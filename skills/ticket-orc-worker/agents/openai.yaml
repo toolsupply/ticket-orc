@@ -1,0 +1,3 @@
+interface:
+  display_name: "Ticket Orc"
+  short_description: "Ticket Tasks orchestration worker capability."

@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  precheck:
+    name: verify tagged source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: verify tagged source and version
+        shell: bash
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "release must run from a v* tag" >&2
+              exit 1
+              ;;
+          esac
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(tr -d '\r\n' < VERSION)"
+          test "$version" = "${GITHUB_REF_NAME#v}"
+
+  build:
+    name: package (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: verify source and build release archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(tr -d '\r\n' < VERSION)"
+          test "$version" = "${GITHUB_REF_NAME#v}"
+          binary=ticket-orc
+          if [ "$GOOS" = windows ]; then binary=ticket-orc.exe; fi
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/toolsupply/ticket-orc/internal/cli.Version=$version -X github.com/toolsupply/ticket-orc/internal/cli.Commit=$GITHUB_SHA" \
+            -o "$binary" ./cmd/ticket-orc
+          mkdir -p release
+          archive="ticket-orc-$GOOS-$GOARCH"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            zip -q -j "release/$archive.zip" "$binary"
+            unzip -tq "release/$archive.zip" >/dev/null
+            entries="$(unzip -Z1 "release/$archive.zip")"
+            test "$entries" = "$binary"
+          else
+            tar -czf "release/$archive.tar.gz" "$binary"
+            entries="$(tar -tzf "release/$archive.tar.gz")"
+            test "$entries" = "$binary"
+          fi
+          if printf '%s\n' "$entries" | grep -Eq '(^|/)(tickets|tickets-archive|\.ticket-orc)(/|$)'; then
+            echo "release archive contains local Ticket data" >&2
+            exit 1
+          fi
+      - name: attest release archive
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: release/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/*
+          if-no-files-found: error
+
+  skill:
+    name: package worker Skill
+    needs: precheck
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: package worker Skill
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p release/stage/ticket-orc-worker
+          cp -R skills/ticket-orc-worker/. release/stage/ticket-orc-worker/
+          (cd release/stage && zip -q -r ../ticket-orc-worker.zip ticket-orc-worker)
+          unzip -tq release/ticket-orc-worker.zip >/dev/null
+          entries="$(unzip -Z1 release/ticket-orc-worker.zip)"
+          if printf '%s\n' "$entries" | grep -Eq '(^|/)(tickets|tickets-archive|\.ticket-orc)(/|$)'; then
+            echo "worker Skill archive contains local Ticket data" >&2
+            exit 1
+          fi
+          expected="$(cd skills/ticket-orc-worker && find . -type f -print | sed 's#^\./#ticket-orc-worker/#' | LC_ALL=C sort)"
+          actual="$(printf '%s\n' "$entries" | sed '/\/$/d' | LC_ALL=C sort)"
+          test "$actual" = "$expected"
+          rm -rf release/stage
+      - name: attest worker Skill archive
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: release/ticket-orc-worker.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-skill
+          path: release/ticket-orc-worker.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [build, skill]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: checksums and verify release artifacts
+        working-directory: release
+        shell: bash
+        run: |
+          set -eu
+          expected_payloads="$(printf '%s\n' \
+            ticket-orc-darwin-amd64.tar.gz \
+            ticket-orc-darwin-arm64.tar.gz \
+            ticket-orc-linux-amd64.tar.gz \
+            ticket-orc-linux-arm64.tar.gz \
+            ticket-orc-windows-amd64.zip \
+            ticket-orc-worker.zip | LC_ALL=C sort)"
+          actual_payloads="$(find . -mindepth 1 -maxdepth 1 -print | sed 's#^\./##' | LC_ALL=C sort)"
+          if [ "$actual_payloads" != "$expected_payloads" ]; then
+            echo "unexpected release payload set before checksumming" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected_payloads" "$actual_payloads" >&2
+            exit 1
+          fi
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          expected_release="$(printf '%s\n' SHA256SUMS "$expected_payloads" | LC_ALL=C sort)"
+          actual_release="$(find . -mindepth 1 -maxdepth 1 -print | sed 's#^\./##' | LC_ALL=C sort)"
+          if [ "$actual_release" != "$expected_release" ]; then
+            echo "unexpected final release file set" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected_release" "$actual_release" >&2
+            exit 1
+          fi
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

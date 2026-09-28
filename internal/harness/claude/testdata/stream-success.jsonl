@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/work/project","session_id":"captured-session-1","model":"claude-sonnet-4-5","permissionMode":"default","tools":["Read","Write"]}
+{"type":"assistant","session_id":"captured-session-1","message":{"role":"assistant","content":[{"type":"text","text":"I will inspect the project file."},{"type":"tool_use","id":"toolu_read_1","name":"Read","input":{"file_path":"/work/project/README.md"}}]}}
+{"type":"user","session_id":"captured-session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read_1","content":"# ticket-orc"}]}}
+{"type":"assistant","session_id":"captured-session-1","message":{"role":"assistant","content":[{"type":"text","text":"The project is ready."}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"captured-session-1","result":"The project is ready."}

@@ -1,0 +1,12 @@
+# Build artifacts (local host binary + cross-compiled release targets)
+/ticket-orc
+/ticket-orc.exe
+/bin/
+/dist/
+/.ticket-orc/.local/
+
+# Test and temporary data
+*.test
+*.project
+*.settings
+*.swp
