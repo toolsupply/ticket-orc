@@ -32,6 +32,15 @@ func canonicalTestDirectory(t *testing.T) string {
 	return canonical
 }
 
+func nonGitTestDirectory(t *testing.T) string {
+	t.Helper()
+	dir := canonicalTestDirectory(t)
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test working directory is not a genuine non-Git directory: %s (stat error: %v)", dir, err)
+	}
+	return dir
+}
+
 func canonicalTestDirectoryWithSpace(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(canonicalTestDirectory(t), "recorded codex home")
@@ -68,6 +77,7 @@ func TestRunBuildsArgumentsStreamsEventsAndFindsSession(t *testing.T) {
 	adapter := testAdapter(t, []string{"PATH=/tools", "TICKET_ACTOR=old", "KEEP=value"}, runner)
 	var stream bytes.Buffer
 	request := validRequest(t, &stream)
+	request.WorkingDir = nonGitTestDirectory(t)
 	request.Model = "gpt-test"
 	request.Reasoning = "high"
 	request.CodexSandbox = "workspace-write"
@@ -84,7 +94,7 @@ func TestRunBuildsArgumentsStreamsEventsAndFindsSession(t *testing.T) {
 		t.Fatal("Run did not report the raw log path")
 	}
 	wantArgs := []string{
-		"exec", "--json",
+		"exec", "--skip-git-repo-check", "--json",
 		"-m", "gpt-test",
 		"-c", `model_reasoning_effort="high"`,
 		"-s", "workspace-write",
@@ -93,7 +103,7 @@ func TestRunBuildsArgumentsStreamsEventsAndFindsSession(t *testing.T) {
 	if len(runner.calls) != 1 || !reflect.DeepEqual(runner.calls[0].args, wantArgs) {
 		t.Fatalf("args = %q, want %q", runner.calls[0].args, wantArgs)
 	}
-	if runner.calls[0].executable != "/test/codex" || runner.calls[0].dir != "/work/project" {
+	if runner.calls[0].executable != "/test/codex" || runner.calls[0].dir != request.WorkingDir {
 		t.Fatalf("process request = %#v", runner.calls[0])
 	}
 	if !contains(runner.calls[0].env, "KEEP=value") || countPrefix(runner.calls[0].env, "TICKET_ACTOR=") != 1 ||
@@ -202,12 +212,14 @@ func TestResumeUsesExistingSessionAndVerifiesStreamIdentity(t *testing.T) {
 	runner := &fakeProcessRunner{chunks: [][]byte{[]byte(`{"type":"thread.started","thread_id":"thread-1"}`)}}
 	adapter := testAdapter(t, nil, runner)
 	request := validRequest(t, io.Discard)
+	request.WorkingDir = nonGitTestDirectory(t)
+	request.Role = "reviewer"
 	request.CodexSandbox = "workspace-write"
 	result, err := adapter.Resume(context.Background(), "thread-1", request)
 	if err != nil || result.SessionID != "thread-1" || !result.StreamEndedNormally {
 		t.Fatalf("Resume = %#v, %v", result, err)
 	}
-	want := []string{"exec", "--json", "-s", "workspace-write", "resume", "thread-1", "implement ticket"}
+	want := []string{"exec", "--skip-git-repo-check", "--json", "-s", "workspace-write", "resume", "thread-1", "implement ticket"}
 	if !reflect.DeepEqual(runner.calls[0].args, want) {
 		t.Fatalf("args = %q, want %q", runner.calls[0].args, want)
 	}
@@ -279,9 +291,28 @@ func TestRunProcessPreservesFullStderr(t *testing.T) {
 	}
 }
 
+func TestRunProcessBoundsStderrAtDiagnosticLimit(t *testing.T) {
+	result, err := runProcess(context.Background(), processRequest{
+		executable: os.Args[0],
+		args:       []string{"-test.run=TestCodexHelperProcess", "--"},
+		env:        append(os.Environ(), "GO_WANT_CODEX_HELPER_PROCESS=1", "GO_WANT_CODEX_HELPER_LARGE_STDERR=1"),
+		stdout:     io.Discard,
+	})
+	if err == nil || result.exitCode != 3 {
+		t.Fatalf("runProcess = %#v, %v; want exit 3", result, err)
+	}
+	if len(result.stderr) != maxDiagnosticBytes || result.stderr != strings.Repeat("x", maxDiagnosticBytes) {
+		t.Fatalf("stderr length/content = %d/%q, want exactly %d captured bytes", len(result.stderr), result.stderr[:min(len(result.stderr), 32)], maxDiagnosticBytes)
+	}
+}
+
 func TestCodexHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_CODEX_HELPER_PROCESS") != "1" {
 		return
+	}
+	if os.Getenv("GO_WANT_CODEX_HELPER_LARGE_STDERR") == "1" {
+		_, _ = fmt.Fprint(os.Stderr, strings.Repeat("x", maxDiagnosticBytes*2))
+		os.Exit(3)
 	}
 	_, _ = fmt.Fprint(os.Stderr, strings.Repeat("diagnostic-", 1000))
 	os.Exit(3)

@@ -12,6 +12,7 @@ import (
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/daemonclient"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -21,13 +22,14 @@ type localTicket struct {
 	ID       string `json:"id"`
 	Title    string `json:"title,omitempty"`
 	State    string `json:"state"`
+	Queue    string `json:"queue"`
 	Assignee string `json:"assignee,omitempty"`
 	Priority int    `json:"priority"`
 }
 
 type localTicketReader interface {
-	ActiveClaims(context.Context, string, []string, int) (ticketclient.ListResult, error)
-	ReadyFrontier(context.Context, string, []string, int) (ticketclient.ListResult, error)
+	ActiveClaims(context.Context, string, int) (ticketclient.ListResult, error)
+	ReadyFrontier(context.Context, string, ticketclient.QueueFilters, int) (ticketclient.ListResult, error)
 	Close() error
 }
 
@@ -40,9 +42,13 @@ type currentSessionState struct {
 	Repository       string        `json:"repository"`
 	Actor            string        `json:"actor"`
 	Role             string        `json:"role,omitempty"`
+	Harness          string        `json:"harness,omitempty"`
 	Session          string        `json:"session"`
 	Joined           bool          `json:"joined"`
 	Queue            string        `json:"queue,omitempty"`
+	RoleQueue        string        `json:"role_queue,omitempty"`
+	ActiveQueue      string        `json:"active_queue,omitempty"`
+	ActiveQueues     []string      `json:"active_queues,omitempty"`
 	ReadyCount       int           `json:"ready_count"`
 	ReadyMore        bool          `json:"ready_more,omitempty"`
 	ActiveClaims     []localTicket `json:"active_claims"`
@@ -55,9 +61,12 @@ type currentSessionState struct {
 }
 
 func executeSessionState(config StateConfig, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner) error {
+	if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.FileConfig.ID, config.Instance.LocalDirConfigured); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), steerCommandTimeout)
 	defer cancel()
-	result, err := currentSessionStateWithConfig(ctx, config.StateDir, LoadedFileConfig{Instance: config.Instance, Config: config.FileConfig}, lookupEnv, runTicket, openLocalTicketReader, readLocalDaemonStatus)
+	result, err := currentSessionStateWithEndpointConfig(ctx, config.StateDir, LoadedFileConfig{Instance: config.Instance, Config: config.FileConfig}, config.Endpoint, lookupEnv, runTicket, openLocalTicketReader, readLocalDaemonStatus, nil)
 	if err != nil {
 		return err
 	}
@@ -81,7 +90,11 @@ func currentSessionStateWithRunner(ctx context.Context, stateDir string, lookupE
 }
 
 func currentSessionStateWithConfig(ctx context.Context, stateDir string, loaded LoadedFileConfig, lookupEnv envLookup, runTicket ticketCommandRunner, open localTicketReaderFactory, readStatus localDaemonStatusReader) (currentSessionState, error) {
-	identity, err := discoverCurrentTicketIdentity(ctx, lookupEnv, runTicket)
+	return currentSessionStateWithEndpointConfig(ctx, stateDir, loaded, steerEndpointSelector{}, lookupEnv, runTicket, open, readStatus, nil)
+}
+
+func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string, loaded LoadedFileConfig, selector steerEndpointSelector, lookupEnv envLookup, runTicket ticketCommandRunner, open localTicketReaderFactory, readStatus localDaemonStatusReader, router *steertransport.Router) (currentSessionState, error) {
+	identity, err := discoverCurrentIdentity(ctx, selector, lookupEnv, runTicket)
 	if err != nil {
 		return currentSessionState{}, err
 	}
@@ -90,37 +103,61 @@ func currentSessionStateWithConfig(ctx context.Context, stateDir string, loaded 
 	if err != nil {
 		return currentSessionState{}, fmt.Errorf("read steer registration: %w", err)
 	}
-	joined := registered && registration.ThreadID == identity.ThreadID && registration.CodexHome == identity.CodexHome && registration.RepositoryPath == identity.RepositoryPath
+	joined := registered && steerRegistrationMatchesIdentity(registration, identity)
 	result := currentSessionState{
 		OrcID: loaded.Config.ID, RepositoryID: identity.RepositoryID, Repository: repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID),
-		Actor: identity.Actor, Session: identity.ThreadID, Joined: joined,
+		Actor: identity.Actor, Session: identity.SessionID, Harness: identity.Harness, Joined: joined,
 		ActiveClaims: []localTicket{},
 	}
 	if !joined {
+		if selector.Explicit {
+			return result, errors.New("selected steering endpoint is not joined")
+		}
 		return result, nil
+	}
+	if router == nil {
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			return result, err
+		}
+	}
+	if _, err := router.Verify(ctx, localDir, registration); err != nil {
+		return result, fmt.Errorf("verify current steer endpoint: %w", err)
 	}
 	result.ManagedOwnership = "unknown"
 	result.Role = registration.Role
+	result.Harness = registration.Harness
 	role, ok := loaded.Config.Roles[registration.Role]
 	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
 		return result, fmt.Errorf("registered role %q has no supported Ticket queue", registration.Role)
 	}
 	result.Queue = role.TicketQueue
+	result.RoleQueue = role.TicketQueue
 	client, err := open(identity)
 	if err != nil {
 		return result, fmt.Errorf("open Ticket reader: %w", err)
 	}
 	defer client.Close()
-	active, err := client.ActiveClaims(ctx, role.TicketQueue, nil, localTicketLimit)
+	activeClaims, activeQueues, err := readLocalActiveClaims(ctx, client)
 	if err != nil {
-		return result, fmt.Errorf("read active Ticket claims: %w", err)
+		return result, err
 	}
-	ready, err := client.ReadyFrontier(ctx, role.TicketQueue, nil, localTicketLimit)
-	if err != nil {
-		return result, fmt.Errorf("read Ticket ready frontier: %w", err)
+	result.ActiveClaims = activeClaims
+	result.ActiveQueues = activeQueues
+	if len(activeQueues) == 1 {
+		result.ActiveQueue = activeQueues[0]
 	}
-	result.ActiveClaims = localTickets(active.Items)
-	result.ReadyCount, result.ReadyMore = len(ready.Items), ready.More
+	if len(activeClaims) == 0 {
+		filters, err := resolvedRoleQueueFilters(role, loaded.Config.Review)
+		if err != nil {
+			return result, fmt.Errorf("resolve role Ticket filters: %w", err)
+		}
+		ready, err := client.ReadyFrontier(ctx, role.TicketQueue, filters, localTicketLimit)
+		if err != nil {
+			return result, fmt.Errorf("read Ticket ready frontier: %w", err)
+		}
+		result.ReadyCount, result.ReadyMore = len(ready.Items), ready.More
+	}
 	delivery, ok, err := findCurrentDelivery(ctx, localDir, registration)
 	if err != nil {
 		return result, fmt.Errorf("read delivery status: %w", err)
@@ -145,7 +182,7 @@ func currentSessionStateWithConfig(ctx context.Context, stateDir string, loaded 
 	}
 	matched := false
 	for _, session := range status.Steer {
-		if session.RepositoryID == registration.RepositoryID && session.Actor == registration.Actor && session.Session == registration.ThreadID {
+		if session.RepositoryID == registration.RepositoryID && session.Actor == registration.Actor && session.Harness == registration.Harness && session.Session == registration.SessionID {
 			matched = true
 			result.StatusCode = session.Code
 			result.PersistenceCode = session.PersistenceCode
@@ -192,12 +229,28 @@ func openLocalTicketReader(identity currentTicketIdentity) (localTicketReader, e
 	return ticketclient.NewWithWorkingDirAndTarget(identity.Actor, identity.RepositoryPath, ticketclient.Target{Repository: identity.RepositoryPath})
 }
 
-func localTickets(items []ticketclient.Ticket) []localTicket {
+func localTickets(items []ticketclient.Ticket, queue string) []localTicket {
 	result := make([]localTicket, 0, len(items))
 	for _, item := range items {
-		result = append(result, localTicket{ID: item.ID, Title: item.Title, State: item.State, Assignee: item.Assignee, Priority: item.Priority})
+		result = append(result, localTicket{ID: item.ID, Title: item.Title, State: item.State, Queue: queue, Assignee: item.Assignee, Priority: item.Priority})
 	}
 	return result
+}
+
+func readLocalActiveClaims(ctx context.Context, client localTicketReader) ([]localTicket, []string, error) {
+	items := make([]localTicket, 0)
+	queues := make([]string, 0, 2)
+	for _, queue := range []string{"open", "review"} {
+		active, err := client.ActiveClaims(ctx, queue, localTicketLimit)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read active Ticket claims: %w", err)
+		}
+		if len(active.Items) != 0 {
+			items = append(items, localTickets(active.Items, queue)...)
+			queues = append(queues, queue)
+		}
+	}
+	return items, queues, nil
 }
 
 func renderCurrentSessionState(out io.Writer, result currentSessionState) error {
@@ -216,11 +269,11 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 		fmt.Fprintln(out, "Active: none")
 	} else {
 		for i, ticket := range result.ActiveClaims {
+			prefix := "  "
 			if i == 0 {
-				fmt.Fprintf(out, "Active: %s\n", ticket.ID)
-			} else {
-				fmt.Fprintf(out, "  %s\n", ticket.ID)
+				prefix = "Active: "
 			}
+			fmt.Fprintf(out, "%s%s (%s queue)\n", prefix, ticket.ID, ticket.Queue)
 		}
 	}
 	fmt.Fprintf(out, "Delivery: %s\n", humanDelivery(result.Delivery))
@@ -324,6 +377,10 @@ func humanDelivery(state string) string {
 }
 
 func executeNext(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
+	args, selector, err := extractEndpointSelector(args)
+	if err != nil {
+		return usageError(stderr, "%v", err)
+	}
 	args, configPath, err := extractConfigPath(args)
 	if err != nil {
 		return usageError(stderr, "%v", err)
@@ -343,7 +400,7 @@ func executeNext(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 			return usageError(stderr, "unknown next argument %q", arg)
 		}
 	}
-	if err := nextWithConfigRunner(context.Background(), jsonOutput, configPath, stdout, lookupEnv, runTicketJSON, openLocalTicketReader); err != nil {
+	if err := nextWithEndpointConfigRunner(context.Background(), jsonOutput, configPath, selector, stdout, lookupEnv, runTicketJSON, openLocalTicketReader, nil); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
@@ -355,13 +412,17 @@ func nextWithRunner(ctx context.Context, jsonOutput bool, stdout io.Writer, look
 }
 
 func nextWithConfigRunner(ctx context.Context, jsonOutput bool, configPath string, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner, open localTicketReaderFactory) error {
+	return nextWithEndpointConfigRunner(ctx, jsonOutput, configPath, steerEndpointSelector{}, stdout, lookupEnv, runTicket, open, nil)
+}
+
+func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPath string, selector steerEndpointSelector, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner, open localTicketReaderFactory, router *steertransport.Router) error {
 	ctx, cancel := context.WithTimeout(ctx, steerCommandTimeout)
 	defer cancel()
 	loaded, err := loadSteerConfigPath(configPath, lookupEnv)
 	if err != nil {
 		return err
 	}
-	identity, err := discoverCurrentTicketIdentity(ctx, lookupEnv, runTicket)
+	identity, err := discoverCurrentIdentity(ctx, selector, lookupEnv, runTicket)
 	if err != nil {
 		return err
 	}
@@ -369,8 +430,17 @@ func nextWithConfigRunner(ctx context.Context, jsonOutput bool, configPath strin
 	if err != nil {
 		return fmt.Errorf("read steer registration: %w", err)
 	}
-	if !ok || registration.ThreadID != identity.ThreadID || registration.CodexHome != identity.CodexHome || registration.RepositoryPath != identity.RepositoryPath {
+	if !ok || !steerRegistrationMatchesIdentity(registration, identity) {
 		return errors.New("current session is not joined; run ticket-orc join first")
+	}
+	if router == nil {
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := router.Verify(ctx, loaded.Instance.LocalDir, registration); err != nil {
+		return fmt.Errorf("verify current steer endpoint: %w", err)
 	}
 	role, ok := loaded.Config.Roles[registration.Role]
 	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
@@ -381,27 +451,41 @@ func nextWithConfigRunner(ctx context.Context, jsonOutput bool, configPath strin
 		return fmt.Errorf("open Ticket reader: %w", err)
 	}
 	defer client.Close()
-	active, err := client.ActiveClaims(ctx, role.TicketQueue, nil, localTicketLimit)
+	activeItems, activeQueues, err := readLocalActiveClaims(ctx, client)
 	if err != nil {
-		return fmt.Errorf("read active Ticket claims: %w", err)
+		return err
 	}
-	ready, err := client.ReadyFrontier(ctx, role.TicketQueue, nil, localTicketLimit)
-	if err != nil {
-		return fmt.Errorf("read Ticket ready frontier: %w", err)
-	}
-	items := localTickets(active.Items)
+	var ready ticketclient.ListResult
+	items := activeItems
 	if len(items) == 0 {
-		items = localTickets(ready.Items)
+		filters, err := resolvedRoleQueueFilters(role, loaded.Config.Review)
+		if err != nil {
+			return fmt.Errorf("resolve role Ticket filters: %w", err)
+		}
+		ready, err = client.ReadyFrontier(ctx, role.TicketQueue, filters, localTicketLimit)
+		if err != nil {
+			return fmt.Errorf("read Ticket ready frontier: %w", err)
+		}
+		items = localTickets(ready.Items, role.TicketQueue)
+	}
+	activeQueue := ""
+	if len(activeQueues) == 1 {
+		activeQueue = activeQueues[0]
 	}
 	result := struct {
-		Role     string        `json:"role"`
-		Session  string        `json:"session"`
-		Delivery string        `json:"delivery"`
-		Queue    string        `json:"queue"`
-		Active   bool          `json:"active_claim"`
-		Items    []localTicket `json:"items"`
-		More     bool          `json:"more,omitempty"`
-	}{Role: registration.Role, Session: identity.ThreadID, Queue: role.TicketQueue, Active: len(active.Items) > 0, Items: items, More: ready.More}
+		Role         string        `json:"role"`
+		Harness      string        `json:"harness"`
+		Session      string        `json:"session"`
+		Delivery     string        `json:"delivery"`
+		Queue        string        `json:"queue"`
+		RoleQueue    string        `json:"role_queue"`
+		ActiveQueue  string        `json:"active_queue,omitempty"`
+		ActiveQueues []string      `json:"active_queues,omitempty"`
+		Active       bool          `json:"active_claim"`
+		Items        []localTicket `json:"items"`
+		More         bool          `json:"more,omitempty"`
+	}{Role: registration.Role, Harness: registration.Harness, Session: identity.SessionID, Queue: role.TicketQueue, RoleQueue: role.TicketQueue,
+		ActiveQueue: activeQueue, ActiveQueues: activeQueues, Active: len(activeItems) > 0, Items: items, More: ready.More}
 	if delivery, found, deliveryErr := findCurrentDelivery(ctx, loaded.Instance.LocalDir, registration); deliveryErr != nil {
 		return fmt.Errorf("read delivery status: %w", deliveryErr)
 	} else if found {
@@ -420,7 +504,11 @@ func nextWithConfigRunner(ctx context.Context, jsonOutput bool, configPath strin
 		return nil
 	}
 	if result.Active {
-		fmt.Fprintln(stdout, "Active claim:")
+		label := result.ActiveQueue
+		if label == "" {
+			label = strings.Join(result.ActiveQueues, ", ")
+		}
+		fmt.Fprintf(stdout, "Active claim (%s queue):\n", label)
 	} else {
 		fmt.Fprintf(stdout, "%s ready\n", readyCountLabel(len(ready.Items), ready.More))
 	}

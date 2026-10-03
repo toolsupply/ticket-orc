@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"maps"
 
 	"github.com/toolsupply/ticket-orc/internal/state"
 )
@@ -84,7 +85,12 @@ func currentSteerRegistration(ctx context.Context, store *state.RegistrationStor
 
 func sameSteerRegistrationIncarnation(left, right state.SteerRegistration) bool {
 	return left.RepositoryID == right.RepositoryID && left.Actor == right.Actor &&
-		left.RegistrationID == right.RegistrationID && left.JoinSignal == right.JoinSignal &&
-		left.RepositoryPath == right.RepositoryPath && left.CodexHome == right.CodexHome &&
-		left.ThreadID == right.ThreadID && left.Role == right.Role
+		left.RegistrationID == right.RegistrationID && left.IncarnationID == right.IncarnationID &&
+		left.RepositoryPath == right.RepositoryPath && left.Role == right.Role &&
+		left.Harness == right.Harness && left.SessionID == right.SessionID &&
+		left.Transport.Kind == right.Transport.Kind && maps.Equal(left.Transport.Params, right.Transport.Params)
+}
+
+func sameSteerRegistration(left, right state.SteerRegistration) bool {
+	return left.RepositoryName == right.RepositoryName && sameSteerRegistrationIncarnation(left, right)
 }

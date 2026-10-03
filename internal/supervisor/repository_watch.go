@@ -46,6 +46,9 @@ func (e *WatchProtocolError) Unwrap() error {
 	return e.Cause
 }
 
+// RepositoryWatchStarter returns a process only after the Ticket watch stream
+// has crossed its validated READY boundary. Events may be delivered only
+// after that boundary.
 type RepositoryWatchStarter func(context.Context, ConfiguredRepository, func(RepositoryWatchEvent)) (RepositoryWatchProcess, error)
 type RepositoryWatchProbe func(context.Context, ConfiguredRepository) (ticketclient.RepositoryInfo, error)
 
@@ -61,6 +64,8 @@ type repositoryWatchObserver struct {
 	cancel      context.CancelFunc
 	mu          sync.Mutex
 	process     RepositoryWatchProcess
+	ready       bool
+	attempt     uint64
 	restarts    int
 	lastRestart time.Time
 }
@@ -74,6 +79,7 @@ type RepositoryWatchManager struct {
 	probe     RepositoryWatchProbe
 	start     RepositoryWatchStarter
 	eventSink func(RuntimeEvent)
+	readySink func(string)
 
 	mu              sync.Mutex
 	observers       map[string]*repositoryWatchObserver
@@ -103,6 +109,15 @@ func (m *RepositoryWatchManager) SetEventSink(sink func(RuntimeEvent)) {
 	}
 	m.mu.Lock()
 	m.eventSink = sink
+	m.mu.Unlock()
+}
+
+func (m *RepositoryWatchManager) SetReadySink(sink func(string)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.readySink = sink
 	m.mu.Unlock()
 }
 
@@ -232,25 +247,32 @@ func (m *RepositoryWatchManager) addObserverAtRevision(key string, repository Co
 func (m *RepositoryWatchManager) runObserver(ctx context.Context, observer *repositoryWatchObserver) {
 	backoff := repositoryWatchBackoff
 	for {
-		if ctx.Err() != nil {
+		attempt, active := m.beginObserverAttempt(ctx, observer)
+		if !active {
 			return
 		}
-		process, err := m.start(ctx, observer.repository, func(event RepositoryWatchEvent) { m.TicketChanged(observer.key, event) })
+		process, err := m.start(ctx, observer.repository, func(event RepositoryWatchEvent) { m.ticketChangedFrom(observer, attempt, event) })
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			m.markDegraded(observer, "watch_start_failed")
+			failure := "watch_start_failed"
+			var protocolErr *WatchProtocolError
+			if errors.As(err, &protocolErr) {
+				failure = RepositoryWatchFailureCode(err)
+			}
+			m.markDegraded(observer, failure)
 			if !waitRepositoryBackoff(ctx, backoff) {
 				return
 			}
 			backoff = nextRepositoryBackoff(backoff)
 			continue
 		}
-		recoveryCode, active := m.activateObserver(ctx, observer, process)
+		recoveryCode, active := m.activateObserver(ctx, observer, attempt, process)
 		if !active {
 			return
 		}
+		m.publishReady(observer)
 		if err := m.refresh(ctx, observer); err != nil {
 			m.markDegraded(observer, "refresh_failed")
 		} else if recoveryCode != "" {
@@ -258,6 +280,7 @@ func (m *RepositoryWatchManager) runObserver(ctx context.Context, observer *repo
 		}
 		err = waitRepositoryProcess(ctx, process)
 		observer.clearProcess(process)
+		m.retireObserverAttempt(observer, attempt)
 		if ctx.Err() != nil {
 			return
 		}
@@ -267,6 +290,25 @@ func (m *RepositoryWatchManager) runObserver(ctx context.Context, observer *repo
 		}
 		backoff = nextRepositoryBackoff(backoff)
 	}
+}
+
+func (m *RepositoryWatchManager) beginObserverAttempt(ctx context.Context, observer *repositoryWatchObserver) (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ctx.Err() != nil || m.observers[observer.key] != observer {
+		return 0, false
+	}
+	observer.attempt++
+	observer.ready = false
+	return observer.attempt, true
+}
+
+func (m *RepositoryWatchManager) retireObserverAttempt(observer *repositoryWatchObserver, attempt uint64) {
+	m.mu.Lock()
+	if m.observers[observer.key] == observer && observer.attempt == attempt {
+		observer.ready = false
+	}
+	m.mu.Unlock()
 }
 
 func waitRepositoryProcess(ctx context.Context, process RepositoryWatchProcess) error {
@@ -364,6 +406,21 @@ func repositoryInfoName(info ticketclient.RepositoryInfo) string {
 
 func (m *RepositoryWatchManager) TicketChanged(key string, event RepositoryWatchEvent) {
 	m.mu.Lock()
+	m.ticketChangedLocked(key, event)
+	m.mu.Unlock()
+}
+
+func (m *RepositoryWatchManager) ticketChangedFrom(observer *repositoryWatchObserver, attempt uint64, event RepositoryWatchEvent) {
+	m.mu.Lock()
+	if observer == nil || m.observers[observer.key] != observer || observer.attempt != attempt || !observer.ready {
+		m.mu.Unlock()
+		return
+	}
+	m.ticketChangedLocked(observer.key, event)
+	m.mu.Unlock()
+}
+
+func (m *RepositoryWatchManager) ticketChangedLocked(key string, event RepositoryWatchEvent) {
 	status := m.statusLocked(key)
 	status.LastEventAt = time.Now().UTC()
 	if status.State != "degraded" {
@@ -377,7 +434,6 @@ func (m *RepositoryWatchManager) TicketChanged(key string, event RepositoryWatch
 		timer.Stop()
 	}
 	m.timers[key] = time.AfterFunc(RepositoryWatchDebounce, func() { m.flushChanged(key) })
-	m.mu.Unlock()
 }
 
 func (m *RepositoryWatchManager) flushChanged(key string) {
@@ -401,14 +457,15 @@ func (m *RepositoryWatchManager) flushChanged(key string) {
 	sink(public)
 }
 
-func (m *RepositoryWatchManager) activateObserver(ctx context.Context, observer *repositoryWatchObserver, process RepositoryWatchProcess) (string, bool) {
+func (m *RepositoryWatchManager) activateObserver(ctx context.Context, observer *repositoryWatchObserver, attempt uint64, process RepositoryWatchProcess) (string, bool) {
 	m.mu.Lock()
-	if ctx.Err() != nil || m.observers[observer.key] != observer {
+	if ctx.Err() != nil || m.observers[observer.key] != observer || observer.attempt != attempt {
 		m.mu.Unlock()
 		_ = process.Stop()
 		return "", false
 	}
 	observer.setProcess(process)
+	observer.ready = true
 	observer.mu.Lock()
 	observer.restarts++
 	observer.lastRestart = time.Now().UTC()
@@ -431,6 +488,20 @@ func (m *RepositoryWatchManager) activateObserver(ctx context.Context, observer 
 		return "observer_restarted", true
 	}
 	return "", true
+}
+
+func (m *RepositoryWatchManager) publishReady(observer *repositoryWatchObserver) {
+	m.mu.Lock()
+	if current, ok := m.observers[observer.key]; !ok || current != observer {
+		m.mu.Unlock()
+		return
+	}
+	sink := m.readySink
+	repositoryID := observer.repository.ID
+	m.mu.Unlock()
+	if sink != nil {
+		sink(repositoryID)
+	}
 }
 
 func (m *RepositoryWatchManager) publishRecovery(observer *repositoryWatchObserver, code string) {

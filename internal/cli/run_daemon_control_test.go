@@ -220,7 +220,8 @@ func TestDaemonControlCallbacksPublishNamedEventsAndMode(t *testing.T) {
 	stateDir := t.TempDir()
 	store := state.NewDaemonControlStore(stateDir)
 	gate := newDispatchGate(store, state.DaemonRunning)
-	config := RunConfig{StateDir: stateDir, Runtime: NewRuntimeState(nil), dispatchGate: gate, control: &daemon.Control{}}
+	dirty := newSteerDirtySet()
+	config := RunConfig{StateDir: stateDir, Runtime: NewRuntimeState(nil), dispatchGate: gate, steerDirty: dirty, control: &daemon.Control{}}
 	manager := newWorkerManager(context.Background(), config, "unused", io.Discard, io.Discard, nil)
 	var events []supervisor.RuntimeEvent
 	wireSupervisorControlCallbacks(&config, manager, func(event supervisor.RuntimeEvent) { events = append(events, event) }, nil, nil)
@@ -232,6 +233,9 @@ func TestDaemonControlCallbacksPublishNamedEventsAndMode(t *testing.T) {
 	}
 	if _, err := config.control.ResumeDaemon(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if resumed := dirty.Drain(); !resumed.all {
+		t.Fatalf("daemon resume dirty snapshot=%#v, want full reconciliation", resumed)
 	}
 	result, err := config.control.AbortDaemon(context.Background())
 	if err != nil || result.Mode != "aborted" || !result.Applied {

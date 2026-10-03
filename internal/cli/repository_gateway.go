@@ -20,11 +20,12 @@ func (m *workerManager) repositoryGateway() daemon.RepositoryGateway {
 		return daemon.RepositoryGateway{}
 	}
 	return daemon.RepositoryGateway{
-		ListTickets:  m.listRepositoryTickets,
-		GetTicket:    m.getRepositoryTicket,
-		CreateTicket: m.createRepositoryTicket,
-		UpdateTicket: m.updateRepositoryTicket,
-		MutateTicket: m.mutateRepositoryTicket,
+		ListTickets:           m.listRepositoryTickets,
+		GetTicket:             m.getRepositoryTicket,
+		CreateTicket:          m.createRepositoryTicket,
+		UpdateTicket:          m.updateRepositoryTicket,
+		MutateTicket:          m.mutateRepositoryTicket,
+		TicketBodyBudgetBytes: ticketclient.RepositoryDetailBodyBudgetBytes,
 	}
 }
 
@@ -134,7 +135,7 @@ func (m *workerManager) createRepositoryTicket(ctx context.Context, repositoryID
 	}
 	client, err := ticketclient.NewWithTarget(request.Actor, ticketTargetFromConfiguredRepository(repository))
 	if err != nil {
-		return daemon.RepositoryTicketMutation{}, repositoryMutationFailure(err)
+		return daemon.RepositoryTicketMutation{}, repositoryMutationNotAppliedFailure(err)
 	}
 	defer client.Close()
 	input := ticketclient.CreateInput{Title: request.Title, Priority: request.Priority, Tags: request.Tags, Parent: request.Parent, DependsOn: request.DependsOn, Sections: request.Sections}
@@ -158,7 +159,7 @@ func (m *workerManager) updateRepositoryTicket(ctx context.Context, repositoryID
 	}
 	client, err := ticketclient.NewWithTarget(request.Actor, ticketTargetFromConfiguredRepository(repository))
 	if err != nil {
-		return daemon.RepositoryTicketMutation{}, repositoryMutationFailure(err)
+		return daemon.RepositoryTicketMutation{}, repositoryMutationNotAppliedFailure(err)
 	}
 	defer client.Close()
 	mutation, err := client.UpdateTicket(ctx, id, ticketclient.UpdateInput{Set: request.Set, Sections: request.Sections})
@@ -184,7 +185,7 @@ func (m *workerManager) mutateRepositoryTicket(ctx context.Context, repositoryID
 	}
 	client, err := ticketclient.NewWithTarget(request.Actor, ticketTargetFromConfiguredRepository(repository))
 	if err != nil {
-		return daemon.RepositoryTicketMutation{}, repositoryMutationFailure(err)
+		return daemon.RepositoryTicketMutation{}, repositoryMutationNotAppliedFailure(err)
 	}
 	defer client.Close()
 	options := ticketclient.MutationOptions{Handoff: request.Handoff, Message: request.Message, Outcome: request.Outcome}
@@ -308,7 +309,23 @@ func repositoryReadFailure(err error) error {
 }
 
 func repositoryMutationFailure(err error) error {
-	return repositoryMutationFailureApplied(err, false)
+	if err == nil {
+		return nil
+	}
+	// A mutation command may have reached Ticket before an error is returned.
+	// A missing or malformed response does not prove that it was rejected.
+	// Preserve an explicit positive applied signal when Ticket provides one;
+	// otherwise leave certainty unknown instead of inviting an unsafe retry.
+	knownApplied := ticketclient.MutationApplied(err)
+	return &daemon.RepositoryMutationError{
+		Code: "repository_mutation_failed", Status: 502,
+		Message: "Ticket repository mutation failed", Applied: knownApplied,
+		AppliedKnown: knownApplied, Cause: err,
+	}
+}
+
+func repositoryMutationNotAppliedFailure(err error) error {
+	return repositoryMutationError("repository_mutation_failed", 502, "Ticket repository mutation failed", false, err)
 }
 
 func repositoryMutationFailureApplied(err error, applied bool) error {
@@ -319,7 +336,7 @@ func repositoryMutationFailureApplied(err error, applied bool) error {
 }
 
 func repositoryMutationError(code string, status int, message string, applied bool, cause error) error {
-	return &daemon.RepositoryMutationError{Code: code, Status: status, Message: message, Applied: applied, Cause: cause}
+	return &daemon.RepositoryMutationError{Code: code, Status: status, Message: message, Applied: applied, AppliedKnown: true, Cause: cause}
 }
 
 func (m *workerManager) repositoryServiceSummary(repositoryID string) (daemon.RepositoryStatus, error) {

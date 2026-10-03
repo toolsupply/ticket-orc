@@ -27,6 +27,7 @@ const (
 type Endpoint struct {
 	Version       int    `json:"version"`
 	Protocol      int    `json:"protocol"`
+	InstanceID    string `json:"instance_id"`
 	PID           int    `json:"pid"`
 	URL           string `json:"url"`
 	ListenAddress string `json:"listen_address,omitempty"`

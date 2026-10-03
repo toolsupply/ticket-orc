@@ -26,7 +26,7 @@ const (
 	consoleStatusSession      = 11
 	consoleStatusState        = 14
 	consoleRepositoryStateCol = 16
-	consoleWatchRepositoryCol = 14
+	consoleWatchRepositoryCol = consoleRepositoryLabelCol
 )
 
 func consoleTableRow(worker, activity, ticket string) string {
@@ -225,10 +225,10 @@ func renderConsoleRepositories(out io.Writer, repositories []daemon.RepositorySt
 			fmt.Fprintf(out, "  Failure: %s\n", consoleField(repository.Failure))
 		}
 		if !repository.LastEventAt.IsZero() {
-			fmt.Fprintf(out, "  Last change: %s\n", repository.LastEventAt.UTC().Format(time.RFC3339))
+			fmt.Fprintf(out, "  Last change: %s\n", repository.LastEventAt.Local().Format(time.RFC3339))
 		}
 		if !repository.LastRestartAt.IsZero() {
-			fmt.Fprintf(out, "  Last restart: %s\n", repository.LastRestartAt.UTC().Format(time.RFC3339))
+			fmt.Fprintf(out, "  Last restart: %s\n", repository.LastRestartAt.Local().Format(time.RFC3339))
 		}
 		if repository.RestartCount != 0 {
 			fmt.Fprintf(out, "  Restart count: %d\n", repository.RestartCount)
@@ -331,7 +331,7 @@ func renderConsoleDetailStatus(out io.Writer, status daemon.Status) {
 			if worker.TicketActivityTicket != "" {
 				activity += " (ticket " + consoleField(worker.TicketActivityTicket) + ")"
 			}
-			fmt.Fprintf(out, "  Ticket activity: %s at %s\n", activity, worker.TicketActivityAt.UTC().Format(time.RFC3339))
+			fmt.Fprintf(out, "  Ticket activity: %s at %s\n", activity, worker.TicketActivityAt.Local().Format(time.RFC3339))
 		}
 		if worker.Reason != "" {
 			fmt.Fprintf(out, "  Failure reason: %s\n", consoleField(worker.Reason))

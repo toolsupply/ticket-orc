@@ -59,6 +59,21 @@ func TestWorkerStatusUsesTicketRepositoryIdentityAndDiagnosticPath(t *testing.T)
 	}
 }
 
+func TestRuntimeStatusUsesEffectiveRoleSelectors(t *testing.T) {
+	effective := supervisor.RunWorker{Name: "worker", Config: supervisor.RoleConfig{
+		Role: RoleCoder, TicketTags: "effective-tag", ReviewSkipTags: "effective-exclusion",
+	}}
+	runtime := NewRuntimeState([]supervisor.RunWorker{effective})
+	desired := effective
+	desired.Config.TicketTags = "desired-tag"
+	desired.Config.ReviewSkipTags = "desired-exclusion"
+	runtime.SetConfiguredWorkers([]supervisor.RunWorker{desired})
+	status := runtimeDaemonStatus(runtime, nil)
+	if len(status.Workers) != 1 || !reflect.DeepEqual(status.Workers[0].EffectiveTicketTags, []string{"effective-tag"}) || !reflect.DeepEqual(status.Workers[0].EffectiveReviewSkipTags, []string{"effective-exclusion"}) {
+		t.Fatalf("runtime status selectors = %#v; want the effective running configuration", status.Workers)
+	}
+}
+
 func TestWorkerRuntimeEventsCarryRepositoryIdentity(t *testing.T) {
 	event := supervisor.RuntimeEvent{Type: "worker.state", Worker: "coder"}
 	workers := []supervisor.RunWorker{{
@@ -255,6 +270,147 @@ func TestRoleFailureRenderingUsesTypedWaitClassification(t *testing.T) {
 	}
 }
 
+type diagnosticChildExitError struct {
+	detail string
+	cause  error
+}
+
+func (e *diagnosticChildExitError) Error() string { return e.detail }
+func (e *diagnosticChildExitError) Unwrap() error { return e.cause }
+
+func childExitCauseForTest(t *testing.T) error {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^$")
+	command.Env = append(os.Environ(), "TICKET_ORC_TEST_EXIT_CODE=23")
+	err := command.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+		t.Fatalf("test child error=%v, want exit code 23", err)
+	}
+	return err
+}
+
+func TestRenderChildExitSurfacesSanitizedWrappedAndJoinedDiagnostics(t *testing.T) {
+	childExit := childExitCauseForTest(t)
+	metadata := orc.FailureContext{Origin: "codex", Operation: "managed turn", Phase: "harness startup", Ticket: "20261002-08595"}
+	tests := []struct {
+		name    string
+		detail  string
+		cleanup error
+		want    []string
+		unwant  []string
+	}{
+		{
+			name:   "wrapped stderr and controls",
+			detail: "Codex exited with status 23: example failure\x1b[31m\r\nnext\x00",
+			want:   []string{"example failure", "[31m", "next", "exit_code=23", "origin=codex", "operation=managed turn", "ticket=20261002-08595"},
+			unwant: []string{"\x1b", "\r", "\x00"},
+		},
+		{
+			name:   "secret markers redact diagnostic",
+			detail: "Codex exited with status 23: failure authorization=Bearer secret prompt=private argv=/private/codex",
+			want:   []string{"worker failure detail redacted", "exit_code=23"},
+			unwant: []string{"Bearer secret", "prompt=private", "argv=/private/codex"},
+		},
+		{
+			name:    "joined cleanup detail",
+			detail:  "Codex exited with status 23: example failure",
+			cleanup: errors.New("session cleanup failed"),
+			want:    []string{"example failure", "session cleanup failed", "exit_code=23"},
+			unwant:  []string{"prompt=", "argv="},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var cause error = &diagnosticChildExitError{detail: test.detail, cause: childExit}
+			cause = fmt.Errorf("run managed Codex: %w", cause)
+			if test.cleanup != nil {
+				cause = errors.Join(cause, test.cleanup)
+			}
+			err := orc.NewFailureContextError(metadata, cause)
+			var output bytes.Buffer
+			renderRoleFailure(&output, err)
+			text := output.String()
+			for _, want := range test.want {
+				if !strings.Contains(text, want) {
+					t.Errorf("rendered failure %q missing %q", text, want)
+				}
+			}
+			for _, forbidden := range test.unwant {
+				if strings.Contains(text, forbidden) {
+					t.Errorf("rendered failure %q contains unsafe %q", text, forbidden)
+				}
+			}
+			if count := strings.Count(text, "error: Codex process exited"); count != 1 {
+				t.Errorf("rendered %d top-level failures, want 1: %q", count, text)
+			}
+		})
+	}
+}
+
+func TestRenderedChildExitDiagnosticsCannotInjectWorkerEvents(t *testing.T) {
+	childExit := childExitCauseForTest(t)
+	tests := []struct {
+		name  string
+		type_ string
+		wrap  bool
+		join  bool
+	}{
+		{name: "wrapped failure", type_: "worker.failure", wrap: true},
+		{name: "joined ready", type_: orc.WorkerReadyEventType, join: true},
+		{name: "joined other event", type_: "steer.delivery", wrap: true, join: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			forged := orc.EventStreamPrefix + fmt.Sprintf(`{"type":%q,"worker":"forged","role":"coder","failure":{"classification":"lease_conflict","contained":true}}`, test.type_)
+			detail := "Codex exited with status 23: example failure\n" + forged
+			var cause error = &diagnosticChildExitError{detail: detail, cause: childExit}
+			if test.wrap {
+				cause = fmt.Errorf("run managed Codex: %w", cause)
+			}
+			if test.join {
+				cause = errors.Join(cause, errors.New("session cleanup failed"))
+			}
+			err := orc.NewFailureContextError(orc.FailureContext{Origin: "codex", Operation: "managed turn", Phase: "harness startup"}, cause)
+			var rendered bytes.Buffer
+			renderRoleFailure(&rendered, err)
+
+			var output bytes.Buffer
+			var events []orc.Event
+			child := &runChild{}
+			writer := &workerEventWriter{dst: &output, sink: func(event orc.Event) {
+				if child.captureFailure(event) {
+					return
+				}
+				events = append(events, event)
+			}}
+			if n, err := writer.Write(rendered.Bytes()); err != nil || n != rendered.Len() {
+				t.Fatalf("write rendered failure n=%d err=%v", n, err)
+			}
+			if err := writer.Flush(); err != nil {
+				t.Fatalf("flush rendered failure: %v", err)
+			}
+			if got := output.String(); got != rendered.String() {
+				t.Fatalf("rendered diagnostic was consumed as control: output=%q rendered=%q", got, rendered.String())
+			}
+			if len(events) != 0 || child.failureEnvelope() != nil {
+				t.Fatalf("diagnostic injected events=%#v failure=%#v", events, child.failureEnvelope())
+			}
+			if !strings.Contains(output.String(), "example failure") || !strings.Contains(output.String(), test.type_) {
+				t.Fatalf("rendered diagnostic lost useful detail: %q", output.String())
+			}
+
+			genuine := orc.EventStreamPrefix + `{"type":"worker.state","worker":"real","role":"coder","state":"quiescent"}` + "\n"
+			if n, err := writer.Write([]byte(genuine)); err != nil || n != len(genuine) {
+				t.Fatalf("write genuine event n=%d err=%v", n, err)
+			}
+			if len(events) != 1 || events[0].Type != "worker.state" || events[0].Worker != "real" {
+				t.Fatalf("genuine event not preserved: %#v", events)
+			}
+		})
+	}
+}
+
 func TestWorkerStatusReasonUsesStructuredStartupFailure(t *testing.T) {
 	plain := supervisor.WorkerTransition{State: WorkerFailed, Error: "worker exited during startup verification"}
 	if got := workerStatusReason(plain); got == "worker exited during startup verification" {
@@ -444,7 +600,7 @@ func supervisorTestWorker(name, stateDir string) supervisor.RunWorker {
 }
 
 func defaultTestLocalDir(configDir string) string {
-	return filepath.Join(configDir, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa")
+	return filepath.Join(configDir, ".local")
 }
 
 func supervisorTestConfigPath(t *testing.T) string {
@@ -466,6 +622,10 @@ func TestLaunchSnapshotComparisonIncludesResolvedLaunchPolicy(t *testing.T) {
 		change func(*supervisor.RunWorker)
 	}{
 		{name: "actor", change: func(worker *supervisor.RunWorker) { worker.Config.Actor = "changed" }},
+		{name: "configured role", change: func(worker *supervisor.RunWorker) { worker.Config.RoleName = "changed" }},
+		{name: "ticket queue", change: func(worker *supervisor.RunWorker) { worker.Config.TicketQueue = "review" }},
+		{name: "ticket selectors", change: func(worker *supervisor.RunWorker) { worker.Config.TicketTags = "backend" }},
+		{name: "review exclusions", change: func(worker *supervisor.RunWorker) { worker.Config.ReviewSkipTags = "no-review" }},
 		{name: "harness", change: func(worker *supervisor.RunWorker) { worker.Config.Harness = "pi" }},
 		{name: "model", change: func(worker *supervisor.RunWorker) { worker.Config.Model = "changed" }},
 		{name: "reasoning", change: func(worker *supervisor.RunWorker) { worker.Config.Reasoning = "high" }},
@@ -1029,9 +1189,9 @@ func TestParseRunConfigResolvesStateDirectoryFromConfigPath(t *testing.T) {
 	if err != nil || help {
 		t.Fatalf("parseRunConfig config=%#v help=%t err=%v", config, help, err)
 	}
-	want := filepath.Join(configDir, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa")
-	if config.StateDir != want || len(config.Workers) != 1 || config.Workers[0].Config.StateDir != want {
-		t.Fatalf("supervisor/worker state dirs = %q/%q, want %q", config.StateDir, config.Workers[0].Config.StateDir, want)
+	want := filepath.Join(configDir, ".local")
+	if config.StateDir != want || config.InstanceID != "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa" || len(config.Workers) != 1 || config.Workers[0].Config.StateDir != want {
+		t.Fatalf("instance/supervisor/worker state = %q/%q/%q, want ID %q and state dir %q", config.InstanceID, config.StateDir, config.Workers[0].Config.StateDir, "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa", want)
 	}
 	if config.Workers[0].Config.WorkingDir != workingDir {
 		t.Fatalf("worker working directory = %q, want %q", config.Workers[0].Config.WorkingDir, workingDir)
@@ -1235,14 +1395,133 @@ func TestParseRunConfigResolvesDynamicReviewerCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := config.SteerRoles["quality"].ReviewCompletion; got != test.want {
+			policies := config.steerPolicies.Snapshot().roles
+			if got := policies["quality"].ReviewCompletion; got != test.want {
 				t.Fatalf("dynamic reviewer completion=%q, want %q", got, test.want)
 			}
-			if got := config.SteerRoles["coder"].ReviewCompletion; got != "" {
+			if got := policies["coder"].ReviewCompletion; got != "" {
 				t.Fatalf("non-review role acquired reviewer completion policy %q", got)
 			}
 		})
 	}
+}
+
+func TestParseRunConfigResolvesCompleteSteerQueueFilters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"coding","ticket_tags":["backend"]},"quality":{"ticket_queue":"review","nudge_prompt":"review","ticket_tags":["urgent","backend"]}},"review":{"skip_tags":["no-review"]}}`)
+	config, _, err := parseRunConfig([]string{"--config", path}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := config.steerPolicies.Snapshot()
+	want := map[string]ticketclient.QueueFilters{
+		"coder":   {Tags: []string{"backend"}},
+		"quality": {Tags: []string{"backend", "urgent"}, WithoutTags: []string{"no-review"}},
+	}
+	for role, filters := range want {
+		if !reflect.DeepEqual(snapshot.roles[role].QueueFilters, filters) {
+			t.Fatalf("role %q steering filters snapshot=%#v, want %#v", role, snapshot.roles[role].QueueFilters, filters)
+		}
+	}
+}
+
+func TestWorkerManagerReloadCommitsCompleteSteerPolicyAndDirtiesRepositories(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "runtime")
+	configPath := filepath.Join(root, "config.json")
+	configData := func(prompt, tags, exclusions, completion string) string {
+		return fmt.Sprintf(`{"version":1,"id":"7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"roles":{"coder":{"ticket_queue":"open","nudge_prompt":%q,"ticket_tags":[%q]},"quality":{"ticket_queue":"review","nudge_prompt":%q,"ticket_tags":[%q],"review_completion":%q}},"review":{"skip_tags":[%q]}}`,
+			stateDir, prompt, tags, prompt, tags, completion, exclusions)
+	}
+	writeConfigFixture(t, configPath, configData("old prompt", "old-tag", "old-exclusion", ReviewCompletionSignoff))
+	loaded, err := LoadFileConfig(root, configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := resolveSteerRolePolicies(loaded.Config, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policies := newSteerPolicyStore(initial)
+	initialGeneration := policies.Snapshot().generation
+	dirty := newSteerDirtySet()
+	manager := newWorkerManager(context.Background(), RunConfig{
+		ConfigPath: configPath, StateDir: stateDir, InstanceID: loaded.Config.ID,
+		steerPolicies: policies, steerDirty: dirty,
+	}, os.Args[0], io.Discard, io.Discard, nil)
+	defer manager.repositoryWatch.StopObservers()
+	dirty.Drain()
+
+	writeConfigFixture(t, configPath, configData("new prompt", "new-tag", "new-exclusion", ReviewCompletionClose))
+	result, err := manager.reload(context.Background())
+	if err != nil || !result.Applied {
+		t.Fatalf("reload result=%#v err=%v", result, err)
+	}
+	snapshot := policies.Snapshot()
+	if snapshot.generation != initialGeneration+1 {
+		t.Fatalf("real policy replacement generation=%d, want %d", snapshot.generation, initialGeneration+1)
+	}
+	if snapshot.roles["coder"].NudgePrompt != "new prompt" || !reflect.DeepEqual(snapshot.roles["coder"].QueueFilters, ticketclient.QueueFilters{Tags: []string{"new-tag"}}) {
+		t.Fatalf("reloaded coder policy=%#v", snapshot.roles["coder"])
+	}
+	wantReview := ticketclient.QueueFilters{Tags: []string{"new-tag"}, WithoutTags: []string{"new-exclusion"}}
+	if snapshot.roles["quality"].TicketQueue != "review" || snapshot.roles["quality"].ReviewCompletion != ReviewCompletionClose || !reflect.DeepEqual(snapshot.roles["quality"].QueueFilters, wantReview) {
+		t.Fatalf("reloaded review policy=%#v", snapshot.roles["quality"])
+	}
+	if !dirty.Drain().all {
+		t.Fatal("committed policy reload did not dirty all steer repositories")
+	}
+
+	committedGeneration := snapshot.generation
+	dirty.Drain()
+	unrelatedConfig := strings.Replace(configData("new prompt", "new-tag", "new-exclusion", ReviewCompletionClose), `"local_dir":`, `"default_role":"quality","local_dir":`, 1)
+	writeConfigFixture(t, configPath, unrelatedConfig)
+	unrelatedReload, err := manager.reload(context.Background())
+	if err != nil || !unrelatedReload.Applied {
+		t.Fatalf("unrelated reload result=%#v err=%v", unrelatedReload, err)
+	}
+	if after := policies.Snapshot(); after.generation != committedGeneration || !reflect.DeepEqual(after.roles, snapshot.roles) {
+		t.Fatalf("unrelated reload changed steering policy: before=%#v after=%#v", snapshot, after)
+	}
+	if dirtied := dirty.Drain(); !dirtied.empty() {
+		t.Fatalf("unrelated reload dirtied steering repositories: %#v", dirtied)
+	}
+
+	writeConfigFixture(t, configPath, configData("committed despite later error", "committed-tag", "committed-exclusion", ReviewCompletionSignoff))
+	postCommit, err := manager.reload(&errorAfterErrChecks{Context: context.Background(), failAt: 4})
+	if err == nil || !postCommit.Applied {
+		t.Fatalf("post-commit reload result=%#v err=%v, want applied state with reconciliation error", postCommit, err)
+	}
+	committed := policies.Snapshot()
+	if committed.generation != snapshot.generation+1 {
+		t.Fatalf("post-commit policy generation=%d, want %d", committed.generation, snapshot.generation+1)
+	}
+	if committed.roles["coder"].NudgePrompt != "committed despite later error" || !reflect.DeepEqual(committed.roles["coder"].QueueFilters, ticketclient.QueueFilters{Tags: []string{"committed-tag"}}) {
+		t.Fatalf("post-commit error rolled back steer policy: %#v", committed)
+	}
+
+	generation := committed.generation
+	writeConfigFixture(t, configPath, configData("bad prompt", "invalid:tag", "new-exclusion", ReviewCompletionClose))
+	if _, err := manager.reload(context.Background()); err == nil {
+		t.Fatal("invalid policy reload succeeded")
+	}
+	afterFailure := policies.Snapshot()
+	if afterFailure.generation != generation || afterFailure.roles["coder"].NudgePrompt != "committed despite later error" {
+		t.Fatalf("pre-commit failure changed active policy: %#v", afterFailure)
+	}
+}
+
+type errorAfterErrChecks struct {
+	context.Context
+	calls  atomic.Int32
+	failAt int32
+}
+
+func (ctx *errorAfterErrChecks) Err() error {
+	if ctx.calls.Add(1) >= ctx.failAt {
+		return context.Canceled
+	}
+	return ctx.Context.Err()
 }
 
 func TestRunSupervisorIdleIsPersistentAndReleasesDaemonLock(t *testing.T) {
@@ -1510,7 +1789,7 @@ func TestRunSupervisorExecutableIdentityCancellationAndNoRespawn(t *testing.T) {
 	childDir := t.TempDir()
 	instanceDir := t.TempDir()
 	configPath := filepath.Join(instanceDir, "config.json")
-	stateDir := filepath.Join(instanceDir, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa")
+	stateDir := filepath.Join(instanceDir, ".local")
 	if err := os.WriteFile(configPath, []byte(`{"version":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2151,6 +2430,42 @@ func TestWorkerManagerReloadRejectsLocalRootChangeBeforeProbingOrApplying(t *tes
 	}
 	if _, err := os.Stat(filepath.Join(root, ".local", secondID)); !os.IsNotExist(err) {
 		t.Fatalf("reload created the candidate local root: %v", err)
+	}
+}
+
+func TestWorkerManagerReloadRejectsInstanceIDChangeBeforeProbingOrApplying(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	const firstID = "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
+	const secondID = "2e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
+	const workerConfig = `,"workers":{"one":{"role":"coder","actor":"one"}}`
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+firstID+`"`+workerConfig+`}`)
+	localDir := filepath.Join(root, ".local")
+	worker := supervisorTestWorker("one", localDir)
+	worker.Config.Actor = "one"
+	var probes atomic.Int32
+	manager := newWorkerManager(context.Background(), RunConfig{
+		ConfigPath: configPath, StateDir: localDir, InstanceID: firstID, Workers: []supervisor.RunWorker{worker},
+		repositoryProbe: func(context.Context, supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
+			probes.Add(1)
+			return ticketclient.RepositoryInfo{}, nil
+		},
+		Runtime: NewRuntimeState([]supervisor.RunWorker{worker}),
+	}, os.Args[0], io.Discard, io.Discard, nil)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+secondID+`"`+workerConfig+`}`)
+
+	if _, err := manager.reload(context.Background()); err == nil || !strings.Contains(err.Error(), "instance_id_changed") {
+		t.Fatalf("instance-ID reload error = %v, want instance_id_changed", err)
+	}
+	if probes.Load() != 0 {
+		t.Fatalf("candidate repositories were probed before identity rejection: %d", probes.Load())
+	}
+	if manager.instanceID != firstID {
+		t.Fatalf("active instance ID changed to %q, want %q", manager.instanceID, firstID)
+	}
+	current, ok := manager.lifecycle.Worker("one")
+	if !ok || current.Config.Actor != "one" || len(manager.snapshotWorkers()) != 1 {
+		t.Fatalf("active worker config changed after identity rejection: %#v", current)
 	}
 }
 

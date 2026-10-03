@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
 )
 
 const steerTestThread = "01a0da4e-aa3a-78d3-87ba-b5972a10e2a5"
@@ -80,11 +82,11 @@ func TestJoinRejoinRoleChangeAndLeaveContract(t *testing.T) {
 	}
 	store := state.NewRegistrationStore(dir)
 	registration, ok, err := store.Find(context.Background(), "d659917f-5939-4e93-bfde-6346a0f2bc50", "reviewer")
-	if err != nil || !ok || registration.Role != "reviewer" || registration.CodexHome != filepath.Join(dir, "codex") || registration.RegistrationID == "" {
+	if err != nil || !ok || registration.Role != "reviewer" || registration.Harness != "codex" || registration.Transport.Kind != "codex-queue" || registration.Transport.Params["home"] != filepath.Join(dir, "codex") || registration.RegistrationID == "" {
 		t.Fatalf("registration=%#v ok=%v err=%v", registration, ok, err)
 	}
 	firstRegistrationID := registration.RegistrationID
-	if registration.RepositoryPath != repositoryDir || registration.ThreadID != thread {
+	if registration.RepositoryPath != repositoryDir || registration.SessionID != thread {
 		t.Fatalf("registration routing = %#v", registration)
 	}
 	output.Reset()
@@ -110,6 +112,125 @@ func TestJoinRejoinRoleChangeAndLeaveContract(t *testing.T) {
 	}
 	if _, ok, err := store.Find(context.Background(), registration.RepositoryID, registration.Actor); err != nil || ok {
 		t.Fatalf("registration remains after leave: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExplicitSpoolJoinReturnsPreparedEndpointJSONWithoutCodexEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	repositoryDir := t.TempDir()
+	writeSteerConfig(t, dir)
+	lookup := mapEnv(map[string]string{"TICKET_ORC": dir})
+	runner, _ := fakeTicketRunner("", repositoryDir)
+	selector := steerEndpointSelector{Harness: "pi-extension", SessionID: "opaque/session-42", Transport: "spool", Explicit: true}
+	var output bytes.Buffer
+	if err := joinWithEndpointConfigRunner(context.Background(), "reviewer", "", selector, true, &output, lookup, runner, nil); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		OrcID          string `json:"orc_id"`
+		RepositoryID   string `json:"repository_id"`
+		Actor          string `json:"actor"`
+		Role           string `json:"role"`
+		Harness        string `json:"harness"`
+		Session        string `json:"session"`
+		RegistrationID string `json:"registration_id"`
+		IncarnationID  string `json:"incarnation_id"`
+		Transport      struct {
+			Kind     string `json:"kind"`
+			Protocol int    `json:"protocol"`
+			Root     string `json:"root"`
+			Pending  string `json:"pending"`
+			Control  string `json:"control"`
+			Rejected string `json:"rejected"`
+		} `json:"transport"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := filepath.Join(dir, "steer-spool", result.RegistrationID, result.IncarnationID)
+	if result.OrcID == "" || result.RepositoryID != localRepoID || result.Actor != "reviewer" || result.Role != "reviewer" ||
+		result.Harness != selector.Harness || result.Session != selector.SessionID || len(result.RegistrationID) != 32 || len(result.IncarnationID) != 32 ||
+		result.Transport.Kind != "spool" || result.Transport.Protocol != 1 || result.Transport.Root != wantRoot ||
+		result.Transport.Pending != filepath.Join(wantRoot, "pending") || result.Transport.Control != filepath.Join(wantRoot, "control") || result.Transport.Rejected != filepath.Join(wantRoot, "rejected") {
+		t.Fatalf("join result=%#v", result)
+	}
+	if strings.Contains(output.String(), "codex") {
+		t.Fatalf("explicit endpoint join depended on Codex or exposed Codex data: %s", output.String())
+	}
+}
+
+type failingSpoolTransport struct{ err error }
+
+func (*failingSpoolTransport) Kind() string { return "spool" }
+func (transport *failingSpoolTransport) Prepare(context.Context, string, state.SteerRegistration) (steertransport.Endpoint, error) {
+	return steertransport.Endpoint{}, transport.err
+}
+func (transport *failingSpoolTransport) Verify(context.Context, string, state.SteerRegistration) (steertransport.Endpoint, error) {
+	return steertransport.Endpoint{}, transport.err
+}
+func (*failingSpoolTransport) Deliver(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+	return nil
+}
+func (*failingSpoolTransport) Retire(context.Context, string, state.SteerRegistration) error {
+	return nil
+}
+
+func TestFailedExplicitEndpointPreparationPreservesWorkingCodexRegistration(t *testing.T) {
+	dir := t.TempDir()
+	writeSteerConfig(t, dir)
+	lookup := mapEnv(map[string]string{"TICKET_ORC": dir, "CODEX_THREAD_ID": steerTestThread, "CODEX_HOME": filepath.Join(dir, "codex")})
+	runner, _ := fakeTicketRunner("")
+	var output bytes.Buffer
+	if err := joinWithRunner(context.Background(), "reviewer", &output, lookup, runner); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewRegistrationStore(dir)
+	previous, ok, err := store.Find(context.Background(), localRepoID, "reviewer")
+	if err != nil || !ok {
+		t.Fatalf("previous registration=%#v ok=%v err=%v", previous, ok, err)
+	}
+	prepareErr := errors.New("spool directory unavailable")
+	router, err := steertransport.NewRouter(&failingSpoolTransport{err: prepareErr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := steerEndpointSelector{Harness: "future-harness", SessionID: "future-session", Transport: "spool", Explicit: true}
+	if err := joinWithEndpointConfigRunner(context.Background(), "reviewer", "", selector, false, &output, lookup, runner, router); err == nil || !strings.Contains(err.Error(), prepareErr.Error()) {
+		t.Fatalf("failed preparation error = %v", err)
+	}
+	current, ok, err := store.Find(context.Background(), localRepoID, "reviewer")
+	if err != nil || !ok || current.RegistrationID != previous.RegistrationID || current.IncarnationID != previous.IncarnationID || current.Transport.Kind != "codex-queue" {
+		t.Fatalf("failed preparation replaced working route: %#v ok=%v err=%v", current, ok, err)
+	}
+}
+
+func TestEndpointSelectorIsAllOrNothing(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "harness only", args: []string{"--harness", "pi"}, want: "supplied together"},
+		{name: "session only", args: []string{"--session=s"}, want: "supplied together"},
+		{name: "transport only", args: []string{"--transport", "spool"}, want: "supplied together"},
+		{name: "unsupported transport", args: []string{"--harness", "pi", "--session", "s", "--transport", "other"}, want: "unsupported explicit"},
+		{name: "invalid harness", args: []string{"--harness", "../pi", "--session", "s", "--transport", "spool"}, want: "invalid steering harness"},
+		{name: "duplicate", args: []string{"--harness", "pi", "--harness", "pi", "--session", "s", "--transport", "spool"}, want: "duplicate flag"},
+		{name: "complete", args: []string{"reviewer", "--harness", "pi", "--session", "s", "--transport", "spool"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remaining, selector, err := extractEndpointSelector(test.args)
+			if test.want != "" {
+				if err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("selector=%#v remaining=%v err=%v", selector, remaining, err)
+				}
+				return
+			}
+			if err != nil || !selector.Explicit || selector.Harness != "pi" || selector.SessionID != "s" || selector.Transport != "spool" || !reflect.DeepEqual(remaining, []string{"reviewer"}) {
+				t.Fatalf("selector=%#v remaining=%v err=%v", selector, remaining, err)
+			}
+		})
 	}
 }
 
@@ -255,7 +376,7 @@ func TestWhoamiJSONUsesCurrentSessionRegistration(t *testing.T) {
 	}
 }
 
-func TestTicketIdentityUsesEffectiveDefaultCodexHome(t *testing.T) {
+func TestLegacyEndpointUsesEffectiveDefaultCodexHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -264,7 +385,19 @@ func TestTicketIdentityUsesEffectiveDefaultCodexHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.CodexHome != filepath.Join(home, ".codex") || !filepath.IsAbs(identity.CodexHome) {
-		t.Fatalf("effective Codex home=%q, want absolute default under %q", identity.CodexHome, home)
+	if got := identity.Transport.Params["home"]; got != filepath.Join(home, ".codex") || !filepath.IsAbs(got) {
+		t.Fatalf("effective Codex home=%q, want absolute default under %q", got, home)
+	}
+}
+
+func TestTicketRoutingIdentityDoesNotDependOnCodexEnvironment(t *testing.T) {
+	runner, calls := fakeTicketRunner("", t.TempDir())
+	identity, err := discoverTicketRoutingIdentity(context.Background(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Actor != "reviewer" || identity.RepositoryID != localRepoID || identity.RepositoryPath == "" ||
+		!reflect.DeepEqual(*calls, [][]string{{"actor", "-j"}, {"info", "-j"}}) {
+		t.Fatalf("Ticket routing identity=%#v calls=%#v", identity, *calls)
 	}
 }

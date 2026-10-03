@@ -21,6 +21,7 @@ type workerManager struct {
 	ctx               context.Context
 	configPath        string
 	localDir          string
+	instanceID        string
 	executable        string
 	lifecycle         *supervisor.LifecycleManager[supervisor.RunWorker, *runChild]
 	configMu          sync.Mutex
@@ -49,6 +50,8 @@ type workerManager struct {
 	runtimeEventSink        func(supervisor.RuntimeEvent)
 	runtime                 *supervisor.RuntimeState[supervisor.RunWorker]
 	dispatchGate            *dispatchGate
+	steerPolicies           *steerPolicyStore
+	steerDirty              *steerDirtySet
 	results                 chan struct {
 		child *runChild
 		err   error
@@ -65,6 +68,7 @@ func newWorkerManager(ctx context.Context, config RunConfig, executable string, 
 		starter = config.startChild
 	}
 	childStdout, childStderr := stdout, stderr
+	steerPolicies := config.steerPolicies
 	if config.Interactive {
 		// Interactive consoles own the terminal. Raw child streams can contain
 		// prompts, diagnostics, and opaque transport targets that bypass the
@@ -73,7 +77,7 @@ func newWorkerManager(ctx context.Context, config RunConfig, executable string, 
 		childStdout, childStderr = io.Discard, io.Discard
 	}
 	manager := &workerManager{
-		ctx: ctx, configPath: config.ConfigPath, localDir: config.StateDir, executable: executable,
+		ctx: ctx, configPath: config.ConfigPath, localDir: config.StateDir, instanceID: config.InstanceID, executable: executable,
 		starter: starter, stdout: stdout, stderr: stderr, childStdout: childStdout, childStderr: childStderr,
 		outputMu: &sync.Mutex{}, errorMu: &sync.Mutex{}, transition: transition,
 		ticketProbe:       config.ticketProbe,
@@ -86,6 +90,8 @@ func newWorkerManager(ctx context.Context, config RunConfig, executable string, 
 		preflighted:       make(map[string]bool, len(config.Workers)),
 		runtime:           config.Runtime,
 		dispatchGate:      config.dispatchGate,
+		steerPolicies:     steerPolicies,
+		steerDirty:        config.steerDirty,
 		results: make(chan struct {
 			child *runChild
 			err   error
@@ -197,6 +203,16 @@ func (m *workerManager) reload(ctx context.Context) (supervisor.ReloadResult, er
 		return supervisor.ReloadResult{}, &supervisor.LifecycleError{
 			Code:    "local_root_changed",
 			Message: "candidate config selects a different local runtime root; restart the daemon with the selected config",
+		}
+	}
+	candidateSteerPolicies, err := resolveSteerRolePolicies(loaded.Config, os.LookupEnv)
+	if err != nil {
+		return supervisor.ReloadResult{}, &supervisor.LifecycleError{Code: "invalid_config", Message: "candidate steering policy is invalid", Cause: err}
+	}
+	if m.instanceID != "" && loaded.Config.ID != m.instanceID {
+		return supervisor.ReloadResult{}, &supervisor.LifecycleError{
+			Code:    "instance_id_changed",
+			Message: "candidate config selects a different instance ID; restart the daemon with the selected config",
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -341,6 +357,12 @@ func (m *workerManager) reload(ctx context.Context) (supervisor.ReloadResult, er
 					}
 				}
 				m.runtime.SetRevision(revision)
+			}
+			if m.steerPolicies != nil {
+				_, policyChanged := m.steerPolicies.Replace(candidateSteerPolicies)
+				if policyChanged && m.steerDirty != nil {
+					m.steerDirty.MarkAll()
+				}
 			}
 			return revision
 		},

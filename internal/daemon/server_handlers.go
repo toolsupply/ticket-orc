@@ -29,6 +29,46 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"workers": status.Workers})
 }
 
+func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	// A missing callback intentionally reports an empty inventory. The
+	// callback is the only source of group names; worker metadata is not a
+	// second registry for this endpoint.
+	var names []string
+	if s.config.Control != nil && s.config.Control.Groups != nil {
+		names = s.config.Control.Groups()
+	}
+	if len(names) > maxGroupInventoryEntries {
+		writeError(w, http.StatusServiceUnavailable, "group_inventory_unavailable", "group inventory exceeds the response bound")
+		return
+	}
+	groups := make([]GroupStatus, 0, len(names))
+	for _, name := range names {
+		if !validPublicGroupName(name) {
+			writeError(w, http.StatusServiceUnavailable, "group_inventory_unavailable", "group inventory contains an invalid name")
+			return
+		}
+		groups = append(groups, GroupStatus{Name: name})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+}
+
+func validPublicGroupName(name string) bool {
+	if name == "" || len(name) > maxPublicGroupNameBytes || name == "." || name == ".." || strings.TrimSpace(name) != name {
+		return false
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleDaemonPause(w http.ResponseWriter, r *http.Request) {
 	var callback func(context.Context) (DaemonControlResult, error)
 	if s.config.Control != nil {
@@ -99,16 +139,23 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "stream_unavailable", "event stream is unavailable")
 		return
 	}
-	id, events, ok := s.events.subscribe()
+	id, baseline, events, ok := s.events.subscribe()
 	if !ok {
 		writeError(w, http.StatusConflict, "daemon_stopping", "daemon is stopping")
 		return
 	}
 	defer s.events.unsubscribe(id)
+	syncEvent, err := encodeSSEEvent(Event{Seq: baseline, Type: "stream.sync"})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "stream_unavailable", "event stream is unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
-	_, _ = io.WriteString(w, ": connected\n\n")
+	if _, err := w.Write(syncEvent); err != nil {
+		return
+	}
 	flusher.Flush()
 	heartbeat := time.NewTicker(s.config.EventHeartbeat)
 	defer heartbeat.Stop()
@@ -140,15 +187,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) currentStatus() Status {
-	status := Status{Version: s.config.Version, Protocol: s.config.Protocol, PID: s.config.PID, URL: s.endpoint.URL, StartedAt: s.startedAt}
+	status := Status{Version: s.config.Version, InstanceID: s.config.InstanceID, Protocol: s.config.Protocol, PID: s.config.PID, URL: s.endpoint.URL, StartedAt: s.startedAt}
 	if s.config.Status != nil {
 		status = s.config.Status()
 		status.Version = s.config.Version
+		status.InstanceID = s.config.InstanceID
 		status.Protocol = s.config.Protocol
 		status.PID = s.config.PID
 		status.URL = s.endpoint.URL
 		status.StartedAt = s.startedAt
 	}
+	status.Capabilities = s.capabilities()
 	if s.config.Control != nil && s.config.Control.DaemonMode != nil {
 		status.Mode = s.config.Control.DaemonMode()
 	}

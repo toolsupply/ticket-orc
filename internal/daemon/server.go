@@ -14,6 +14,8 @@ const (
 	defaultShutdownTimeout   = 5 * time.Second
 	defaultEventHeartbeat    = 15 * time.Second
 	maxRequestBody           = 1 << 20
+	maxGroupInventoryEntries = 256
+	maxPublicGroupNameBytes  = 64
 )
 
 // ErrRequestTooLarge identifies a request body rejected by the bounded JSON
@@ -23,30 +25,41 @@ var ErrRequestTooLarge = errors.New("request body too large")
 // WorkerStatus is the public, deliberately small worker representation used
 // by the status endpoint. It contains no prompts, credentials, or environment.
 type WorkerStatus struct {
-	Name                 string         `json:"name"`
-	Role                 string         `json:"role,omitempty"`
-	Harness              string         `json:"harness,omitempty"`
-	TicketActor          string         `json:"ticket_actor,omitempty"`
-	TicketActivityAt     time.Time      `json:"ticket_activity_at,omitempty"`
-	TicketActivity       string         `json:"ticket_activity,omitempty"`
-	TicketActivityTicket string         `json:"ticket_activity_ticket,omitempty"`
-	TicketActivitySource string         `json:"ticket_activity_source,omitempty"`
-	State                string         `json:"state"`
-	Reason               string         `json:"reason,omitempty"`
-	Failure              *WorkerFailure `json:"failure,omitempty"`
-	TicketFrontierState  string         `json:"ticket_frontier_state,omitempty"`
-	RepositoryID         string         `json:"repository_id,omitempty"`
-	RepositoryName       string         `json:"repository_name,omitempty"`
-	RepositoryKey        string         `json:"repository_key,omitempty"`
-	RepositoryPath       string         `json:"repository_path,omitempty"`
-	TicketConfig         string         `json:"ticket_config,omitempty"`
-	TicketScope          string         `json:"ticket_scope,omitempty"`
-	Groups               []string       `json:"groups,omitempty"`
+	Name                    string         `json:"name"`
+	Role                    string         `json:"role,omitempty"`
+	EffectiveRoleName       string         `json:"effective_role_name,omitempty"`
+	EffectiveTicketQueue    string         `json:"effective_ticket_queue,omitempty"`
+	Harness                 string         `json:"harness,omitempty"`
+	TicketActor             string         `json:"ticket_actor,omitempty"`
+	TicketActivityAt        time.Time      `json:"ticket_activity_at,omitempty"`
+	TicketActivity          string         `json:"ticket_activity,omitempty"`
+	TicketActivityTicket    string         `json:"ticket_activity_ticket,omitempty"`
+	TicketActivitySource    string         `json:"ticket_activity_source,omitempty"`
+	State                   string         `json:"state"`
+	Reason                  string         `json:"reason,omitempty"`
+	Failure                 *WorkerFailure `json:"failure,omitempty"`
+	TicketFrontierState     string         `json:"ticket_frontier_state,omitempty"`
+	EffectiveTicketTags     []string       `json:"effective_ticket_tags,omitempty"`
+	EffectiveReviewSkipTags []string       `json:"effective_review_skip_tags,omitempty"`
+	RepositoryID            string         `json:"repository_id,omitempty"`
+	RepositoryName          string         `json:"repository_name,omitempty"`
+	RepositoryKey           string         `json:"repository_key,omitempty"`
+	RepositoryPath          string         `json:"repository_path,omitempty"`
+	TicketConfig            string         `json:"ticket_config,omitempty"`
+	TicketScope             string         `json:"ticket_scope,omitempty"`
+	Groups                  []string       `json:"groups,omitempty"`
+}
+
+// GroupStatus is the bounded public projection of one managed group.
+type GroupStatus struct {
+	Name string `json:"name"`
 }
 
 // Status is the authoritative daemon snapshot exposed to local clients.
 type Status struct {
 	Version        string             `json:"version"`
+	InstanceID     string             `json:"instance_id"`
+	Capabilities   Capabilities       `json:"capabilities"`
 	Protocol       int                `json:"protocol"`
 	PID            int                `json:"pid"`
 	URL            string             `json:"url"`
@@ -61,12 +74,16 @@ type Status struct {
 // SteerStatus reports one dynamic external session without exposing its home
 // directory or prompt.
 type SteerStatus struct {
-	RepositoryID   string `json:"repository_id"`
-	RepositoryName string `json:"repository_name,omitempty"`
-	Role           string `json:"role"`
-	Actor          string `json:"actor"`
-	Session        string `json:"session,omitempty"`
-	State          string `json:"state"`
+	RepositoryID            string   `json:"repository_id"`
+	RepositoryName          string   `json:"repository_name,omitempty"`
+	Role                    string   `json:"role"`
+	Actor                   string   `json:"actor"`
+	Harness                 string   `json:"harness,omitempty"`
+	Session                 string   `json:"session,omitempty"`
+	EffectiveTicketQueue    string   `json:"effective_ticket_queue,omitempty"`
+	EffectiveTicketTags     []string `json:"effective_ticket_tags,omitempty"`
+	EffectiveReviewSkipTags []string `json:"effective_review_skip_tags,omitempty"`
+	State                   string   `json:"state"`
 	// Ticket identifies the active claim when one was observed.
 	Ticket          string `json:"ticket,omitempty"`
 	Code            string `json:"code,omitempty"`
@@ -93,6 +110,7 @@ type RepositoryStatus struct {
 // request and should return a snapshot without blocking on external clients.
 type Config struct {
 	StateDir    string
+	InstanceID  string
 	EndpointKey string
 	// ListenAddress selects the IP literal to bind. Empty uses the default address.
 	ListenAddress string

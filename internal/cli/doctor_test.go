@@ -30,6 +30,13 @@ func TestParseDoctorConfig(t *testing.T) {
 	if _, help, err := parseDoctorConfig([]string{"--help"}, emptyEnv); err != nil || !help {
 		t.Fatalf("doctor help=%v err=%v", help, err)
 	}
+	got, help, err = parseDoctorConfig([]string{"--reset-local", "--config", "workers.json"}, emptyEnv)
+	if err != nil || help || !got.resetLocal || got.configPath != "workers.json" {
+		t.Fatalf("reset-local doctor config=%#v help=%v err=%v", got, help, err)
+	}
+	if _, _, err := parseDoctorConfig([]string{"--reset-local", "--reset-local"}, emptyEnv); err == nil {
+		t.Fatal("duplicate --reset-local accepted")
+	}
 }
 
 func TestOrdinaryRunDoesNotEnableDoctorRecovery(t *testing.T) {

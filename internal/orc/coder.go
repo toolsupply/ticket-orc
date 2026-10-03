@@ -36,6 +36,7 @@ type CoderConfig struct {
 	ClaudePermissionMode       string
 	ReviewCompletion           string
 	ReviewSkipTags             []string
+	QueueFilters               ticketclient.QueueFilters
 	TicketPrompt               string
 	WorkingDir                 string
 	Operator                   io.Writer
@@ -44,7 +45,7 @@ type CoderConfig struct {
 }
 
 type CoderTickets interface {
-	WaitAndClaimImplementation(context.Context) (ticketclient.Ticket, error)
+	WaitAndClaimImplementation(context.Context, ticketclient.QueueFilters) (ticketclient.Ticket, error)
 	Show(context.Context, string) (ticketclient.Ticket, error)
 	Release(context.Context, string) (ticketclient.Transition, error)
 }
@@ -130,7 +131,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		claimed, err := tickets.WaitAndClaimImplementation(ctx)
+		claimed, err := tickets.WaitAndClaimImplementation(ctx, config.QueueFilters)
 		if err != nil {
 			return &WorkWaitError{Role: "coder", Cause: err}
 		}
@@ -167,7 +168,18 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		observed, runErr := tickets.Show(ctx, claimed.ID)
 		turnErr := errors.Join(turn.err, runErr)
 		if runErr != nil {
+			if turn.err != nil && turn.result.SessionID == "" && ctx.Err() == nil {
+				logCoder(config.Diagnostics, "%s: automatic claim recovery skipped because Ticket state could not be verified", claimed.ID)
+			}
 			return turnErr
+		}
+		if attempted, released, recoveryErr := releaseFailedStartupClaim(ctx, tickets, claimed.ID, config.Actor, "open", turn.result, turn.err, observed); attempted {
+			if released {
+				logCoder(config.Diagnostics, "%s: failed before session startup; released unchanged open claim", claimed.ID)
+			} else {
+				logCoder(config.Diagnostics, "%s: automatic claim recovery failed after pre-session harness failure", claimed.ID)
+			}
+			return fmt.Errorf("coder turn for %s: %w", claimed.ID, recoveryErr)
 		}
 		observed.State = ticketclient.NormalizeLifecycleState(observed.State)
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "coder", State: observed.State, Ticket: observed.ID})

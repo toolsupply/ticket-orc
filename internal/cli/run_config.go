@@ -9,33 +9,37 @@ import (
 	"strings"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
 // RunConfig describes one foreground supervisor invocation.
 type RunConfig struct {
-	ConfigPath      string
-	StateDir        string
-	ListenAddress   string
-	Port            int
-	EndpointKey     string
-	Interactive     bool
-	Doctor          bool
-	Repositories    supervisor.RepositoryRegistry
-	Workers         []supervisor.RunWorker
-	Diagnostics     []ConfigDiagnostic
-	SteerRoles      map[string]steerRolePolicy
-	steerStatus     *dynamicSteerStatus
-	dispatchGate    *dispatchGate
-	steerWake       chan struct{}
-	Runtime         *supervisor.RuntimeState[supervisor.RunWorker]
-	Hooks           supervisor.SupervisorHooks
-	startChild      runChildStarter
-	startDaemon     runDaemonStarter
-	ticketProbe     func(context.Context, supervisor.RunWorker) (ticketclient.RepositoryInfo, error)
-	repositoryProbe repositoryProbe
-	control         *daemon.Control
+	ConfigPath         string
+	StateDir           string
+	InstanceID         string
+	LocalDirConfigured bool
+	ListenAddress      string
+	Port               int
+	EndpointKey        string
+	Interactive        bool
+	Doctor             bool
+	Repositories       supervisor.RepositoryRegistry
+	Workers            []supervisor.RunWorker
+	Diagnostics        []ConfigDiagnostic
+	steerPolicies      *steerPolicyStore
+	steerStatus        *dynamicSteerStatus
+	dispatchGate       *dispatchGate
+	steerDirty         *steerDirtySet
+	startupGuard       *state.Lock
+	Runtime            *supervisor.RuntimeState[supervisor.RunWorker]
+	Hooks              supervisor.SupervisorHooks
+	startChild         runChildStarter
+	startDaemon        runDaemonStarter
+	ticketProbe        func(context.Context, supervisor.RunWorker) (ticketclient.RepositoryInfo, error)
+	repositoryProbe    repositoryProbe
+	control            *daemon.Control
 }
 
 type runDaemonStarter func(context.Context, *supervisor.RuntimeState[supervisor.RunWorker], []supervisor.RunWorker) (*daemon.Server, error)
@@ -224,21 +228,33 @@ func parseRunConfig(args []string, lookupEnv envLookup) (RunConfig, bool, error)
 		return RunConfig{}, false, diagnostics
 	}
 	stateDir := loaded.Instance.LocalDir
-	steerRoles := make(map[string]steerRolePolicy, len(loaded.Config.Roles))
-	for name, role := range loaded.Config.Roles {
+	steerRoles, err := resolveSteerRolePolicies(loaded.Config, lookupEnv)
+	if err != nil {
+		return RunConfig{}, false, err
+	}
+	return RunConfig{ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, InstanceID: loaded.Config.ID, LocalDirConfigured: loaded.Instance.LocalDirConfigured, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, Diagnostics: diagnostics, steerPolicies: newSteerPolicyStore(steerRoles), steerStatus: &dynamicSteerStatus{}}, false, nil
+}
+
+func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[string]steerRolePolicy, error) {
+	steerRoles := make(map[string]steerRolePolicy, len(config.Roles))
+	for name, role := range config.Roles {
 		reviewCompletion := ""
 		if role.TicketQueue == "review" {
-			reviewCompletion = firstNonEmpty(role.ReviewCompletion, loaded.Config.Defaults.ReviewCompletion, ReviewCompletionSignoff)
+			reviewCompletion = firstNonEmpty(role.ReviewCompletion, config.Defaults.ReviewCompletion, ReviewCompletionSignoff)
 			if value, ok := lookupEnv("TICKET_ORC_REVIEW_COMPLETION"); ok {
 				if !oneOf(value, ReviewCompletionSignoff, ReviewCompletionClose) {
-					return RunConfig{}, false, configValidation("review_completion.invalid", "review_completion", "review completion is invalid", "set TICKET_ORC_REVIEW_COMPLETION to signoff or close")
+					return nil, configValidation("review_completion.invalid", "review_completion", "review completion is invalid", "set TICKET_ORC_REVIEW_COMPLETION to signoff or close")
 				}
 				reviewCompletion = value
 			}
 		}
-		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion}
+		filters, err := resolvedRoleQueueFilters(role, config.Review)
+		if err != nil {
+			return nil, err
+		}
+		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion}
 	}
-	return RunConfig{ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, Diagnostics: diagnostics, SteerRoles: steerRoles, steerStatus: &dynamicSteerStatus{}}, false, nil
+	return steerRoles, nil
 }
 
 func resolveAllWorkers(loaded LoadedFileConfig, lookupEnv envLookup) (map[string]supervisor.RunWorker, ConfigDiagnostics) {

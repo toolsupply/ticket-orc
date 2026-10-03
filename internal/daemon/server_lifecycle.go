@@ -98,6 +98,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.endpoint = Endpoint{
 			Version:       endpointVersion,
 			Protocol:      s.config.Protocol,
+			InstanceID:    s.config.InstanceID,
 			PID:           s.config.PID,
 			URL:           "http://" + net.JoinHostPort(clientAddressForListener(s.config.ListenAddress), strconv.Itoa(addr.Port)),
 			ListenAddress: addr.IP.String(),

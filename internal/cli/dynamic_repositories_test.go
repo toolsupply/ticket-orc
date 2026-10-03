@@ -30,8 +30,8 @@ func dynamicTestRegistration(t *testing.T, actor, path string) state.SteerRegist
 	}
 	return state.SteerRegistration{
 		RepositoryID: dynamicTestRepositoryID, RepositoryPath: repositoryPath, RepositoryName: "Ticket project",
-		RegistrationID: "11111111111111111111111111111111", JoinSignal: "22222222222222222222222222222222",
-		Actor: actor, Role: "coder", CodexHome: codexHome, ThreadID: "01a0da4e-aa3a-78d3-87ba-b5972a10e2a5",
+		RegistrationID: "11111111111111111111111111111111", IncarnationID: "22222222222222222222222222222222",
+		Actor: actor, Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(codexHome), SessionID: "01a0da4e-aa3a-78d3-87ba-b5972a10e2a5",
 	}
 }
 
@@ -129,6 +129,162 @@ func TestDynamicRepositoryDiscoveryRejectsChangedIdentityAtSamePath(t *testing.T
 	}
 }
 
+func TestDynamicRepositoryIdentityCacheReusesAndSeparatesIdentities(t *testing.T) {
+	first := dynamicTestRegistration(t, "first", "/ticket/first")
+	second := dynamicTestRegistration(t, "second", "/ticket/second")
+	second.RepositoryID = joinOtherRepositoryID
+	registrations := []state.SteerRegistration{first, second}
+	cache := newDynamicRepositoryIdentityCache()
+	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	probes := 0
+	probe := func(_ context.Context, registration state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+		probes++
+		return ticketclient.RepositoryInfo{ID: registration.RepositoryID, Path: registration.RepositoryPath}, nil
+	}
+	resolved, statuses := resolveDynamicRepositoriesWithCache(context.Background(), registrations, nil, probe, cache, now)
+	if len(resolved) != 2 || len(statuses) != 2 || probes != 2 {
+		t.Fatalf("initial identities resolved=%#v statuses=%#v probes=%d", resolved, statuses, probes)
+	}
+	resolved, statuses = resolveDynamicRepositoriesWithCache(context.Background(), registrations, nil, probe, cache, now.Add(time.Second))
+	if len(resolved) != 2 || len(statuses) != 2 || probes != 2 {
+		t.Fatalf("unchanged identities were not cached: resolved=%#v statuses=%#v probes=%d", resolved, statuses, probes)
+	}
+}
+
+func TestDynamicRepositoryIdentityCacheInvalidatesPathAndConflicts(t *testing.T) {
+	registration := dynamicTestRegistration(t, "coder", "/ticket/project")
+	cache := newDynamicRepositoryIdentityCache()
+	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	probes := 0
+	probe := func(_ context.Context, current state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+		probes++
+		return ticketclient.RepositoryInfo{ID: current.RepositoryID, Path: current.RepositoryPath}, nil
+	}
+	first, _ := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, probe, cache, now)
+	if len(first) != 1 || probes != 1 {
+		t.Fatalf("initial path verification resolved=%#v probes=%d", first, probes)
+	}
+	changedPath := registration
+	changedPath.RepositoryPath = t.TempDir()
+	failedProbe := func(context.Context, state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+		probes++
+		return ticketclient.RepositoryInfo{}, errors.New("unavailable")
+	}
+	changed, statuses := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{changedPath}, nil, failedProbe, cache, now.Add(time.Second))
+	if len(changed) != 0 || len(statuses) != 1 || probes != 2 {
+		t.Fatalf("changed path reused old trust: resolved=%#v statuses=%#v probes=%d", changed, statuses, probes)
+	}
+	conflicting := changedPath
+	conflicting.Actor = "reviewer"
+	conflicting.RepositoryPath = t.TempDir()
+	conflicted, statuses := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{changedPath, conflicting}, nil, probe, cache, now.Add(2*time.Second))
+	if len(conflicted) != 0 || len(statuses) != 1 || probes != 2 {
+		t.Fatalf("conflicting routes should invalidate without probing: resolved=%#v statuses=%#v probes=%d", conflicted, statuses, probes)
+	}
+	repaired, _ := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{changedPath}, nil, probe, cache, now.Add(3*time.Second))
+	if len(repaired) != 1 || probes != 3 {
+		t.Fatalf("route repair reused trust invalidated by conflict: resolved=%#v probes=%d", repaired, probes)
+	}
+}
+
+func TestDynamicRepositoryIdentityCacheRetriesFailuresAndRevalidates(t *testing.T) {
+	for _, mismatch := range []bool{false, true} {
+		name := "probe failure"
+		if mismatch {
+			name = "identity mismatch"
+		}
+		t.Run(name, func(t *testing.T) {
+			registration := dynamicTestRegistration(t, "coder", "/ticket/project")
+			cache := newDynamicRepositoryIdentityCache()
+			now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+			probes := 0
+			probe := func(_ context.Context, current state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+				probes++
+				if probes == 2 {
+					if mismatch {
+						return ticketclient.RepositoryInfo{ID: joinOtherRepositoryID}, nil
+					}
+					return ticketclient.RepositoryInfo{}, errors.New("temporary Ticket outage")
+				}
+				return ticketclient.RepositoryInfo{ID: current.RepositoryID, Path: current.RepositoryPath}, nil
+			}
+			initial, _ := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, probe, cache, now)
+			if len(initial) != 1 || probes != 1 {
+				t.Fatalf("initial verification=%#v probes=%d", initial, probes)
+			}
+			failed, statuses := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, probe, cache, now.Add(dynamicRepositoryReverifyInterval))
+			if len(failed) != 0 || len(statuses) != 1 || statuses[0].State != "degraded" || probes != 2 {
+				t.Fatalf("failed revalidation retained target=%#v statuses=%#v probes=%d", failed, statuses, probes)
+			}
+			_, _ = resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, probe, cache, now.Add(dynamicRepositoryReverifyInterval+time.Second))
+			if probes != 2 {
+				t.Fatalf("failed probe retried before retry interval: probes=%d", probes)
+			}
+			recovered, _ := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, probe, cache, now.Add(dynamicRepositoryReverifyInterval+dynamicRepositoryRetryInterval))
+			if len(recovered) != 1 || probes != 3 {
+				t.Fatalf("failed verification did not retry at bounded cadence: resolved=%#v probes=%d", recovered, probes)
+			}
+		})
+	}
+}
+
+func TestDynamicRepositoryPathChangeWithdrawsOldTargetBeforeProbe(t *testing.T) {
+	registration := dynamicTestRegistration(t, "coder", "/ticket/old")
+	cache := newDynamicRepositoryIdentityCache()
+	now := time.Now()
+	initial, _ := resolveDynamicRepositoriesWithCache(context.Background(), []state.SteerRegistration{registration}, nil, func(_ context.Context, current state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+		return ticketclient.RepositoryInfo{ID: current.RepositoryID, Path: current.RepositoryPath}, nil
+	}, cache, now)
+	manager := &workerManager{
+		repositories: supervisor.RepositoryRegistry{}, repositoriesByID: map[string]supervisor.ConfiguredRepository{},
+		dynamicReposByID: map[string]supervisor.ConfiguredRepository{}, dynamicStatusKeys: map[string]bool{}, runtime: NewRuntimeState(nil),
+	}
+	manager.replaceDynamicRepositories(initial, []supervisor.RepositoryStatus{{ID: registration.RepositoryID, Key: dynamicRepositoryKey(registration.RepositoryID), State: "healthy"}})
+	changed := registration
+	changed.RepositoryPath = t.TempDir()
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		applyDynamicRepositoryObservationWithCache(context.Background(), manager, func(_ context.Context, current state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+			close(probeStarted)
+			<-probeRelease
+			return ticketclient.RepositoryInfo{ID: current.RepositoryID, Path: current.RepositoryPath}, nil
+		}, registrationObservation{Registrations: []state.SteerRegistration{changed}}, cache, now.Add(time.Second))
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		close(probeRelease)
+		t.Fatal("new path was not probed")
+	}
+	if _, err := manager.repositoryTarget(registration.RepositoryID); err == nil {
+		close(probeRelease)
+		t.Fatal("old path remained active while the new path was unverified")
+	}
+	close(probeRelease)
+	<-done
+	resolved, err := manager.repositoryTarget(registration.RepositoryID)
+	if err != nil || resolved.Target.Repository != changed.RepositoryPath {
+		t.Fatalf("verified replacement target=%#v err=%v", resolved, err)
+	}
+	conflicting := changed
+	conflicting.Actor = "reviewer"
+	conflicting.RepositoryPath = t.TempDir()
+	applyDynamicRepositoryObservationWithCache(context.Background(), manager, func(context.Context, state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+		t.Fatal("conflicting registrations must not be probed")
+		return ticketclient.RepositoryInfo{}, nil
+	}, registrationObservation{Registrations: []state.SteerRegistration{changed, conflicting}}, cache, now.Add(2*time.Second))
+	if _, err := manager.repositoryTarget(registration.RepositoryID); err == nil {
+		t.Fatal("conflicting registration path kept a dynamic repository active")
+	}
+	statuses := manager.runtime.RepositoryStatuses()
+	if len(statuses) != 1 || statuses[0].Failure != "dynamic registrations disagree about the Ticket repository path" {
+		t.Fatalf("conflicting route status=%#v", statuses)
+	}
+}
+
 func TestDynamicRepositoryCannotReplaceConfiguredTarget(t *testing.T) {
 	configuredPath := t.TempDir()
 	info := ticketclient.RepositoryInfo{ID: dynamicTestRepositoryID, Path: configuredPath}
@@ -175,13 +331,14 @@ func TestDynamicRepositoryDiscoveryTracksJoinAndLeaveWithoutManagedWorkers(t *te
 	}()
 	store := state.NewRegistrationStore(dir)
 	registration := dynamicTestRegistration(t, "coder", "/ticket/project")
-	if _, _, _, err := store.Join(context.Background(), registration); err != nil {
+	registration, _, _, err := store.Join(context.Background(), registration)
+	if err != nil {
 		cancel()
 		<-done
 		t.Fatal(err)
 	}
 	waitForDynamicRepositoryTarget(t, manager, dynamicTestRepositoryID, true)
-	if removed, err := store.Leave(context.Background(), registration.RepositoryID, registration.Actor, registration.RepositoryPath, registration.CodexHome, registration.ThreadID); err != nil || !removed {
+	if removed, err := store.Leave(context.Background(), registration); err != nil || !removed {
 		cancel()
 		<-done
 		t.Fatalf("remove registration removed=%t err=%v", removed, err)

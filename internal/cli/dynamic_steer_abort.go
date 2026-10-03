@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/toolsupply/ticket-orc/internal/harness/codex"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
@@ -27,10 +27,14 @@ func requestConfiguredSteerAbort(
 	ctx context.Context,
 	config RunConfig,
 	clients steerClientFactory,
-	queue steerQueue,
+	router *steertransport.Router,
 ) ([]steerAbortResult, error) {
 	steerDir := config.StateDir
-	return requestDynamicSteerAbort(ctx, config.StateDir, steerDir, config.SteerRoles, config.Runtime, clients, queue, nil, nil)
+	var policies map[string]steerRolePolicy
+	if config.steerPolicies != nil {
+		policies = config.steerPolicies.Snapshot().roles
+	}
+	return requestDynamicSteerAbort(ctx, config.StateDir, steerDir, policies, config.Runtime, clients, router, nil, nil)
 }
 
 // requestDynamicSteerAbort makes one bounded, non-durable stop request for
@@ -45,7 +49,7 @@ func requestDynamicSteerAbort(
 	policies map[string]steerRolePolicy,
 	runtime *supervisor.RuntimeState[supervisor.RunWorker],
 	clients steerClientFactory,
-	queue steerQueue,
+	router *steertransport.Router,
 	observer *registrationObserver,
 	persistence steerRuntimePersistence,
 ) ([]steerAbortResult, error) {
@@ -67,9 +71,11 @@ func requestDynamicSteerAbort(
 			return ticketclient.NewWithWorkingDirAndTarget(reg.Actor, reg.RepositoryPath, ticketclient.Target{Repository: reg.RepositoryPath})
 		}
 	}
-	if queue == nil {
-		queue = func(ctx context.Context, home, thread, message string) error {
-			return codex.New().Queue(ctx, home, thread, message)
+	if router == nil {
+		var err error
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			return nil, err
 		}
 	}
 	if observer == nil {
@@ -108,7 +114,7 @@ func requestDynamicSteerAbort(
 		}
 		delivery, hasDelivery := deliveries[steerRegistrationKey(reg)]
 		outstandingDelivery := hasDelivery && delivery.RegistrationID == reg.RegistrationID &&
-			delivery.JoinSignal == reg.JoinSignal && delivery.ThreadID == reg.ThreadID &&
+			delivery.IncarnationID == reg.IncarnationID && delivery.SessionID == reg.SessionID &&
 			(delivery.State == "sending" || delivery.State == "queued")
 
 		client, err := clients(reg)
@@ -130,16 +136,16 @@ func requestDynamicSteerAbort(
 		if !current {
 			continue
 		}
-		results = append(results, queueSteerAbort(ctx, reg, queue))
+		results = append(results, queueSteerAbort(ctx, steerDir, reg, router))
 	}
 	return results, nil
 }
 
-func queueSteerAbort(ctx context.Context, reg state.SteerRegistration, queue steerQueue) steerAbortResult {
+func queueSteerAbort(ctx context.Context, stateDir string, reg state.SteerRegistration, router *steertransport.Router) steerAbortResult {
 	queueCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 	defer cancel()
 	result := steerAbortResult{RepositoryID: reg.RepositoryID, Actor: reg.Actor}
-	if err := queue(queueCtx, reg.CodexHome, reg.ThreadID, steerAbortPrompt); err != nil {
+	if err := router.Deliver(queueCtx, stateDir, reg, steertransport.Message{Kind: steertransport.MessageStop, Text: steerAbortPrompt}); err != nil {
 		result.Outcome = "request_failed"
 		result.Code = "transport_unavailable"
 		return result

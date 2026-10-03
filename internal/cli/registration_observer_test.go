@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestRegistrationObserverLossMalformedRecoveryAndJoinRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation := observer.Observe(ctx); observation.Code != "" || len(observation.Registrations) != 1 || observation.Registrations[0] != current {
+	if observation := observer.Observe(ctx); observation.Code != "" || len(observation.Registrations) != 1 || !sameSteerRegistration(observation.Registrations[0], current) {
 		t.Fatalf("valid registration observation=%#v", observation)
 	}
 	manager := &workerManager{
@@ -67,18 +68,21 @@ func TestRegistrationObserverLossMalformedRecoveryAndJoinRepair(t *testing.T) {
 
 	events := []daemon.Event{}
 	statuses := &dynamicSteerStatus{publish: func(event daemon.Event) { events = append(events, event) }}
-	statuses.replace([]daemon.SteerStatus{{RepositoryID: current.RepositoryID, RepositoryName: current.RepositoryName, Role: current.Role, Actor: current.Actor, Session: current.ThreadID, State: "queued"}})
+	statuses.replace([]daemon.SteerStatus{{RepositoryID: current.RepositoryID, RepositoryName: current.RepositoryName, Role: current.Role, Actor: current.Actor, Session: current.SessionID, Harness: current.Harness, State: "queued"}})
+	policies := steerPolicySnapshot{roles: map[string]steerRolePolicy{
+		current.Role: {TicketQueue: "review", QueueFilters: ticketclient.QueueFilters{Tags: []string{"backend"}, WithoutTags: []string{"no-review"}}},
+	}}
 	if err := os.Remove(validFile); err != nil {
 		t.Fatal(err)
 	}
 	lost := observer.Observe(ctx)
-	if lost.Code != "registration_state_lost" || len(lost.Registrations) != 1 || lost.Registrations[0] != current {
+	if lost.Code != "registration_state_lost" || len(lost.Registrations) != 1 || !sameSteerRegistration(lost.Registrations[0], current) {
 		t.Fatalf("lost registration observation=%#v", lost)
 	}
-	statuses.replace(registrationFailureStatuses(lost))
+	statuses.replace(registrationFailureStatuses(lost, policies))
 	waitForDynamicRepositoryStatus(t, manager, "degraded", "registration_state_lost")
 	items := statuses.snapshot()
-	if len(items) != 1 || items[0].State != "degraded" || items[0].Code != "registration_state_lost" || items[0].RepositoryID != current.RepositoryID || items[0].Actor != current.Actor {
+	if len(items) != 1 || items[0].State != "degraded" || items[0].Code != "registration_state_lost" || items[0].RepositoryID != current.RepositoryID || items[0].Actor != current.Actor || items[0].EffectiveTicketQueue != "review" || !reflect.DeepEqual(items[0].EffectiveTicketTags, []string{"backend"}) || !reflect.DeepEqual(items[0].EffectiveReviewSkipTags, []string{"no-review"}) {
 		t.Fatalf("loss status=%#v", items)
 	}
 	for _, event := range events {
@@ -91,13 +95,13 @@ func TestRegistrationObserverLossMalformedRecoveryAndJoinRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	malformed := observer.Observe(ctx)
-	if malformed.Code != "registration_state_malformed" || malformed.Err == nil || len(malformed.Registrations) != 1 || malformed.Registrations[0] != current {
+	if malformed.Code != "registration_state_malformed" || malformed.Err == nil || len(malformed.Registrations) != 1 || !sameSteerRegistration(malformed.Registrations[0], current) {
 		t.Fatalf("malformed registration observation=%#v", malformed)
 	}
 	if fresh := newRegistrationObserver(store).Observe(ctx); fresh.Code != "registration_state_malformed" || fresh.Err == nil || len(fresh.Registrations) != 0 {
 		t.Fatalf("malformed startup observation=%#v", fresh)
 	}
-	statuses.replace(registrationFailureStatuses(malformed))
+	statuses.replace(registrationFailureStatuses(malformed, policies))
 	waitForDynamicRepositoryStatus(t, manager, "degraded", "registration_state_malformed")
 	for _, event := range events {
 		if event.State == "left" || event.Code == "registration_removed" {
@@ -109,7 +113,7 @@ func TestRegistrationObserverLossMalformedRecoveryAndJoinRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	recovered := observer.Observe(ctx)
-	if recovered.Code != "" || len(recovered.Registrations) != 1 || recovered.Registrations[0] != current {
+	if recovered.Code != "" || len(recovered.Registrations) != 1 || !sameSteerRegistration(recovered.Registrations[0], current) {
 		t.Fatalf("recovered registration observation=%#v", recovered)
 	}
 	waitForDynamicRepositoryStatus(t, manager, "healthy", "")
@@ -133,7 +137,7 @@ func TestRegistrationObserverLossMalformedRecoveryAndJoinRepair(t *testing.T) {
 		t.Fatalf("join repair registration=%#v changed=%t err=%v", current, changed, err)
 	}
 	repaired := observer.Observe(ctx)
-	if repaired.Code != "" || len(repaired.Registrations) != 1 || repaired.Registrations[0] != current {
+	if repaired.Code != "" || len(repaired.Registrations) != 1 || !sameSteerRegistration(repaired.Registrations[0], current) {
 		t.Fatalf("repaired registration observation=%#v", repaired)
 	}
 	waitForDynamicRepositoryStatus(t, manager, "healthy", "")

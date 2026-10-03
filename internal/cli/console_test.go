@@ -526,17 +526,18 @@ func TestConsoleVerboseStatusHasBlankBoundaries(t *testing.T) {
 }
 
 func TestRenderConsoleDetailStatusIncludesTicketActivityTicket(t *testing.T) {
+	activityAt := time.Date(2026, 9, 21, 15, 0, 0, 0, time.UTC)
 	var output bytes.Buffer
 	renderConsoleDetailStatus(&output, daemon.Status{Workers: []daemon.WorkerStatus{{
 		Name:                 "coder",
 		State:                "running",
-		TicketActivityAt:     time.Date(2026, 9, 21, 15, 0, 0, 0, time.UTC),
+		TicketActivityAt:     activityAt,
 		TicketActivity:       "claimed",
 		TicketActivityTicket: "20260921-12345",
 		TicketActivitySource: "ticket",
 	}}})
 	text := output.String()
-	for _, want := range []string{"Ticket activity: claimed (ticket 20260921-12345)", "2026-09-21T15:00:00Z"} {
+	for _, want := range []string{"Ticket activity: claimed (ticket 20260921-12345)", activityAt.Local().Format(time.RFC3339)} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("detail status missing %q: %q", want, text)
 		}
@@ -907,7 +908,7 @@ func TestStatusAndWatchUseSeparateIdentityFieldsAndRepositoryFallback(t *testing
 	const repositoryID = "8d1268c4-6a64-4b9b-95c9-d5598a150e86"
 	const sessionID = "01a0dcb8-6a64-4b9b-95c9-d5598a150e86"
 	status := daemon.Status{
-		Steer:        []daemon.SteerStatus{{RepositoryID: repositoryID, Role: "coder", Actor: "reviewer", Session: sessionID, State: "queued", Code: "awaiting_claim"}},
+		Steer:        []daemon.SteerStatus{{RepositoryID: repositoryID, Role: "coder", Actor: "reviewer", Harness: "codex", Session: sessionID, State: "queued", Code: "awaiting_claim"}},
 		Repositories: []daemon.RepositoryStatus{{ID: repositoryID, Path: "/work/project-root", State: "healthy"}},
 	}
 	var output bytes.Buffer
@@ -956,11 +957,15 @@ func TestStatusAndWatchUseSeparateIdentityFieldsAndRepositoryFallback(t *testing
 	}
 	tracker := newConsoleEventTracker()
 	tracker.seed(status)
-	roleChange := tracker.prepare(daemon.Event{Type: "steer.status", RepositoryID: repositoryID, Role: "architect", Actor: "reviewer", Session: shortIdentity(sessionID), State: "none"})
+	roleChange := tracker.prepare(daemon.Event{Type: "steer.status", RepositoryID: repositoryID, Role: "architect", Actor: "reviewer", Harness: "codex", Session: shortIdentity(sessionID), State: "none"})
 	if got := consoleEventMessage(roleChange); got != "role changed" {
 		t.Fatalf("role change event=%#v message=%q", roleChange, got)
 	}
-	replacement := tracker.prepare(daemon.Event{Type: "steer.status", RepositoryID: repositoryID, Role: "architect", Actor: "reviewer", Session: shortIdentity("01a0e118-6a64-4b9b-95c9-d5598a150e86"), State: "none"})
+	harnessReplacement := tracker.prepare(daemon.Event{Type: "steer.status", RepositoryID: repositoryID, Role: "architect", Actor: "reviewer", Harness: "future-harness", Session: shortIdentity(sessionID), State: "none"})
+	if got := consoleEventMessage(harnessReplacement); got != "session replaced" {
+		t.Fatalf("harness replacement event=%#v message=%q", harnessReplacement, got)
+	}
+	replacement := tracker.prepare(daemon.Event{Type: "steer.status", RepositoryID: repositoryID, Role: "architect", Actor: "reviewer", Harness: "future-harness", Session: shortIdentity("01a0e118-6a64-4b9b-95c9-d5598a150e86"), State: "none"})
 	if got := consoleEventMessage(replacement); got != "session replaced" {
 		t.Fatalf("session replacement event=%#v message=%q", replacement, got)
 	}
@@ -996,14 +1001,153 @@ func TestWatchEnrichesManagedWorkerRoleActorAndRepositoryLocally(t *testing.T) {
 func TestWatchAddsDateSeparatorOnlyWhenDayChanges(t *testing.T) {
 	var output bytes.Buffer
 	renderer := &consoleWatchRenderer{}
-	first := time.Date(2026, 9, 26, 23, 59, 59, 0, time.UTC)
-	second := time.Date(2026, 9, 27, 0, 0, 1, 0, time.UTC)
+	first := time.Date(2026, 9, 26, 23, 59, 59, 0, time.Local)
+	second := first.Add(2 * time.Second)
 	renderer.render(&output, daemon.Event{Type: "daemon.started"}, first)
 	renderer.render(&output, daemon.Event{Type: "daemon.stopping"}, second)
 	text := output.String()
-	if strings.Count(text, "--- 2026-09-27 ---") != 1 || strings.Contains(text, "--- 2026-09-26 ---") {
+	if strings.Count(text, "--- "+second.Format("2006-01-02")+" ---") != 1 || strings.Contains(text, "--- "+first.Format("2006-01-02")+" ---") {
 		t.Fatalf("watch date separators = %q", text)
 	}
+}
+
+func TestConsoleWatchUsesStatusRepositoryNamesAndTruncation(t *testing.T) {
+	firstID := "11111111-1111-4111-8111-111111111111"
+	secondID := "22222222-2222-4222-8222-222222222222"
+	renderer := &consoleWatchRenderer{}
+	renderer.seedRepositories([]daemon.RepositoryStatus{
+		{ID: firstID, Name: "Ticket Alpha", Path: "/work/ticket/tickets"},
+		{ID: secondID, Name: "Ticket Beta With A Long Display Name", Path: "/work/ticket-orc/tickets"},
+	})
+	var output bytes.Buffer
+	for _, repositoryID := range []string{firstID, secondID} {
+		renderer.render(&output, daemon.Event{Type: "ticket.repository_changed", RepositoryID: repositoryID}, time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC))
+	}
+	text := output.String()
+	if !strings.Contains(text, "Ticket Alpha") || !strings.Contains(text, consoleEllipsize("Ticket Beta With A Long Display Name", consoleRepositoryLabelCol)) {
+		t.Fatalf("watch repository labels do not match status names/truncation: %q", text)
+	}
+	if strings.Contains(text, "tickets") {
+		t.Fatalf("watch fell back to colliding path basenames despite status names: %q", text)
+	}
+}
+
+func TestConsoleWatchRefreshesUnknownRepositoryFromStatus(t *testing.T) {
+	const repositoryID = "33333333-3333-4333-8333-333333333333"
+	var statusCalls, eventCalls atomic.Int32
+	watchStarted := make(chan struct{})
+	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v1/status"):
+			status := daemon.Status{Workers: []daemon.WorkerStatus{}}
+			if statusCalls.Add(1) > 1 {
+				status.Repositories = []daemon.RepositoryStatus{{ID: repositoryID, Name: "New Project", Path: "/work/new-project/tickets", State: "healthy"}}
+			}
+			_ = json.NewEncoder(w).Encode(status)
+		case strings.HasSuffix(r.URL.Path, "/v1/events"):
+			eventCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "id: 0\nevent: stream.sync\ndata: {\"seq\":0,\"type\":\"stream.sync\"}\n\n")
+			w.(http.Flusher).Flush()
+			<-watchStarted
+			_, _ = io.WriteString(w, "id: 1\ndata: {\"seq\":1,\"type\":\"ticket.repository_changed\",\"repository_id\":\""+repositoryID+"\"}\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inputReader, inputWriter := io.Pipe()
+	var errorsOut bytes.Buffer
+	watchOutput := &consoleWatchStartWriter{started: watchStarted}
+	done := make(chan error, 1)
+	go func() {
+		done <- runConsoleLoopWithEndpointOptions(ctx, daemonCommandOptions{localDir: stateDir}, inputReader, watchOutput, &errorsOut, nil, "", false, nil)
+	}()
+	go func() { _, _ = io.WriteString(inputWriter, "watch\n") }()
+	deadline := time.After(time.Second)
+	for statusCalls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("watch did not refresh status for unknown repository (status calls=%d, event streams=%d)", statusCalls.Load(), eventCalls.Load())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	_ = inputWriter.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("console did not stop after cancellation")
+	}
+	if got := watchOutput.String(); !strings.Contains(got, "New Project") || strings.Contains(got, "tickets") {
+		t.Fatalf("new runtime repository label=%q", got)
+	}
+}
+
+func TestConsoleWatchWritesDateMarkerAndTimeRowAtomically(t *testing.T) {
+	var output countingConsoleWriter
+	renderer := &consoleWatchRenderer{}
+	first := time.Date(2026, 9, 27, 23, 59, 59, 0, time.Local)
+	second := first.Add(2 * time.Second)
+	renderer.render(&output, daemon.Event{Type: "daemon.started"}, first)
+	if output.writes != 1 {
+		t.Fatalf("ordinary watch render writes=%d, want one", output.writes)
+	}
+	output.buffer.Reset()
+	output.writes = 0
+	renderer.render(&output, daemon.Event{Type: "daemon.stopping"}, second)
+	if output.writes != 1 {
+		t.Fatalf("day transition split marker and event into %d writes", output.writes)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != 2 || lines[0] != "--- "+second.Format("2006-01-02")+" ---" {
+		t.Fatalf("day transition output=%q, want marker and one row", output.String())
+	}
+	if len(lines[1]) < len(consoleTimestampLayout) {
+		t.Fatalf("watch event row is missing its time cell: %q", lines[1])
+	}
+	if got := strings.TrimSpace(lines[1][:len(consoleTimestampLayout)]); got != second.Format(consoleTimestampLayout) {
+		t.Fatalf("watch time cell=%q, want HH:MM:SS", got)
+	}
+}
+
+type countingConsoleWriter struct {
+	buffer bytes.Buffer
+	writes int
+}
+
+func (writer *countingConsoleWriter) Write(data []byte) (int, error) {
+	writer.writes++
+	return writer.buffer.Write(data)
+}
+
+func (writer *countingConsoleWriter) String() string { return writer.buffer.String() }
+
+type consoleWatchStartWriter struct {
+	bytes.Buffer
+	started  chan struct{}
+	stopped  chan struct{}
+	once     sync.Once
+	stopOnce sync.Once
+}
+
+func (writer *consoleWatchStartWriter) Write(data []byte) (int, error) {
+	text := string(data)
+	if strings.Contains(text, "Watching activity.") {
+		writer.once.Do(func() { close(writer.started) })
+	}
+	if writer.stopped != nil && strings.Contains(text, "watch stopped") {
+		writer.stopOnce.Do(func() { close(writer.stopped) })
+	}
+	return writer.Buffer.Write(data)
 }
 
 func TestConsoleWatchReturnsToPromptOnInterrupt(t *testing.T) {
@@ -1061,11 +1205,14 @@ func TestConsoleWatchAppendsActivityAsNDJSON(t *testing.T) {
 	eventReady := make(chan struct{})
 	sendEvent := make(chan struct{})
 	var eventReadyOnce sync.Once
+	eventHandlerDone := make(chan struct{})
+	var eventHandlerDoneOnce sync.Once
 	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/status":
 			_ = json.NewEncoder(w).Encode(daemon.Status{})
 		case "/v1/events":
+			defer eventHandlerDoneOnce.Do(func() { close(eventHandlerDone) })
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, ": connected\n\n")
 			w.(http.Flusher).Flush()
@@ -1081,14 +1228,49 @@ func TestConsoleWatchAppendsActivityAsNDJSON(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
 	reader, writer := io.Pipe()
 	interrupts := make(chan os.Signal, 1)
-	var output, errorsOut bytes.Buffer
+	var errorsOut bytes.Buffer
+	watchStarted := make(chan struct{})
+	watchStopped := make(chan struct{})
+	watchOutput := &consoleWatchStartWriter{started: watchStarted, stopped: watchStopped}
 	done := make(chan error, 1)
+	consoleExited := make(chan struct{})
 	go func() {
-		done <- runConsoleLoopWithSelectionPolicy(context.Background(), stateDir, reader, &output, &errorsOut, interrupts, "", false, nil)
+		done <- runConsoleLoopWithSelectionPolicy(ctx, stateDir, reader, watchOutput, &errorsOut, interrupts, "", false, nil)
+		close(consoleExited)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = writer.Close()
+		_ = reader.Close()
+		select {
+		case <-consoleExited:
+		case <-time.After(time.Second):
+			t.Errorf("console goroutine did not stop during cleanup")
+		}
+		select {
+		case <-eventReady:
+			select {
+			case <-eventHandlerDone:
+			case <-time.After(time.Second):
+				t.Errorf("event request did not stop during cleanup")
+			}
+		default:
+		}
+		server.CloseClientConnections()
+		serverClosed := make(chan struct{})
+		go func() {
+			server.Close()
+			close(serverClosed)
+		}()
+		select {
+		case <-serverClosed:
+		case <-time.After(time.Second):
+			t.Errorf("test HTTP server did not close promptly")
+		}
+	})
 	select {
 	case <-eventReady:
 	case <-time.After(time.Second):
@@ -1097,12 +1279,16 @@ func TestConsoleWatchAppendsActivityAsNDJSON(t *testing.T) {
 	if _, err := io.WriteString(writer, "watch\n"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-watchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("console did not enter watch mode")
+	}
 	close(sendEvent)
 
 	activityPath := filepath.Join(stateDir, "logs", "activity.jsonl")
 	var data []byte
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		data, _ = os.ReadFile(activityPath)
 		if len(data) != 0 {
@@ -1118,7 +1304,11 @@ func TestConsoleWatchAppendsActivityAsNDJSON(t *testing.T) {
 		t.Fatalf("logged activity=%#v", event)
 	}
 	interrupts <- os.Interrupt
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-watchStopped:
+	case <-time.After(time.Second):
+		t.Fatal("console did not stop watch mode after interrupt")
+	}
 	_, _ = io.WriteString(writer, "quit\n")
 	_ = writer.Close()
 	select {
@@ -1184,6 +1374,302 @@ func TestConsoleEventsResynchronizeAfterReconnectAndGap(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for resync=%t repository_resync=%t claim=%t", sawResync, sawRepositoryResync, sawClaim)
 		}
+	}
+}
+
+func TestConsoleEventsReadsMultipleEventsFromOneSubscription(t *testing.T) {
+	var eventCalls atomic.Int32
+	connected := make(chan struct{})
+	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		call := eventCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "id: 40\nevent: stream.sync\ndata: {\"seq\":40,\"type\":\"stream.sync\"}\n\n")
+		for sequence, eventType := range []string{"worker.state", "ticket.claim", "repository.observer"} {
+			frame := fmt.Sprintf("id: %d\ndata: {\"seq\":%d,\"type\":%q}\n\n", sequence+41, sequence+41, eventType)
+			_, _ = io.WriteString(w, frame)
+		}
+		w.(http.Flusher).Flush()
+		if call == 1 {
+			close(connected)
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client, err := daemonclient.New(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan daemon.Event, 8)
+	errorsOut := make(chan error, 2)
+	done := make(chan struct{})
+	go func() {
+		readConsoleEvents(ctx, client, events, errorsOut)
+		close(done)
+	}()
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("event stream did not connect")
+	}
+	want := []string{"worker.state", "ticket.claim", "repository.observer"}
+	for i, eventType := range want {
+		event := nextConsoleTestEvent(t, events)
+		if event.Type != eventType || event.Seq != uint64(i+41) {
+			t.Fatalf("event[%d]=%#v, want type=%q seq=%d", i, event, eventType, i+41)
+		}
+	}
+	if got := eventCalls.Load(); got != 1 {
+		t.Fatalf("event subscriptions=%d, want one for all events", got)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected extra event, possibly synthetic stream.sync: %#v", event)
+	default:
+	}
+	select {
+	case err := <-errorsOut:
+		t.Fatalf("event stream error: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event reader did not stop after cancellation")
+	}
+}
+
+func TestConsoleEventGapResyncKeepsCurrentSubscription(t *testing.T) {
+	var eventCalls, statusCalls atomic.Int32
+	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/status":
+			statusCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(daemon.Status{Workers: []daemon.WorkerStatus{{Name: "coder", State: "paused"}}})
+		case "/v1/events":
+			eventCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "id: 5\nevent: stream.sync\ndata: {\"seq\":5,\"type\":\"stream.sync\"}\n\nid: 6\ndata: {\"seq\":6,\"type\":\"worker.state\",\"worker\":\"coder\"}\n\nid: 8\ndata: {\"seq\":8,\"type\":\"ticket.claim\",\"ticket\":\"20260928-12345\"}\n\nid: 9\ndata: {\"seq\":9,\"type\":\"worker.state\",\"worker\":\"coder\"}\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := daemonclient.New(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan daemon.Event, 8)
+	errorsOut := make(chan error, 2)
+	done := make(chan struct{})
+	go func() {
+		readConsoleEvents(ctx, client, events, errorsOut)
+		close(done)
+	}()
+	want := []struct {
+		typeName string
+		seq      uint64
+	}{
+		{typeName: "worker.state", seq: 6},
+		{typeName: "status.resync"},
+		{typeName: "ticket.claim", seq: 8},
+		{typeName: "worker.state", seq: 9},
+	}
+	for i, expected := range want {
+		event := nextConsoleTestEvent(t, events)
+		if event.Type != expected.typeName || event.Seq != expected.seq {
+			t.Fatalf("event[%d]=%#v, want type=%q seq=%d", i, event, expected.typeName, expected.seq)
+		}
+		if i == 1 && (event.Worker != "coder" || event.State != "paused") {
+			t.Fatalf("resync event=%#v, want authoritative paused worker", event)
+		}
+	}
+	if got := eventCalls.Load(); got != 1 {
+		t.Fatalf("event subscriptions=%d, want current stream retained after gap", got)
+	}
+	if got := statusCalls.Load(); got != 1 {
+		t.Fatalf("status reconciliations=%d, want one", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event reader did not stop after cancellation")
+	}
+}
+
+func TestConsoleEventEOFReconnectsAndClosesPreviousStream(t *testing.T) {
+	var eventCalls atomic.Int32
+	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(daemon.Status{Workers: []daemon.WorkerStatus{{Name: "coder", State: "running"}}})
+		case "/v1/events":
+			call := eventCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if call == 1 {
+				_, _ = io.WriteString(w, "id: 100\nevent: stream.sync\ndata: {\"seq\":100,\"type\":\"stream.sync\"}\n\nid: 101\ndata: {\"seq\":101,\"type\":\"worker.state\",\"worker\":\"first\"}\n\n")
+				w.(http.Flusher).Flush()
+				return
+			}
+			_, _ = io.WriteString(w, "id: 200\nevent: stream.sync\ndata: {\"seq\":200,\"type\":\"stream.sync\"}\n\nid: 201\ndata: {\"seq\":201,\"type\":\"worker.state\",\"worker\":\"second\"}\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	trackedBodies := make(chan *consoleTrackedEventBody, 4)
+	httpClient := &http.Client{Transport: consoleEventTrackingTransport{base: http.DefaultTransport, bodies: trackedBodies}}
+	client, err := daemonclient.NewWithHTTPClient(stateDir, httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan daemon.Event, 8)
+	errorsOut := make(chan error, 2)
+	done := make(chan struct{})
+	go func() {
+		readConsoleEvents(ctx, client, events, errorsOut)
+		close(done)
+	}()
+	firstBody := nextTrackedConsoleBody(t, trackedBodies)
+	firstEvent := nextConsoleTestEvent(t, events)
+	if firstEvent.Type != "worker.state" || firstEvent.Seq != 101 || firstEvent.Worker != "first" {
+		t.Fatalf("first event=%#v", firstEvent)
+	}
+	select {
+	case <-firstBody.closed:
+	case <-time.After(time.Second):
+		t.Fatal("previous event response body was not closed on EOF")
+	}
+	secondBody := nextTrackedConsoleBody(t, trackedBodies)
+	var sawResync, sawSecond bool
+	for !sawResync || !sawSecond {
+		event := nextConsoleTestEvent(t, events)
+		if event.Type == "status.resync" && event.Worker == "coder" {
+			sawResync = true
+		}
+		if event.Type == "worker.state" && event.Seq == 201 && event.Worker == "second" {
+			sawSecond = true
+		}
+	}
+	if got := eventCalls.Load(); got != 2 {
+		t.Fatalf("event subscriptions=%d, want reconnect with new sync baseline", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event reader did not stop after cancellation")
+	}
+	select {
+	case <-secondBody.closed:
+	case <-time.After(time.Second):
+		t.Fatal("current event response body was not closed on cancellation")
+	}
+}
+
+func TestConsoleEventReconnectFailuresRemainBounded(t *testing.T) {
+	var eventCalls atomic.Int32
+	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		eventCalls.Add(1)
+		http.Error(w, `{"error":{"code":"temporarily_unavailable","message":"unavailable"}}`, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	client, err := daemonclient.New(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan daemon.Event, 1)
+	errorsOut := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		readConsoleEvents(ctx, client, events, errorsOut)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event reader exceeded its bounded reconnect attempts")
+	}
+	if got := eventCalls.Load(); got != 3 {
+		t.Fatalf("event subscription attempts=%d, want 3", got)
+	}
+	select {
+	case err := <-errorsOut:
+		if err == nil {
+			t.Fatal("terminal reconnect error is nil")
+		}
+	default:
+		t.Fatal("bounded reconnect failure was not reported")
+	}
+}
+
+func nextConsoleTestEvent(t *testing.T, events <-chan daemon.Event) daemon.Event {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for console event")
+		return daemon.Event{}
+	}
+}
+
+type consoleTrackedEventBody struct {
+	io.ReadCloser
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (body *consoleTrackedEventBody) Close() error {
+	body.once.Do(func() { close(body.closed) })
+	return body.ReadCloser.Close()
+}
+
+type consoleEventTrackingTransport struct {
+	base   http.RoundTripper
+	bodies chan<- *consoleTrackedEventBody
+}
+
+func (transport consoleEventTrackingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(request)
+	if err != nil || !strings.HasSuffix(request.URL.Path, "/v1/events") {
+		return response, err
+	}
+	body := &consoleTrackedEventBody{ReadCloser: response.Body, closed: make(chan struct{})}
+	response.Body = body
+	transport.bodies <- body
+	return response, nil
+}
+
+func nextTrackedConsoleBody(t *testing.T, bodies <-chan *consoleTrackedEventBody) *consoleTrackedEventBody {
+	t.Helper()
+	select {
+	case body := <-bodies:
+		return body
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event response body")
+		return nil
 	}
 }
 

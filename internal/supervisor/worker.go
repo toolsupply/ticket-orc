@@ -49,6 +49,8 @@ type ClaudeFileConfig struct {
 type RoleConfig struct {
 	WorkerName                 string
 	Role                       Role
+	RoleName                   string
+	TicketQueue                string
 	Harness                    string
 	Actor                      string
 	Model                      string
@@ -58,6 +60,8 @@ type RoleConfig struct {
 	SessionCleanup             CleanupPolicy
 	MinimumReuseContextPercent int
 	StateDir                   string
+	InstanceID                 string
+	LocalDirConfigured         bool
 	WorkingDir                 string
 	Repository                 string
 	RepositoryKey              string `json:"repository_key,omitempty"`
@@ -67,6 +71,7 @@ type RoleConfig struct {
 	Output             OutputMode
 	ReviewCompletion   string
 	ReviewFinalGate    string
+	TicketTags         string
 	ReviewSkipTags     string
 	TicketPrompt       string
 	Codex              CodexFileConfig

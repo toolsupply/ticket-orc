@@ -22,6 +22,9 @@ import (
 )
 
 func executeRole(config supervisor.RoleConfig) (err error) {
+	if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.InstanceID, config.LocalDirConfigured); err != nil {
+		return err
+	}
 	eventSink := roleEventSink()
 	defer func() {
 		if err == nil || errors.Is(err, context.Canceled) {
@@ -98,15 +101,18 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 			StateDir:                   config.StateDir,
 			OutputMode:                 string(config.Output),
 			ReviewCompletion:           config.ReviewCompletion,
-			ReviewSkipTags:             splitReviewSkipTags(config.ReviewSkipTags),
-			TicketPrompt:               config.TicketPrompt,
-			CodexSandbox:               config.Codex.Sandbox,
-			PiProvider:                 config.Pi.Provider,
-			ClaudePermissionMode:       config.Claude.PermissionMode,
-			WorkingDir:                 workingDir,
-			Operator:                   os.Stdout,
-			Diagnostics:                os.Stderr,
-			EventSink:                  eventSink,
+			QueueFilters: ticketclient.QueueFilters{
+				Tags:        splitTicketTags(config.TicketTags),
+				WithoutTags: splitReviewSkipTags(config.ReviewSkipTags),
+			},
+			TicketPrompt:         config.TicketPrompt,
+			CodexSandbox:         config.Codex.Sandbox,
+			PiProvider:           config.Pi.Provider,
+			ClaudePermissionMode: config.Claude.PermissionMode,
+			WorkingDir:           workingDir,
+			Operator:             os.Stdout,
+			Diagnostics:          os.Stderr,
+			EventSink:            eventSink,
 		}, tickets, agent, store, cleaner)
 		if err != nil {
 			err = orc.NewFailureContextError(orc.FailureContext{Origin: "reviewer", Operation: "worker execution", Phase: "worker execution"}, err)
@@ -127,6 +133,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		OutputMode:                 string(config.Output),
 		ReviewCompletion:           config.ReviewFinalGate,
 		ReviewSkipTags:             splitReviewSkipTags(config.ReviewSkipTags),
+		QueueFilters:               ticketclient.QueueFilters{Tags: splitTicketTags(config.TicketTags)},
 		CodexSandbox:               config.Codex.Sandbox,
 		TicketPrompt:               config.TicketPrompt,
 		PiProvider:                 config.Pi.Provider,

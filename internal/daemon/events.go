@@ -24,6 +24,7 @@ type Event struct {
 	RepositoryKey  string         `json:"repository_key,omitempty"`
 	RepositoryName string         `json:"repository_name,omitempty"`
 	Actor          string         `json:"actor,omitempty"`
+	Harness        string         `json:"harness,omitempty"`
 	Session        string         `json:"session,omitempty"`
 	Applied        bool           `json:"mutation_applied,omitempty"`
 	Failure        *WorkerFailure `json:"failure,omitempty"`
@@ -62,17 +63,17 @@ func (b *eventBroker) publish(event Event) {
 	}
 }
 
-func (b *eventBroker) subscribe() (uint64, <-chan Event, bool) {
+func (b *eventBroker) subscribe() (uint64, uint64, <-chan Event, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
-		return 0, nil, false
+		return 0, 0, nil, false
 	}
 	b.nextID++
 	id := b.nextID
 	channel := make(chan Event, 32)
 	b.subscribers[id] = channel
-	return id, channel, true
+	return id, b.sequence, channel, true
 }
 
 func (b *eventBroker) unsubscribe(id uint64) {

@@ -21,6 +21,32 @@ import (
 )
 
 func executeRun(config RunConfig, stdout, stderr io.Writer) error {
+	var startupGuard state.Lock
+	if config.InstanceID != "" {
+		if config.ConfigPath == "" {
+			return fmt.Errorf("run config identity is unavailable")
+		}
+		var err error
+		startupGuard, err = acquireRuntimeGuard(context.Background(), config.StateDir)
+		if err != nil {
+			return fmt.Errorf("acquire Orc instance startup guard: %w", err)
+		}
+		config.startupGuard = &startupGuard
+		defer func() {
+			if startupGuard != nil {
+				_ = startupGuard.Release()
+			}
+		}()
+		if err := validateRunConfigIdentity(config); err != nil {
+			return err
+		}
+		if err := upgradeInitGitignore(filepath.Dir(config.ConfigPath)); err != nil {
+			return err
+		}
+	}
+	if err := ensureRuntimeOwnershipIfKnownUnderGuard(config.StateDir, config.InstanceID, config.LocalDirConfigured); err != nil {
+		return err
+	}
 	endpointKey, err := ensureEndpointCapability(config.ConfigPath, config.StateDir, config.EndpointKey)
 	if err != nil {
 		return fmt.Errorf("load local endpoint capability: %w", err)
@@ -46,6 +72,7 @@ func executeRun(config RunConfig, stdout, stderr io.Writer) error {
 	config.startDaemon = func(_ context.Context, runtime *supervisor.RuntimeState[supervisor.RunWorker], workers []supervisor.RunWorker) (*daemon.Server, error) {
 		return daemon.NewServer(daemon.Config{
 			StateDir:      config.StateDir,
+			InstanceID:    config.InstanceID,
 			EndpointKey:   config.EndpointKey,
 			ListenAddress: config.ListenAddress,
 			Port:          config.Port,
@@ -55,7 +82,7 @@ func executeRun(config RunConfig, stdout, stderr io.Writer) error {
 				if config.steerStatus != nil {
 					sessions = config.steerStatus.snapshot()
 				}
-				return runtimeDaemonStatus(runtime, sessions)
+				return runtimeDaemonStatusWithSteerPolicies(runtime, sessions, config.steerPolicies)
 			},
 			Control: control,
 		})
@@ -144,6 +171,12 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 		return fmt.Errorf("acquire daemon lock: %w", err)
 	}
 	defer lock.Release()
+	if config.startupGuard != nil && *config.startupGuard != nil {
+		if err := (*config.startupGuard).Release(); err != nil {
+			return fmt.Errorf("release Orc instance startup guard: %w", err)
+		}
+		*config.startupGuard = nil
+	}
 
 	controlStore := state.NewDaemonControlStore(config.StateDir)
 	controlState, err := controlStore.DaemonControl(ctx)
@@ -151,7 +184,7 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 		return fmt.Errorf("load daemon control state: %w", err)
 	}
 	config.dispatchGate = newDispatchGate(controlStore, controlState.Mode)
-	config.steerWake = make(chan struct{}, 1)
+	config.steerDirty = newSteerDirtySet()
 	dispatchEnabled := controlState.Mode == state.DaemonRunning
 	if len(config.Workers) > 1 {
 		for _, worker := range config.Workers {
@@ -233,7 +266,7 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 		// initial state and the first steer and repository observations complete.
 		go func() {
 			var steer *dynamicSteerStatus
-			if len(config.SteerRoles) != 0 {
+			if config.steerPolicies != nil && len(config.steerPolicies.Snapshot().roles) != 0 {
 				steer = config.steerStatus
 			}
 			if err := waitInitialConsoleStatus(ctx, config.Runtime, steer); err != nil {
@@ -406,7 +439,7 @@ func newSupervisorWorkerTransition(config RunConfig, emitEvent func(supervisor.R
 }
 
 func seedRunSteerObservers(ctx context.Context, config RunConfig, manager *workerManager, steerDir string) (*registrationObserver, *registrationObserver, []daemon.SteerStatus) {
-	if len(config.SteerRoles) == 0 {
+	if config.steerPolicies == nil || len(config.steerPolicies.Snapshot().roles) == 0 {
 		return nil, nil, nil
 	}
 	seedObserver := newRegistrationObserver(state.NewRegistrationStore(steerDir))
@@ -414,7 +447,13 @@ func seedRunSteerObservers(ctx context.Context, config RunConfig, manager *worke
 	seed := seedObserver.Observe(discoveryCtx)
 	cancel()
 	applyDynamicRepositoryObservation(ctx, manager, nil, seed)
+	policySnapshot := config.steerPolicies.Snapshot()
 	initialStatuses := registrationStartupStatuses(seed.Registrations, seed.Code)
+	for index := range initialStatuses {
+		if policy, ok := policySnapshot.roles[initialStatuses[index].Role]; ok {
+			applySteerStatusPolicy(&initialStatuses[index], policy)
+		}
+	}
 	repositoryObserver := newRegistrationObserver(state.NewRegistrationStore(steerDir))
 	repositoryObserver.Seed(seed)
 	steerObserver := newRegistrationObserver(state.NewRegistrationStore(steerDir))
@@ -429,7 +468,17 @@ func wireSupervisorRuntimeEvents(config RunConfig, manager *workerManager, emitE
 	}
 	manager.runtimeEventSink = emitEvent
 	if manager.repositoryWatch != nil {
-		manager.repositoryWatch.SetEventSink(emitEvent)
+		manager.repositoryWatch.SetReadySink(func(repositoryID string) {
+			if config.steerDirty == nil {
+				return
+			}
+			if repositoryID == "" {
+				config.steerDirty.MarkAll()
+			} else {
+				config.steerDirty.MarkRepository(repositoryID)
+			}
+		})
+		manager.repositoryWatch.SetEventSink(composeRepositoryWatchEventSink(config.steerDirty, emitEvent))
 	}
 	return func(worker string, state supervisor.WorkerState, failure *supervisor.WorkerFailure) {
 		if failure == nil {
@@ -437,6 +486,24 @@ func wireSupervisorRuntimeEvents(config RunConfig, manager *workerManager, emitE
 		}
 		config.Runtime.SetFailure(worker, failure)
 		emitEvent(supervisor.RuntimeEvent{Type: "worker.failure", Worker: worker, State: string(state), Code: failure.Classification, Phase: failure.Phase, Failure: failure})
+	}
+}
+
+func composeRepositoryWatchEventSink(dirty *steerDirtySet, publish func(supervisor.RuntimeEvent)) func(supervisor.RuntimeEvent) {
+	return func(event supervisor.RuntimeEvent) {
+		if dirty != nil {
+			switch {
+			case event.Type == "ticket.repository_changed":
+				if event.RepositoryID != "" {
+					dirty.MarkRepository(event.RepositoryID)
+				} else {
+					dirty.MarkAll()
+				}
+			}
+		}
+		if publish != nil {
+			publish(event)
+		}
 	}
 }
 
@@ -461,11 +528,8 @@ func wireSupervisorControlCallbacks(config *RunConfig, manager *workerManager, e
 		if err != nil {
 			return daemon.DaemonControlResult{}, err
 		}
-		if config.steerWake != nil {
-			select {
-			case config.steerWake <- struct{}{}:
-			default:
-			}
+		if config.steerDirty != nil {
+			config.steerDirty.MarkAll()
 		}
 		reconcileErr := manager.reconcileDispatch(ctx)
 		emitEvent(supervisor.RuntimeEvent{Type: "daemon.resumed", State: string(mode.Mode), Applied: applied})
@@ -694,15 +758,16 @@ func runInitialDoctor(ctx context.Context, config *RunConfig, manager *workerMan
 }
 
 func startSupervisorSteer(ctx context.Context, config *RunConfig, manager *workerManager, steerDir string, repositoryObserver, steerObserver *registrationObserver) context.CancelFunc {
-	if len(config.SteerRoles) == 0 {
+	if config.steerPolicies == nil || len(config.steerPolicies.Snapshot().roles) == 0 {
 		return nil
 	}
+	policies := manager.steerPolicies
 	if config.steerStatus == nil {
 		config.steerStatus = &dynamicSteerStatus{}
 	}
 	steerCtx, stopSteer := context.WithCancel(ctx)
 	go runDynamicRepositoryDiscoveryWithObserver(steerCtx, manager, nil, repositoryObserver)
-	go runDynamicSteerWithGate(steerCtx, steerDir, config.SteerRoles, config.Runtime, nil, nil, config.steerStatus, nil, steerObserver, config.dispatchGate, config.steerWake)
+	go runDynamicSteerWithPolicyStoreGate(steerCtx, steerDir, policies, config.Runtime, nil, nil, config.steerStatus, nil, steerObserver, config.dispatchGate, config.steerDirty)
 	return stopSteer
 }
 

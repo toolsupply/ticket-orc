@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,7 @@ import (
 )
 
 const steerRuntimeFileName = "steer-runtime.json"
-const steerRuntimeFileVersion = 3
+const steerRuntimeFileVersion = 4
 
 // SteerDelivery records Orc's notification state for one registration
 // incarnation. It intentionally contains no Ticket ticket data.
@@ -24,8 +23,8 @@ type SteerDelivery struct {
 	RepositoryID   string `json:"repository_id"`
 	Actor          string `json:"actor"`
 	RegistrationID string `json:"registration_id"`
-	JoinSignal     string `json:"join_signal"`
-	ThreadID       string `json:"thread_id"`
+	IncarnationID  string `json:"incarnation_id"`
+	SessionID      string `json:"session_id"`
 	State          string `json:"state"`
 	Code           string `json:"code,omitempty"`
 	// BootstrapPending persists the one-time introduction for this session.
@@ -37,6 +36,7 @@ type SteerDelivery struct {
 type SteerRuntimeSnapshot struct {
 	Version    int             `json:"version"`
 	Deliveries []SteerDelivery `json:"deliveries"`
+	migrated   bool
 }
 
 // SteerRuntimeStore owns the daemon's separate dynamic-steer delivery file.
@@ -83,11 +83,11 @@ func (s *SteerRuntimeStore) Reconcile(ctx context.Context, registrations []Steer
 		}
 		key := steerDeliveryKey(reg.RepositoryID, reg.Actor, reg.RegistrationID)
 		d, ok := byKey[key]
-		if ok && d.JoinSignal != reg.JoinSignal {
-			recoveryPending := d.RecoveryPending || d.ThreadID != reg.ThreadID
-			bootstrapPending := d.BootstrapPending || d.ThreadID != reg.ThreadID
-			d.JoinSignal = reg.JoinSignal
-			d.ThreadID = reg.ThreadID
+		if ok && d.IncarnationID != reg.IncarnationID {
+			recoveryPending := d.RecoveryPending || d.SessionID != reg.SessionID
+			bootstrapPending := d.BootstrapPending || d.SessionID != reg.SessionID
+			d.IncarnationID = reg.IncarnationID
+			d.SessionID = reg.SessionID
 			d.State = "none"
 			d.Code = ""
 			d.BootstrapPending = bootstrapPending
@@ -95,11 +95,11 @@ func (s *SteerRuntimeStore) Reconcile(ctx context.Context, registrations []Steer
 			d.UpdatedAt = time.Now().UTC()
 		} else if !ok {
 			previous, hadPrevious := byOwner[steerOwnerKey(reg.RepositoryID, reg.Actor)]
-			recoveryPending := hadPrevious && (previous.RecoveryPending || previous.ThreadID != reg.ThreadID)
-			bootstrapPending := !hadPrevious || previous.BootstrapPending || previous.ThreadID != reg.ThreadID
+			recoveryPending := hadPrevious && (previous.RecoveryPending || previous.SessionID != reg.SessionID)
+			bootstrapPending := !hadPrevious || previous.BootstrapPending || previous.SessionID != reg.SessionID
 			d = SteerDelivery{
 				RepositoryID: reg.RepositoryID, Actor: reg.Actor, RegistrationID: reg.RegistrationID,
-				JoinSignal: reg.JoinSignal, ThreadID: reg.ThreadID, State: "none",
+				IncarnationID: reg.IncarnationID, SessionID: reg.SessionID, State: "none",
 				BootstrapPending: bootstrapPending,
 				RecoveryPending:  recoveryPending,
 				UpdatedAt:        time.Now().UTC(),
@@ -127,7 +127,7 @@ func (s *SteerRuntimeStore) Reconcile(ctx context.Context, registrations []Steer
 				break
 			}
 		}
-		if same {
+		if same && !current.migrated {
 			return nil
 		}
 	}
@@ -169,7 +169,7 @@ func (s *SteerRuntimeStore) update(ctx context.Context, registration SteerRegist
 	}
 	current := false
 	for _, reg := range regs.Registrations {
-		if reg.RepositoryID == registration.RepositoryID && reg.Actor == registration.Actor && reg.RegistrationID == registration.RegistrationID && reg.JoinSignal == registration.JoinSignal {
+		if reg.RepositoryID == registration.RepositoryID && reg.Actor == registration.Actor && reg.RegistrationID == registration.RegistrationID && reg.IncarnationID == registration.IncarnationID {
 			current = true
 			break
 		}
@@ -191,8 +191,8 @@ func (s *SteerRuntimeStore) update(ctx context.Context, registration SteerRegist
 			if state != "" {
 				d.State = state
 				d.Code = code
-				d.JoinSignal = registration.JoinSignal
-				d.ThreadID = registration.ThreadID
+				d.IncarnationID = registration.IncarnationID
+				d.SessionID = registration.SessionID
 			}
 			d.BootstrapPending = d.BootstrapPending && !bootstrap
 			d.RecoveryPending = d.RecoveryPending && !recovery
@@ -208,7 +208,7 @@ func (s *SteerRuntimeStore) update(ctx context.Context, registration SteerRegist
 		if noActiveClaim {
 			return true, nil
 		}
-		snapshot.Deliveries = append(snapshot.Deliveries, SteerDelivery{RepositoryID: registration.RepositoryID, Actor: registration.Actor, RegistrationID: registration.RegistrationID, JoinSignal: registration.JoinSignal, ThreadID: registration.ThreadID, State: state, Code: code, UpdatedAt: time.Now().UTC()})
+		snapshot.Deliveries = append(snapshot.Deliveries, SteerDelivery{RepositoryID: registration.RepositoryID, Actor: registration.Actor, RegistrationID: registration.RegistrationID, IncarnationID: registration.IncarnationID, SessionID: registration.SessionID, State: state, Code: code, UpdatedAt: time.Now().UTC()})
 	}
 	return true, s.saveUnlocked(snapshot)
 }
@@ -230,22 +230,87 @@ func (s *SteerRuntimeStore) loadUnlocked() (SteerRuntimeSnapshot, error) {
 	if err := json.Unmarshal(data, &version); err != nil {
 		return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
-	if version.Version != steerRuntimeFileVersion {
+	switch version.Version {
+	case steerRuntimeFileVersion:
+		var snapshot SteerRuntimeSnapshot
+		if err := decodeStrictStateJSON(data, &snapshot); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		if err := validateSteerRuntimeSnapshot(snapshot); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		return snapshot, nil
+	case steerRuntimeFileVersion - 1:
+		var previous steerRuntimeSnapshotV3
+		if err := decodeStrictStateJSON(data, &previous); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		if err := validateSteerRuntimeSnapshotV3(previous); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		snapshot := migrateSteerRuntimeSnapshotV3(previous)
+		if err := validateSteerRuntimeSnapshot(snapshot); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: migrated steer runtime: %v", ErrMalformed, err)
+		}
+		return snapshot, nil
+	default:
 		return SteerRuntimeSnapshot{}, fmt.Errorf("%w: unsupported steer runtime version %d (want %d)", ErrMalformed, version.Version, steerRuntimeFileVersion)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var snap SteerRuntimeSnapshot
-	if err := dec.Decode(&snap); err != nil {
-		return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+}
+
+type steerRuntimeSnapshotV3 struct {
+	Version    int               `json:"version"`
+	Deliveries []steerDeliveryV3 `json:"deliveries"`
+}
+
+type steerDeliveryV3 struct {
+	RepositoryID     string    `json:"repository_id"`
+	Actor            string    `json:"actor"`
+	RegistrationID   string    `json:"registration_id"`
+	JoinSignal       string    `json:"join_signal"`
+	ThreadID         string    `json:"thread_id"`
+	State            string    `json:"state"`
+	Code             string    `json:"code,omitempty"`
+	BootstrapPending bool      `json:"bootstrap_pending,omitempty"`
+	RecoveryPending  bool      `json:"recovery_pending,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+func validateSteerRuntimeSnapshotV3(snapshot steerRuntimeSnapshotV3) error {
+	if snapshot.Version != steerRuntimeFileVersion-1 {
+		return fmt.Errorf("unsupported previous steer runtime version %d", snapshot.Version)
 	}
-	if err := requireJSONEOF(dec); err != nil {
-		return SteerRuntimeSnapshot{}, err
+	if snapshot.Deliveries == nil {
+		return errors.New("steer runtime deliveries must be an array")
 	}
-	if err := validateSteerRuntimeSnapshot(snap); err != nil {
-		return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+	seen := make(map[string]bool, len(snapshot.Deliveries))
+	for _, delivery := range snapshot.Deliveries {
+		if !isStableTicketRepositoryID(delivery.RepositoryID) || validateSteerName("actor", delivery.Actor) != nil ||
+			!validSteerRegistrationID(delivery.RegistrationID) || !validSteerRegistrationID(delivery.JoinSignal) ||
+			validateToken("steer runtime thread_id", delivery.ThreadID) != nil || delivery.UpdatedAt.IsZero() ||
+			!(delivery.State == "none" || delivery.State == "sending" || delivery.State == "queued" || delivery.State == "consumed" || delivery.State == "degraded") ||
+			!validSteerRuntimeCode(delivery.Code) {
+			return errors.New("invalid previous steer runtime delivery")
+		}
+		key := steerDeliveryKey(delivery.RepositoryID, delivery.Actor, delivery.RegistrationID)
+		if seen[key] {
+			return errors.New("duplicate previous steer runtime delivery")
+		}
+		seen[key] = true
 	}
-	return snap, nil
+	return nil
+}
+
+func migrateSteerRuntimeSnapshotV3(previous steerRuntimeSnapshotV3) SteerRuntimeSnapshot {
+	snapshot := SteerRuntimeSnapshot{Version: steerRuntimeFileVersion, Deliveries: make([]SteerDelivery, 0, len(previous.Deliveries)), migrated: true}
+	for _, old := range previous.Deliveries {
+		snapshot.Deliveries = append(snapshot.Deliveries, SteerDelivery{
+			RepositoryID: old.RepositoryID, Actor: old.Actor, RegistrationID: old.RegistrationID,
+			IncarnationID: old.JoinSignal, SessionID: old.ThreadID, State: old.State, Code: old.Code,
+			BootstrapPending: old.BootstrapPending, RecoveryPending: old.RecoveryPending, UpdatedAt: old.UpdatedAt,
+		})
+	}
+	return snapshot
 }
 
 func (s *SteerRuntimeStore) saveUnlocked(snap SteerRuntimeSnapshot) error {
@@ -275,7 +340,7 @@ func validateSteerRuntimeSnapshot(snap SteerRuntimeSnapshot) error {
 	}
 	seen := map[string]bool{}
 	for _, d := range snap.Deliveries {
-		if !isStableTicketRepositoryID(d.RepositoryID) || validateSteerName("actor", d.Actor) != nil || !validSteerRegistrationID(d.RegistrationID) || !validSteerRegistrationID(d.JoinSignal) || validateToken("steer runtime thread_id", d.ThreadID) != nil || d.UpdatedAt.IsZero() || !(d.State == "none" || d.State == "sending" || d.State == "queued" || d.State == "consumed" || d.State == "degraded") || !validSteerRuntimeCode(d.Code) {
+		if !isStableTicketRepositoryID(d.RepositoryID) || validateSteerName("actor", d.Actor) != nil || !validSteerRegistrationID(d.RegistrationID) || !validSteerRegistrationID(d.IncarnationID) || validateSteerString("runtime session_id", d.SessionID, maxSteerSessionIDBytes) != nil || d.UpdatedAt.IsZero() || !(d.State == "none" || d.State == "sending" || d.State == "queued" || d.State == "consumed" || d.State == "degraded") || !validSteerRuntimeCode(d.Code) {
 			return errors.New("invalid steer runtime delivery")
 		}
 		key := steerDeliveryKey(d.RepositoryID, d.Actor, d.RegistrationID)

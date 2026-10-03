@@ -3,10 +3,15 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
+	"github.com/toolsupply/ticket-orc/internal/steertransport/spool"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -16,7 +21,7 @@ type abortSteerClient struct {
 	active    int
 }
 
-func (c *abortSteerClient) ActiveClaims(_ context.Context, queue string, _ []string, _ int) (ticketclient.ListResult, error) {
+func (c *abortSteerClient) ActiveClaims(_ context.Context, queue string, _ int) (ticketclient.ListResult, error) {
 	c.active++
 	if c.activeErr != nil {
 		return ticketclient.ListResult{}, c.activeErr
@@ -27,11 +32,113 @@ func (c *abortSteerClient) ActiveClaims(_ context.Context, queue string, _ []str
 	return ticketclient.ListResult{}, nil
 }
 
-func (c *abortSteerClient) ReadyFrontier(context.Context, string, []string, int) (ticketclient.ListResult, error) {
+func (c *abortSteerClient) ReadyFrontier(context.Context, string, ticketclient.QueueFilters, int) (ticketclient.ListResult, error) {
 	return ticketclient.ListResult{}, nil
 }
 
 func (c *abortSteerClient) Close() error { return nil }
+
+func TestDynamicDeliveryAndAbortUseMixedTransportRouter(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	registrations := state.NewRegistrationStore(dir)
+	codex, _, _, err := registrations.Join(ctx, state.SteerRegistration{
+		RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker-codex", Role: "coder", Harness: "codex",
+		Transport: testSteerCodexTransport(filepath.Join(dir, "codex-home")), SessionID: steerTestThread,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spooled, _, _, err := registrations.Join(ctx, state.SteerRegistration{
+		RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker-spool", Role: "coder", Harness: "future-harness",
+		Transport: state.SteerTransportRoute{Kind: "spool"}, SessionID: "opaque-session-id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var codexMessages []steertransport.Message
+	router, err := steertransport.NewRouter(testSteerTransport{deliver: func(_ context.Context, _ string, _ state.SteerRegistration, message steertransport.Message) error {
+		codexMessages = append(codexMessages, message)
+		return nil
+	}}, spool.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolEndpoint, err := router.Prepare(ctx, dir, spooled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateStore := state.NewSteerRuntimeStore(dir)
+	current := []state.SteerRegistration{codex, spooled}
+	if err := stateStore.Reconcile(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	policy := steerRolePolicy{TicketQueue: "open", NudgePrompt: "ordinary work notification"}
+	for _, registration := range current {
+		plan := planSteerNotification(policy, string(orc.SteerIdle), "", "20260929-54321", false, false)
+		if !plan.send {
+			t.Fatal("ready Ticket evidence did not produce a dynamic notification")
+		}
+		result := sendSteerNotification(ctx, dir, registration, plan, router, stateStore, nil, map[string]string{}, map[string]string{})
+		if result.state != string(orc.SteerQueued) {
+			t.Fatalf("dynamic notification for %s: %#v", registration.Harness, result)
+		}
+	}
+	if len(codexMessages) != 1 || codexMessages[0].Kind != steertransport.MessageSteer || codexMessages[0].Text != "ordinary work notification" {
+		t.Fatalf("Codex dynamic messages=%#v", codexMessages)
+	}
+	readMessages := func(path string, registration state.SteerRegistration) []spool.WireMessage {
+		t.Helper()
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := make([]spool.WireMessage, 0, len(entries))
+		for _, entry := range entries {
+			data, err := os.ReadFile(filepath.Join(path, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := spool.DecodeMessage(data, registration)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, message)
+		}
+		return messages
+	}
+	ordinary := readMessages(spoolEndpoint.Pending, spooled)
+	if len(ordinary) != 1 || ordinary[0].Kind != steertransport.MessageSteer || ordinary[0].Message != "ordinary work notification" {
+		t.Fatalf("spool dynamic messages=%#v", ordinary)
+	}
+	beforeAbort, err := stateStore.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.NewDaemonControlStore(dir).AbortDaemon(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clients := func(state.SteerRegistration) (steerClient, error) { return &abortSteerClient{}, nil }
+	results, err := requestDynamicSteerAbort(ctx, dir, dir, map[string]steerRolePolicy{"coder": policy}, nil, clients, router,
+		newRegistrationObserver(registrations), stateStore)
+	if err != nil || len(results) != 2 {
+		t.Fatalf("mixed-transport abort results=%#v err=%v", results, err)
+	}
+	if len(codexMessages) != 2 || codexMessages[1].Kind != steertransport.MessageStop || codexMessages[1].Text != steerAbortPrompt {
+		t.Fatalf("Codex abort message sequence=%#v", codexMessages)
+	}
+	if pending := readMessages(spoolEndpoint.Pending, spooled); len(pending) != 0 {
+		t.Fatalf("spool abort retained ordinary notifications: %#v", pending)
+	}
+	control := readMessages(spoolEndpoint.Control, spooled)
+	if len(control) != 1 || control[0].Kind != steertransport.MessageStop || control[0].Message != steerAbortPrompt {
+		t.Fatalf("spool control messages=%#v", control)
+	}
+	afterAbort, err := stateStore.Snapshot(ctx)
+	if err != nil || !reflect.DeepEqual(beforeAbort, afterAbort) {
+		t.Fatalf("abort changed Ticket-consumption evidence: before=%#v after=%#v err=%v", beforeAbort, afterAbort, err)
+	}
+}
 
 func TestRequestDynamicSteerAbortTargetsOnlyCurrentPotentialWork(t *testing.T) {
 	ctx := context.Background()
@@ -59,8 +166,8 @@ func TestRequestDynamicSteerAbortTargetsOnlyCurrentPotentialWork(t *testing.T) {
 	}
 	currentReplacement, _, changed, err := registrations.Join(ctx, state.SteerRegistration{
 		RepositoryID: old.RepositoryID, RepositoryPath: old.RepositoryPath, RepositoryName: old.RepositoryName,
-		Actor: old.Actor, Role: old.Role, CodexHome: old.CodexHome,
-		ThreadID: "01a0da4e-aa3a-78d3-87ba-b5972a10e6f3",
+		Actor: old.Actor, Role: old.Role, Harness: old.Harness, Transport: old.Transport,
+		SessionID: "01a0da4e-aa3a-78d3-87ba-b5972a10e6f3",
 	})
 	if err != nil || !changed {
 		t.Fatalf("replace registration changed=%t err=%v", changed, err)
@@ -79,21 +186,24 @@ func TestRequestDynamicSteerAbortTargetsOnlyCurrentPotentialWork(t *testing.T) {
 	var messages []string
 	results, err := requestDynamicSteerAbort(ctx, dir, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "ordinary work prompt"}}, nil,
 		func(reg state.SteerRegistration) (steerClient, error) { return clientsByActor[reg.Actor], nil },
-		func(_ context.Context, _, thread, message string) error {
-			queuedByActor[thread]++
-			messages = append(messages, message)
-			if thread == queued.ThreadID {
+		testSteerRouter(t, func(_ context.Context, _ string, registration state.SteerRegistration, message steertransport.Message) error {
+			if message.Kind != steertransport.MessageStop {
+				t.Errorf("abort message kind=%q, want stop", message.Kind)
+			}
+			queuedByActor[registration.SessionID]++
+			messages = append(messages, message.Text)
+			if registration.SessionID == queued.SessionID {
 				return errors.New("unavailable")
 			}
 			return nil
-		}, newRegistrationObserver(registrations), runtime)
+		}), newRegistrationObserver(registrations), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(results) != 2 {
 		t.Fatalf("abort results = %#v, want only active and queued registrations", results)
 	}
-	if queuedByActor[active.ThreadID] != 1 || queuedByActor[queued.ThreadID] != 1 || queuedByActor[idle.ThreadID] != 0 || queuedByActor[old.ThreadID] != 0 {
+	if queuedByActor[active.SessionID] != 1 || queuedByActor[queued.SessionID] != 1 || queuedByActor[idle.SessionID] != 0 || queuedByActor[old.SessionID] != 0 {
 		t.Fatalf("requests by session = %#v", queuedByActor)
 	}
 	if len(messages) != 2 || messages[0] != steerAbortPrompt || messages[1] != steerAbortPrompt {
@@ -134,13 +244,16 @@ func TestRequestDynamicSteerAbortUsesOneLocalDirectory(t *testing.T) {
 	}
 	var queueCalls int
 	results, err := requestConfiguredSteerAbort(ctx, RunConfig{
-		StateDir:   localDir,
-		SteerRoles: map[string]steerRolePolicy{"coder": {TicketQueue: "open"}},
+		StateDir:      localDir,
+		steerPolicies: newSteerPolicyStore(map[string]steerRolePolicy{"coder": {TicketQueue: "open"}}),
 	},
 		func(state.SteerRegistration) (steerClient, error) {
 			return &abortSteerClient{activeID: "20260926-00001"}, nil
 		},
-		func(context.Context, string, string, string) error { queueCalls++; return nil })
+		testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+			queueCalls++
+			return nil
+		}))
 	if err != nil {
 		t.Fatalf("abort with one local directory: %v", err)
 	}
@@ -178,16 +291,16 @@ func TestRequestDynamicSteerAbortSkipsInactiveAndMakesOneAttemptForPendingWork(t
 			}
 			return &abortSteerClient{}, nil
 		},
-		func(ctx context.Context, _, _, message string) error {
+		testSteerRouter(t, func(ctx context.Context, _ string, _ state.SteerRegistration, message steertransport.Message) error {
 			queueCalls++
 			if _, ok := ctx.Deadline(); !ok {
 				t.Error("abort request did not have a bounded deadline")
 			}
-			if message != steerAbortPrompt {
-				t.Errorf("emergency message = %q", message)
+			if message.Text != steerAbortPrompt {
+				t.Errorf("emergency message = %q", message.Text)
 			}
 			return errors.New("transport unavailable")
-		},
+		}),
 		newRegistrationObserver(registrations), runtime)
 	if err != nil {
 		t.Fatal(err)
@@ -220,15 +333,18 @@ func TestRequestDynamicSteerAbortRechecksRegistrationBeforeQueue(t *testing.T) {
 		func(reg state.SteerRegistration) (steerClient, error) {
 			_, _, _, joinErr := registrations.Join(ctx, state.SteerRegistration{
 				RepositoryID: reg.RepositoryID, RepositoryPath: reg.RepositoryPath, RepositoryName: reg.RepositoryName,
-				Actor: reg.Actor, Role: reg.Role, CodexHome: reg.CodexHome,
-				ThreadID: "01a0da4e-aa3a-78d3-87ba-b5972a10e6f7",
+				Actor: reg.Actor, Role: reg.Role, Harness: reg.Harness, Transport: reg.Transport,
+				SessionID: "01a0da4e-aa3a-78d3-87ba-b5972a10e6f7",
 			})
 			if joinErr != nil {
 				return nil, joinErr
 			}
 			return &abortSteerClient{activeID: "20260926-00001"}, nil
 		},
-		func(context.Context, string, string, string) error { queueCalls++; return nil },
+		testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+			queueCalls++
+			return nil
+		}),
 		newRegistrationObserver(registrations), runtime)
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +361,10 @@ func TestRequestDynamicSteerAbortRequiresDurableAbortedMode(t *testing.T) {
 		func(state.SteerRegistration) (steerClient, error) {
 			return &abortSteerClient{activeID: "20260926-00001"}, nil
 		},
-		func(context.Context, string, string, string) error { queueCalls++; return nil }, nil, nil)
+		testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+			queueCalls++
+			return nil
+		}), nil, nil)
 	if err == nil || queueCalls != 0 {
 		t.Fatalf("normal mode abort err=%v queueCalls=%d, want error and no request", err, queueCalls)
 	}
@@ -253,9 +372,10 @@ func TestRequestDynamicSteerAbortRequiresDurableAbortedMode(t *testing.T) {
 
 func joinAbortSteerRegistration(t *testing.T, store *state.RegistrationStore, actor, thread string) state.SteerRegistration {
 	t.Helper()
+	dir := t.TempDir()
 	reg, _, _, err := store.Join(context.Background(), state.SteerRegistration{
-		RepositoryID: joinTestRepositoryID, RepositoryPath: t.TempDir(), Actor: actor, Role: "coder",
-		CodexHome: t.TempDir(), ThreadID: thread,
+		RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: actor, Role: "coder",
+		Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: thread,
 	})
 	if err != nil {
 		t.Fatal(err)

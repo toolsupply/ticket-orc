@@ -17,13 +17,6 @@ A small AI agent orchestrator backed by the [ticket](https://github.com/toolsupp
 - No third-party dependencies
 - MIT licensed
 
-## Use cases
-
-Using orchestration to notify agents of changes in `ticket` repositories keeps your agents busy when you are not watching.
-
-Let an agent turn your specification or idea into tickets — `ticket-orc` picks up the tickets and hands them out to your
-agentic workforce for implementation and review.
-
 ### Keep your agent busy
 
 `ticket-orc` is useful even with a single `ticket` repository and a lone Codex CLI session. In this setup, `ticket-orc`

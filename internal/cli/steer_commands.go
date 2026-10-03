@@ -15,6 +15,7 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/harness/codex"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -22,21 +23,16 @@ const steerCommandTimeout = 30 * time.Second
 
 type ticketCommandRunner func(context.Context, ...string) ([]byte, error)
 
-type currentTicketIdentity struct {
-	Actor          string
-	RepositoryID   string
-	RepositoryPath string
-	RepositoryName string
-	ThreadID       string
-	CodexHome      string
-}
-
 func executeJoin(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
+	args, selector, err := extractEndpointSelector(args)
+	if err != nil {
+		return usageError(stderr, "%v", err)
+	}
 	args, configPath, err := extractConfigPath(args)
 	if err != nil {
 		return usageError(stderr, "%v", err)
 	}
-	roleName, help, err := parseJoinRole(args)
+	roleName, jsonOutput, help, err := parseJoinArgs(args)
 	if err != nil {
 		return usageError(stderr, "%v", err)
 	}
@@ -44,27 +40,35 @@ func executeJoin(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 		fmt.Fprint(stdout, joinHelp)
 		return 0
 	}
-	if err := joinWithConfigRunner(context.Background(), roleName, configPath, stdout, lookupEnv, runTicketJSON); err != nil {
+	if err := joinWithEndpointConfigRunner(context.Background(), roleName, configPath, selector, jsonOutput, stdout, lookupEnv, runTicketJSON, nil); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func parseJoinRole(args []string) (string, bool, error) {
-	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		return "", true, nil
-	}
-	if len(args) > 1 {
-		return "", false, errors.New("join accepts at most one role")
-	}
-	if len(args) == 1 {
-		if strings.HasPrefix(args[0], "-") || strings.TrimSpace(args[0]) == "" {
-			return "", false, fmt.Errorf("invalid role %q", args[0])
+func parseJoinArgs(args []string) (string, bool, bool, error) {
+	role, jsonOutput, help := "", false, false
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help":
+			if help {
+				return "", false, false, errors.New("duplicate flag --help")
+			}
+			help = true
+		case "-j", "--json":
+			if jsonOutput {
+				return "", false, false, errors.New("duplicate flag --json")
+			}
+			jsonOutput = true
+		default:
+			if strings.HasPrefix(arg, "-") || strings.TrimSpace(arg) == "" || role != "" {
+				return "", false, false, fmt.Errorf("join accepts at most one role; unexpected argument %q", arg)
+			}
+			role = arg
 		}
-		return args[0], false, nil
 	}
-	return "", false, nil
+	return role, jsonOutput, help, nil
 }
 
 func extractConfigPath(args []string) ([]string, string, error) {
@@ -109,6 +113,10 @@ func joinWithRunner(ctx context.Context, requestedRole string, stdout io.Writer,
 }
 
 func joinWithConfigRunner(ctx context.Context, requestedRole, configPath string, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner) error {
+	return joinWithEndpointConfigRunner(ctx, requestedRole, configPath, steerEndpointSelector{}, false, stdout, lookupEnv, runTicket, nil)
+}
+
+func joinWithEndpointConfigRunner(ctx context.Context, requestedRole, configPath string, selector steerEndpointSelector, jsonOutput bool, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner, router *steertransport.Router) error {
 	ctx, cancel := context.WithTimeout(ctx, steerCommandTimeout)
 	defer cancel()
 	loaded, err := loadSteerConfigPath(configPath, lookupEnv)
@@ -119,7 +127,7 @@ func joinWithConfigRunner(ctx context.Context, requestedRole, configPath string,
 	if err != nil {
 		return err
 	}
-	identity, err := discoverCurrentTicketIdentity(ctx, lookupEnv, runTicket)
+	identity, err := discoverCurrentIdentity(ctx, selector, lookupEnv, runTicket)
 	if err != nil {
 		return err
 	}
@@ -144,14 +152,44 @@ func joinWithConfigRunner(ctx context.Context, requestedRole, configPath string,
 		return errors.New("ticket check --active -j did not confirm valid active metadata")
 	}
 	localDir := loaded.Instance.LocalDir
-	registration := state.SteerRegistration{
-		RepositoryID: identity.RepositoryID, RepositoryPath: identity.RepositoryPath,
-		RepositoryName: identity.RepositoryName, Actor: identity.Actor, Role: roleName,
-		CodexHome: identity.CodexHome, ThreadID: identity.ThreadID,
+	registration := steerRegistrationForIdentity(identity, roleName)
+	if router == nil {
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			return err
+		}
 	}
-	current, previous, changed, err := state.NewRegistrationStore(localDir).Join(ctx, registration)
+	var preparedEndpoint steertransport.Endpoint
+	var preparedRegistration state.SteerRegistration
+	current, previous, changed, err := state.NewRegistrationStore(localDir).JoinWithPreparation(ctx, registration, func(candidate state.SteerRegistration) error {
+		preparedRegistration = candidate
+		preparedEndpoint, err = router.Prepare(ctx, localDir, candidate)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("save steer registration: %w", err)
+		if preparedRegistration.IncarnationID != "" && current.IncarnationID != preparedRegistration.IncarnationID {
+			_ = router.Retire(context.Background(), localDir, preparedRegistration)
+		}
+		return fmt.Errorf("join steer registration: %w", err)
+	}
+	if previous != nil && previous.IncarnationID != current.IncarnationID {
+		if err := router.Retire(ctx, localDir, *previous); err != nil {
+			return fmt.Errorf("retire previous steer endpoint: %w", err)
+		}
+	}
+	if jsonOutput {
+		return json.NewEncoder(stdout).Encode(struct {
+			OrcID          string                  `json:"orc_id"`
+			RepositoryID   string                  `json:"repository_id"`
+			Actor          string                  `json:"actor"`
+			Role           string                  `json:"role"`
+			Harness        string                  `json:"harness"`
+			Session        string                  `json:"session"`
+			RegistrationID string                  `json:"registration_id"`
+			IncarnationID  string                  `json:"incarnation_id"`
+			Transport      steerEndpointDescriptor `json:"transport"`
+		}{loaded.Config.ID, current.RepositoryID, current.Actor, current.Role, current.Harness, current.SessionID,
+			current.RegistrationID, current.IncarnationID, descriptorFor(preparedEndpoint)})
 	}
 	if previous == nil {
 		fmt.Fprintf(stdout, "joined as %s\n", current.Role)
@@ -159,13 +197,39 @@ func joinWithConfigRunner(ctx context.Context, requestedRole, configPath string,
 		fmt.Fprintf(stdout, "already joined as %s\n", current.Role)
 	} else if previous.Role != current.Role {
 		fmt.Fprintf(stdout, "role changed: %s -> %s\n", previous.Role, current.Role)
-	} else if previous.ThreadID != current.ThreadID {
+	} else if previous.SessionID != current.SessionID {
 		fmt.Fprintf(stdout, "session replaced for %s\n", current.Role)
 	} else {
 		fmt.Fprintf(stdout, "registration updated for %s\n", current.Role)
 	}
-	fmt.Fprintf(stdout, "repository: %s\nsession: %s\n", repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID), shortIdentity(identity.ThreadID))
+	fmt.Fprintf(stdout, "repository: %s\nsession: %s\n", repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID), shortIdentity(identity.SessionID))
 	return nil
+}
+
+func steerRegistrationForIdentity(identity currentTicketIdentity, role string) state.SteerRegistration {
+	return state.SteerRegistration{
+		RepositoryID: identity.RepositoryID, RepositoryPath: identity.RepositoryPath,
+		RepositoryName: identity.RepositoryName, Actor: identity.Actor, Role: role,
+		Harness: identity.Harness, SessionID: identity.SessionID, Transport: identity.Transport,
+	}
+}
+
+func steerRegistrationMatchesIdentity(registration state.SteerRegistration, identity currentTicketIdentity) bool {
+	return registration.RepositoryID == identity.RepositoryID && registration.Actor == identity.Actor &&
+		registration.RepositoryPath == identity.RepositoryPath && registration.Harness == identity.Harness &&
+		registration.SessionID == identity.SessionID && sameTransportRoute(registration.Transport, identity.Transport)
+}
+
+func sameTransportRoute(left, right state.SteerTransportRoute) bool {
+	if left.Kind != right.Kind || len(left.Params) != len(right.Params) {
+		return false
+	}
+	for key, value := range left.Params {
+		if right.Params[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveSteerRole(requested string, config FileConfig, lookupEnv envLookup) (string, error) {
@@ -215,23 +279,76 @@ func validateSteerRole(role string, config FileConfig) (string, error) {
 }
 
 func executeLeave(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
+	args, selector, err := extractEndpointSelector(args)
+	if err != nil {
+		return usageError(stderr, "%v", err)
+	}
 	args, configPath, err := extractConfigPath(args)
 	if err != nil {
 		return usageError(stderr, "%v", err)
 	}
-	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprint(stdout, leaveHelp)
-		return 0
+	var registrationID, incarnationID string
+	jsonOutput := false
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-h" || arg == "--help" {
+			fmt.Fprint(stdout, leaveHelp)
+			return 0
+		}
+		if arg == "-j" || arg == "--json" {
+			if jsonOutput {
+				return usageError(stderr, "duplicate flag --json")
+			}
+			jsonOutput = true
+			continue
+		}
+		name, value, hasValue := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
+		if !strings.HasPrefix(arg, "--") || name != "registration-id" && name != "incarnation-id" {
+			filtered = append(filtered, arg)
+			continue
+		}
+		if !hasValue {
+			i++
+			if i >= len(args) {
+				return usageError(stderr, "flag --%s requires a value", name)
+			}
+			value = args[i]
+		}
+		if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			return usageError(stderr, "--%s must be non-empty and trimmed", name)
+		}
+		if name == "registration-id" {
+			if registrationID != "" {
+				return usageError(stderr, "duplicate flag --registration-id")
+			}
+			registrationID = value
+		} else {
+			if incarnationID != "" {
+				return usageError(stderr, "duplicate flag --incarnation-id")
+			}
+			incarnationID = value
+		}
 	}
+	args = filtered
 	if len(args) != 0 {
 		return usageError(stderr, "leave accepts no arguments")
 	}
-	removed, err := leaveWithConfigRunner(context.Background(), configPath, stdout, lookupEnv, runTicketJSON)
+	if selector.Explicit && (registrationID == "" || incarnationID == "") {
+		return usageError(stderr, "explicit leave requires --registration-id and --incarnation-id")
+	}
+	if registrationID != "" && (!validSteerIncarnationID(registrationID) || !validSteerIncarnationID(incarnationID)) {
+		return usageError(stderr, "registration and incarnation IDs must be 32 lowercase hexadecimal characters")
+	}
+	if !selector.Explicit && (registrationID != "" || incarnationID != "") {
+		return usageError(stderr, "registration IDs require an explicit endpoint selector")
+	}
+	removed, err := leaveWithEndpointConfigRunner(context.Background(), configPath, selector, registrationID, incarnationID, jsonOutput, stdout, lookupEnv, runTicketJSON, nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	if !removed {
+	if !removed && !jsonOutput {
 		fmt.Fprintln(stdout, "not joined (already absent or replaced)")
 	}
 	return 0
@@ -242,25 +359,69 @@ func leaveWithRunner(ctx context.Context, stdout io.Writer, lookupEnv envLookup,
 }
 
 func leaveWithConfigRunner(ctx context.Context, configPath string, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner) (bool, error) {
+	return leaveWithEndpointConfigRunner(ctx, configPath, steerEndpointSelector{}, "", "", false, stdout, lookupEnv, runTicket, nil)
+}
+
+func leaveWithEndpointConfigRunner(ctx context.Context, configPath string, selector steerEndpointSelector, registrationID, incarnationID string, jsonOutput bool, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner, router *steertransport.Router) (bool, error) {
 	loaded, err := loadSteerConfigPath(configPath, lookupEnv)
 	if err != nil {
 		return false, err
 	}
-	identity, err := discoverCurrentTicketIdentity(ctx, lookupEnv, runTicket)
+	identity, err := discoverCurrentIdentity(ctx, selector, lookupEnv, runTicket)
 	if err != nil {
 		return false, err
 	}
-	removed, err := state.NewRegistrationStore(loaded.Instance.LocalDir).Leave(ctx, identity.RepositoryID, identity.Actor, identity.RepositoryPath, identity.CodexHome, identity.ThreadID)
+	registrations := state.NewRegistrationStore(loaded.Instance.LocalDir)
+	registration, found, err := registrations.Find(ctx, identity.RepositoryID, identity.Actor)
+	if err != nil {
+		return false, fmt.Errorf("read steer registration: %w", err)
+	}
+	if !found || !steerRegistrationMatchesIdentity(registration, identity) ||
+		(selector.Explicit && (registration.RegistrationID != registrationID || registration.IncarnationID != incarnationID)) {
+		if jsonOutput {
+			return false, json.NewEncoder(stdout).Encode(struct {
+				Removed bool `json:"removed"`
+			}{Removed: false})
+		}
+		return false, nil
+	}
+	if router == nil {
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			return false, err
+		}
+	}
+	removed, err := registrations.Leave(ctx, registration)
 	if err != nil {
 		return false, fmt.Errorf("remove steer registration: %w", err)
 	}
 	if removed {
-		fmt.Fprintf(stdout, "left %s in %s\n", shortIdentity(identity.ThreadID), repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID))
+		if err := router.Retire(ctx, loaded.Instance.LocalDir, registration); err != nil {
+			return false, fmt.Errorf("registration was removed but endpoint retirement failed: %w", err)
+		}
+	}
+	if jsonOutput {
+		result := struct {
+			Removed        bool   `json:"removed"`
+			RegistrationID string `json:"registration_id,omitempty"`
+			IncarnationID  string `json:"incarnation_id,omitempty"`
+		}{Removed: removed}
+		if removed {
+			result.RegistrationID, result.IncarnationID = registration.RegistrationID, registration.IncarnationID
+		}
+		return removed, json.NewEncoder(stdout).Encode(result)
+	}
+	if removed {
+		fmt.Fprintf(stdout, "left %s in %s\n", shortIdentity(identity.SessionID), repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID))
 	}
 	return removed, nil
 }
 
 func executeWhoami(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
+	args, selector, err := extractEndpointSelector(args)
+	if err != nil {
+		return usageError(stderr, "%v", err)
+	}
 	args, configPath, err := extractConfigPath(args)
 	if err != nil {
 		return usageError(stderr, "%v", err)
@@ -280,7 +441,7 @@ func executeWhoami(args []string, stdout, stderr io.Writer, lookupEnv envLookup)
 			return usageError(stderr, "unknown whoami argument %q", arg)
 		}
 	}
-	if err := whoamiWithConfigRunner(context.Background(), jsonOutput, configPath, stdout, lookupEnv, runTicketJSON); err != nil {
+	if err := whoamiWithEndpointConfigRunner(context.Background(), jsonOutput, configPath, selector, stdout, lookupEnv, runTicketJSON, nil); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
@@ -292,11 +453,15 @@ func whoamiWithRunner(ctx context.Context, jsonOutput bool, stdout io.Writer, lo
 }
 
 func whoamiWithConfigRunner(ctx context.Context, jsonOutput bool, configPath string, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner) error {
+	return whoamiWithEndpointConfigRunner(ctx, jsonOutput, configPath, steerEndpointSelector{}, stdout, lookupEnv, runTicket, nil)
+}
+
+func whoamiWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPath string, selector steerEndpointSelector, stdout io.Writer, lookupEnv envLookup, runTicket ticketCommandRunner, router *steertransport.Router) error {
 	loaded, err := loadSteerConfigPath(configPath, lookupEnv)
 	if err != nil {
 		return err
 	}
-	identity, err := discoverCurrentTicketIdentity(ctx, lookupEnv, runTicket)
+	identity, err := discoverCurrentIdentity(ctx, selector, lookupEnv, runTicket)
 	if err != nil {
 		return err
 	}
@@ -305,7 +470,22 @@ func whoamiWithConfigRunner(ctx context.Context, jsonOutput bool, configPath str
 	if err != nil {
 		return fmt.Errorf("read steer registration: %w", err)
 	}
-	joined := registered && registration.ThreadID == identity.ThreadID && registration.CodexHome == identity.CodexHome && registration.RepositoryPath == identity.RepositoryPath
+	joined := registered && steerRegistrationMatchesIdentity(registration, identity)
+	var endpoint *steerEndpointDescriptor
+	if joined {
+		if router == nil {
+			router, err = newDefaultSteerTransportRouter()
+			if err != nil {
+				return err
+			}
+		}
+		prepared, err := router.Verify(ctx, loaded.Instance.LocalDir, registration)
+		if err != nil {
+			return fmt.Errorf("verify current steer endpoint: %w", err)
+		}
+		descriptor := descriptorFor(prepared)
+		endpoint = &descriptor
+	}
 	if joined {
 		role = registration.Role
 		roleErr = nil
@@ -314,17 +494,26 @@ func whoamiWithConfigRunner(ctx context.Context, jsonOutput bool, configPath str
 		role = ""
 	}
 	result := struct {
-		OrcID        string `json:"orc_id"`
-		RepositoryID string `json:"repository_id"`
-		Repository   string `json:"repository"`
-		Actor        string `json:"actor"`
-		Role         string `json:"role"`
-		Session      string `json:"session"`
-		Joined       bool   `json:"joined"`
+		OrcID          string                   `json:"orc_id"`
+		RepositoryID   string                   `json:"repository_id"`
+		Repository     string                   `json:"repository"`
+		Actor          string                   `json:"actor"`
+		Role           string                   `json:"role"`
+		Session        string                   `json:"session"`
+		Joined         bool                     `json:"joined"`
+		Harness        string                   `json:"harness,omitempty"`
+		RegistrationID string                   `json:"registration_id,omitempty"`
+		IncarnationID  string                   `json:"incarnation_id,omitempty"`
+		Transport      *steerEndpointDescriptor `json:"transport,omitempty"`
 	}{
 		OrcID: loaded.Config.ID, RepositoryID: identity.RepositoryID,
 		Repository: repositoryDisplayLabel(identity.RepositoryName, identity.RepositoryPath, identity.RepositoryID), Actor: identity.Actor,
-		Role: role, Session: identity.ThreadID, Joined: joined,
+		Role: role, Session: identity.SessionID, Joined: joined,
+		Harness: identity.Harness, Transport: endpoint,
+	}
+	if joined {
+		result.RegistrationID = registration.RegistrationID
+		result.IncarnationID = registration.IncarnationID
 	}
 	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
@@ -349,43 +538,81 @@ func loadSteerConfigPath(configPath string, lookupEnv envLookup) (LoadedFileConf
 	if err != nil {
 		return LoadedFileConfig{}, fmt.Errorf("load Orc config: %w", err)
 	}
+	if err := ensureLoadedRuntime(loaded); err != nil {
+		return LoadedFileConfig{}, err
+	}
 	return loaded, nil
 }
 
+func discoverCurrentIdentity(ctx context.Context, selector steerEndpointSelector, lookupEnv envLookup, runTicket ticketCommandRunner) (currentTicketIdentity, error) {
+	routing, err := discoverTicketRoutingIdentity(ctx, runTicket)
+	if err != nil {
+		return currentTicketIdentity{}, err
+	}
+	endpoint, err := discoverSteerEndpointIdentity(selector, lookupEnv)
+	if err != nil {
+		return currentTicketIdentity{}, err
+	}
+	return currentTicketIdentity{ticketRoutingIdentity: routing, steerEndpointIdentity: endpoint}, nil
+}
+
 func discoverCurrentTicketIdentity(ctx context.Context, lookupEnv envLookup, runTicket ticketCommandRunner) (currentTicketIdentity, error) {
-	if lookupEnv == nil || runTicket == nil {
-		return currentTicketIdentity{}, errors.New("Ticket identity discovery is unavailable")
+	return discoverCurrentIdentity(ctx, steerEndpointSelector{}, lookupEnv, runTicket)
+}
+
+func discoverTicketRoutingIdentity(ctx context.Context, runTicket ticketCommandRunner) (ticketRoutingIdentity, error) {
+	if runTicket == nil {
+		return ticketRoutingIdentity{}, errors.New("Ticket identity discovery is unavailable")
 	}
 	if ctx == nil {
-		return currentTicketIdentity{}, errors.New("Ticket identity context is unavailable")
+		return ticketRoutingIdentity{}, errors.New("Ticket identity context is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(ctx, steerCommandTimeout)
 	defer cancel()
 	actorData, err := runTicket(ctx, "actor", "-j")
 	if err != nil {
-		return currentTicketIdentity{}, fmt.Errorf("read Ticket actor: %w", err)
+		return ticketRoutingIdentity{}, fmt.Errorf("read Ticket actor: %w", err)
 	}
 	var actorResult struct {
 		Actor string `json:"actor"`
 	}
 	if err := json.Unmarshal(actorData, &actorResult); err != nil || strings.TrimSpace(actorResult.Actor) == "" || ticketclient.ValidateActor(actorResult.Actor) != nil {
-		return currentTicketIdentity{}, errors.New("ticket actor -j returned invalid actor data")
+		return ticketRoutingIdentity{}, errors.New("ticket actor -j returned invalid actor data")
 	}
 	infoData, err := runTicket(ctx, "info", "-j")
 	if err != nil {
-		return currentTicketIdentity{}, fmt.Errorf("read Ticket repository: %w", err)
+		return ticketRoutingIdentity{}, fmt.Errorf("read Ticket repository: %w", err)
 	}
 	var info ticketclient.RepositoryInfo
 	if err := json.Unmarshal(infoData, &info); err != nil || !ticketclient.ValidRepositoryID(info.ID) || strings.TrimSpace(info.Path) == "" {
-		return currentTicketIdentity{}, errors.New("ticket info -j returned invalid repository data")
+		return ticketRoutingIdentity{}, errors.New("ticket info -j returned invalid repository data")
 	}
 	repositoryPath, err := filepath.Abs(info.Path)
 	if err != nil {
-		return currentTicketIdentity{}, fmt.Errorf("resolve Ticket repository path: %w", err)
+		return ticketRoutingIdentity{}, fmt.Errorf("resolve Ticket repository path: %w", err)
+	}
+	name := ""
+	if info.Name != nil {
+		name = *info.Name
+	}
+	return ticketRoutingIdentity{Actor: actorResult.Actor, RepositoryID: info.ID,
+		RepositoryPath: filepath.Clean(repositoryPath), RepositoryName: name}, nil
+}
+
+func discoverSteerEndpointIdentity(selector steerEndpointSelector, lookupEnv envLookup) (steerEndpointIdentity, error) {
+	if selector.Explicit {
+		if err := validateEndpointSelector(selector); err != nil {
+			return steerEndpointIdentity{}, fmt.Errorf("invalid explicit steering endpoint: %w", err)
+		}
+		return steerEndpointIdentity{Harness: selector.Harness, SessionID: selector.SessionID,
+			Transport: state.SteerTransportRoute{Kind: selector.Transport}}, nil
+	}
+	if lookupEnv == nil {
+		return steerEndpointIdentity{}, errors.New("Codex endpoint discovery is unavailable")
 	}
 	threadID, ok := lookupEnv("CODEX_THREAD_ID")
 	if !ok || codex.ValidateSessionTarget(threadID) != nil {
-		return currentTicketIdentity{}, errors.New("CODEX_THREAD_ID is unavailable or invalid")
+		return steerEndpointIdentity{}, errors.New("CODEX_THREAD_ID is unavailable or invalid")
 	}
 	codexHome := ""
 	if value, ok := lookupEnv("CODEX_HOME"); ok && strings.TrimSpace(value) != "" {
@@ -393,22 +620,16 @@ func discoverCurrentTicketIdentity(ctx context.Context, lookupEnv envLookup, run
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil || strings.TrimSpace(home) == "" {
-			return currentTicketIdentity{}, errors.New("effective Codex home is unavailable")
+			return steerEndpointIdentity{}, errors.New("effective Codex home is unavailable")
 		}
 		codexHome = filepath.Join(home, ".codex")
 	}
-	codexHome, err = filepath.Abs(codexHome)
+	codexHome, err := filepath.Abs(codexHome)
 	if err != nil {
-		return currentTicketIdentity{}, fmt.Errorf("resolve Codex home: %w", err)
+		return steerEndpointIdentity{}, fmt.Errorf("resolve Codex home: %w", err)
 	}
-	name := ""
-	if info.Name != nil {
-		name = *info.Name
-	}
-	return currentTicketIdentity{
-		Actor: actorResult.Actor, RepositoryID: info.ID, RepositoryPath: filepath.Clean(repositoryPath),
-		RepositoryName: name, ThreadID: threadID, CodexHome: filepath.Clean(codexHome),
-	}, nil
+	return steerEndpointIdentity{Harness: "codex", SessionID: threadID,
+		Transport: state.SteerTransportRoute{Kind: "codex-queue", Params: map[string]string{"home": filepath.Clean(codexHome)}}}, nil
 }
 
 func runTicketJSON(ctx context.Context, args ...string) ([]byte, error) {

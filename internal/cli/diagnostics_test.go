@@ -48,6 +48,19 @@ func TestConfigCheckPreservesSafeInheritedActorValidationReason(t *testing.T) {
 	}
 }
 
+func TestConfigCheckDoesNotCreateRuntimeRootOrMarker(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "config.json")
+	writeConfigFixture(t, path, `{"version":1}`)
+	var stdout, stderr bytes.Buffer
+	if err := executeConfigCheck(ConfigCheckConfig{ConfigPath: path, Explicit: true, Output: OutputQuiet}, &stdout, &stderr, emptyEnv); err != nil {
+		t.Fatalf("config check: %v stderr=%q", err, stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".local")); !os.IsNotExist(err) {
+		t.Fatalf("config check created runtime state: lstat err=%v", err)
+	}
+}
+
 func TestConfigCheckUsesTypedFieldDiagnostics(t *testing.T) {
 	tests := []struct {
 		name, field, value, code, path string

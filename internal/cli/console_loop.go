@@ -109,6 +109,11 @@ func runConsoleLoopWithEndpointOptions(ctx context.Context, options daemonComman
 			}
 		case event := <-events:
 			event = tracker.prepare(event)
+			if watching && (event.Type == "config.reloaded" || (event.RepositoryID != "" && !watchRenderer.hasRepository(event.RepositoryID))) {
+				if status, statusErr := client.Status(consoleCtx); statusErr == nil {
+					watchRenderer.seedRepositories(status.Repositories)
+				}
+			}
 			accepted := tracker.accept(event)
 			if watching && accepted && consoleWatchEvent(event) {
 				renderConsoleWatchActivity(renderer.asyncWriter(), watchRenderer, options.localDir, event, time.Now())

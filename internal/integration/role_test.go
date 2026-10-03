@@ -77,6 +77,50 @@ func TestRoleExecutableWorkflow(t *testing.T) {
 	}
 }
 
+func TestRoleExecutableClaimsConfiguredTagsThroughTicketJSON(t *testing.T) {
+	binary, helperDir := buildFixture(t)
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.json")
+	config := fmt.Sprintf(`{"version":1,"id":"1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","ticket_tags":["backend","urgent"],"nudge_prompt":"Coding."},"reviewer":{"ticket_queue":"review","nudge_prompt":"Review."}}}`, stateDir)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ticketLog := filepath.Join(root, "ticket.log")
+	codexLog := filepath.Join(root, "codex.jsonl")
+	actor := "integration-coder"
+	home := filepath.Join(root, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "coder", "--actor", actor, "--config", configPath)
+	cmd.Env = testEnv(helperDir, map[string]string{
+		"TICKET_ORC_FAKE_TICKET_STATE": "review",
+		"TICKET_ORC_FAKE_CLAIM_STATE":  "open",
+		"TICKET_ORC_FAKE_TICKET_LOG":   ticketLog,
+		"TICKET_ORC_FAKE_CODEX_LOG":    codexLog,
+		"TICKET_ORC_FAKE_TICKET_ID":    integrationTicketID,
+	}, map[string]string{"TICKET_ORC_ACTOR": actor, "HOME": home, "USERPROFILE": home})
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("role unexpectedly exited successfully after fake queue exhaustion")
+	}
+	if !strings.Contains(stderr.String(), "wait for implementation work failed") {
+		t.Fatalf("role did not reach the expected empty-queue result: %q", stderr.String())
+	}
+	if got := readText(ticketLog); !strings.Contains(got, "wait --tag backend --tag urgent --claim") {
+		t.Fatalf("Ticket JSON requests did not atomically claim the conjunctive role selector: %q", got)
+	}
+	if got := readCodexCalls(t, codexLog); len(got) != 1 {
+		t.Fatalf("Codex calls=%#v, want one turn after tagged claim", got)
+	}
+}
+
 func TestRoleExecutableInvalidConfigDoesNotClaim(t *testing.T) {
 	binary, helperDir := buildFixture(t)
 	root := t.TempDir()
@@ -257,7 +301,7 @@ func TestSameRoleNamedWorkersSelectDifferentHarnesses(t *testing.T) {
 	configDir := t.TempDir()
 	configPath := filepath.Join(configDir, "config.json")
 	const configID = "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
-	localDir := filepath.Join(configDir, ".local", configID)
+	localDir := filepath.Join(configDir, ".local")
 	config := `{"version":1,"id":"` + configID + `","default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"Coding."},"reviewer":{"ticket_queue":"review","nudge_prompt":"Review."}},"workers":{"worker-a":{"role":"coder","harness":"pi","actor":"integration-a"},"worker-b":{"role":"coder","harness":"claude","actor":"integration-b"}}}`
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
@@ -308,8 +352,8 @@ func TestSameRoleNamedWorkersSelectDifferentHarnesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 || entries[0].Name() != ".local" && entries[1].Name() != ".local" {
-		t.Fatalf("generated worker data appeared beside config.json: %v", entries)
+	if len(entries) != 3 || entries[0].Name() != ".local" || entries[1].Name() != ".local.guard" || entries[2].Name() != "config.json" {
+		t.Fatalf("unexpected entries beside worker config: %v", entries)
 	}
 }
 
@@ -450,6 +494,42 @@ func TestRoleExecutableHarnessFailureRereadsAndStops(t *testing.T) {
 	}
 }
 
+func TestRoleExecutableReleasesClaimAfterCodexFailsBeforeSession(t *testing.T) {
+	for _, test := range []struct {
+		role  string
+		state string
+	}{
+		{role: "coder", state: "open"},
+		{role: "reviewer", state: "review"},
+	} {
+		t.Run(test.role, func(t *testing.T) {
+			binary, helperDir := buildFixture(t)
+			stateDir := filepath.Join(t.TempDir(), "state")
+			codexLog := filepath.Join(t.TempDir(), "codex.jsonl")
+			ticketLog := filepath.Join(t.TempDir(), "ticket.log")
+			result := runRole(t, binary, helperDir, test.role, stateDir, codexLog, ticketLog, map[string]string{
+				"TICKET_ORC_FAKE_TICKET_STATE":              test.state,
+				"TICKET_ORC_FAKE_CLAIM_STATE":               test.state,
+				"TICKET_ORC_FAKE_REVIEW_CLAIM_STATE":        test.state,
+				"TICKET_ORC_FAKE_CODEX_FAIL_BEFORE_SESSION": "1",
+				"TICKET_ORC_FAKE_TICKET_ID":                 integrationTicketID,
+			})
+			if !strings.Contains(result.stderr, "Codex process exited with status 7") || !strings.Contains(result.stderr, "example startup failure") || !strings.Contains(result.stderr, "released unchanged "+test.state+" claim") {
+				t.Fatalf("stderr=%q, want Codex cause and successful claim recovery", result.stderr)
+			}
+			if got := countTicketRequest(ticketLog, "show"); got != 1 {
+				t.Fatalf("show requests=%d log=%q, want authoritative reread", got, readText(ticketLog))
+			}
+			if got := countTicketRequest(ticketLog, "release"); got != 1 {
+				t.Fatalf("release requests=%d log=%q, want exactly one claim recovery", got, readText(ticketLog))
+			}
+			if got := len(readCodexCalls(t, codexLog)); got != 1 {
+				t.Fatalf("Codex calls=%d, want exactly one failed startup", got)
+			}
+		})
+	}
+}
+
 type roleResult struct {
 	stdout string
 	stderr string
@@ -558,7 +638,15 @@ func buildFixture(t *testing.T) (string, string) {
 		"GOPATH":      filepath.Join(cacheRoot, "path"),
 		"GOMODCACHE":  filepath.Join(cacheRoot, "mod"),
 	})
-	cmd := exec.Command("go", "build", "-o", binary, "./cmd/ticket-orc")
+	versionData, err := os.ReadFile(filepath.Join(root, "VERSION"))
+	if err != nil {
+		t.Fatalf("read fixture version: %v", err)
+	}
+	version := strings.TrimSpace(string(versionData))
+	if version == "" {
+		t.Fatal("VERSION is empty")
+	}
+	cmd := exec.Command("go", "build", "-ldflags", "-X github.com/toolsupply/ticket-orc/internal/cli.Version="+version, "-o", binary, "./cmd/ticket-orc")
 	cmd.Dir = root
 	cmd.Env = buildEnv
 	if output, err := cmd.CombinedOutput(); err != nil {

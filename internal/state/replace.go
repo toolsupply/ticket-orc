@@ -73,6 +73,44 @@ func WriteAtomicMode(path string, data []byte, mode os.FileMode) error {
 	return writeStateAtomicMode(path, data, mode)
 }
 
+// WriteAtomicNewMode publishes a private file atomically only when path does
+// not already exist. It is used for ownership records whose first writer must
+// not replace a concurrent writer's identity.
+func WriteAtomicNewMode(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary state for %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := securePrivateFile(tmp, tmpPath, mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("secure temporary state %s: %w", tmpPath, err)
+	}
+	written, writeErr := tmp.Write(data)
+	if writeErr == nil && written != len(data) {
+		writeErr = errors.New("short write")
+	}
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		return fmt.Errorf("write temporary state for %s: %w", path, writeErr)
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		return fmt.Errorf("publish new state %s: %w", path, err)
+	}
+	if err := verifyPrivateFilePath(path, mode); err != nil {
+		return fmt.Errorf("verify state file %s: %w", path, err)
+	}
+	return nil
+}
+
 func recoverFailedReplacement(target, tmp string) (bool, error) {
 	if _, err := os.Lstat(target); err == nil {
 		if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {

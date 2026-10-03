@@ -4,39 +4,103 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
+	"sort"
 	"time"
 )
 
-// WaitAndClaimImplementation blocks until ticket atomically claims eligible
-// implementation work for the client's actor.
-func (c *Client) WaitAndClaimImplementation(ctx context.Context) (Ticket, error) {
-	return c.waitAndClaim(ctx, "open", []string{"wait", "--claim"})
+// QueueFilters contains conjunctive required tags and tags that must be absent.
+// Ownership observations intentionally do not accept this selector.
+type QueueFilters struct {
+	Tags        []string
+	WithoutTags []string
 }
 
-// WaitAndClaimReview blocks until ticket atomically claims eligible review
-// work for the client's actor.
-func (c *Client) WaitAndClaimReview(ctx context.Context) (Ticket, error) {
-	return c.waitAndClaim(ctx, "review", []string{"wait", "review", "--claim"})
+// CanonicalQueueFilters validates and canonicalizes a copy. Tag order and
+// nil-versus-empty slices have no semantic effect.
+func CanonicalQueueFilters(filters QueueFilters) (QueueFilters, error) {
+	canonicalize := func(tags []string) ([]string, error) {
+		if len(tags) == 0 {
+			return nil, nil
+		}
+		if len(tags) > 64 {
+			return nil, fmt.Errorf("ticket tag filter must contain at most 64 tags")
+		}
+		seen := make(map[string]struct{}, len(tags))
+		result := make([]string, 0, len(tags))
+		for _, tag := range tags {
+			if !validTagToken(tag) {
+				return nil, fmt.Errorf("ticket tag filter is invalid")
+			}
+			if _, ok := seen[tag]; !ok {
+				seen[tag] = struct{}{}
+				result = append(result, tag)
+			}
+		}
+		sort.Strings(result)
+		return result, nil
+	}
+	tags, err := canonicalize(filters.Tags)
+	if err != nil {
+		return QueueFilters{}, err
+	}
+	withoutTags, err := canonicalize(filters.WithoutTags)
+	if err != nil {
+		return QueueFilters{}, err
+	}
+	excluded := make(map[string]struct{}, len(withoutTags))
+	for _, tag := range withoutTags {
+		excluded[tag] = struct{}{}
+	}
+	for _, tag := range tags {
+		if _, ok := excluded[tag]; ok {
+			return QueueFilters{}, fmt.Errorf("ticket tag %q is both required and excluded", tag)
+		}
+	}
+	return QueueFilters{Tags: tags, WithoutTags: withoutTags}, nil
 }
 
-// WaitAndClaimReviewWithoutTags keeps configured Orc review-skip tags out of
-// the automatic reviewer queue. Ticket still owns queue readiness and claims.
-func (c *Client) WaitAndClaimReviewWithoutTags(ctx context.Context, tags []string) (Ticket, error) {
-	args, err := appendWithoutTagArgs([]string{"next", "review"}, tags)
+// WaitAndClaimImplementation atomically claims eligible implementation work.
+func (c *Client) WaitAndClaimImplementation(ctx context.Context, filters QueueFilters) (Ticket, error) {
+	return c.waitAndClaimQueue(ctx, "open", filters)
+}
+
+// WaitAndClaimReview atomically claims eligible review work.
+func (c *Client) WaitAndClaimReview(ctx context.Context, filters QueueFilters) (Ticket, error) {
+	return c.waitAndClaimQueue(ctx, "review", filters)
+}
+
+func (c *Client) waitAndClaimQueue(ctx context.Context, queue string, filters QueueFilters) (Ticket, error) {
+	if queue != "open" && queue != "review" {
+		return Ticket{}, fmt.Errorf("ticket queue must be open or review")
+	}
+	filters, err := CanonicalQueueFilters(filters)
 	if err != nil {
 		return Ticket{}, err
 	}
-	// Ticket v0.2 exposes --without-tag on next. Keep selection and claim in
-	// Ticket's one atomic queue operation so a concurrent tag or ownership
-	// change cannot leave Orc holding an excluded review ticket.
+	if len(filters.WithoutTags) == 0 {
+		args := []string{"wait"}
+		if queue == "review" {
+			args = append(args, "review")
+		}
+		args = appendTagArgs(args, filters.Tags)
+		args = append(args, "--claim")
+		return c.waitAndClaim(ctx, queue, args)
+	}
+	// wait supports positive tags but not exclusions. Use Ticket's atomic
+	// next-and-claim operation and poll when an exclusion is required.
+	args := []string{"next"}
+	if queue == "review" {
+		args = append(args, "review")
+	}
+	args = appendTagArgs(args, filters.Tags)
+	args = appendWithoutTagArgs(args, filters.WithoutTags)
 	args = append(args, "--claim")
 	for {
 		var response struct {
 			Item *Ticket `json:"item"`
 		}
 		if err := c.invoke(ctx, args, &response); err != nil {
-			conflict, verificationErr := c.verifyActorQueueConflict(ctx, err, "review")
+			conflict, verificationErr := c.verifyActorQueueConflict(ctx, err, queue)
 			if verificationErr != nil {
 				return Ticket{}, verificationErr
 			}
@@ -48,17 +112,17 @@ func (c *Client) WaitAndClaimReviewWithoutTags(ctx context.Context, tags []strin
 		if response.Item != nil {
 			item := response.Item.NormalizeState()
 			if err := validateFullID(item.ID); err != nil {
-				return Ticket{}, fmt.Errorf("%w: claimed review ticket: %v", ErrProtocol, err)
+				return Ticket{}, fmt.Errorf("%w: claimed %s ticket: %v", ErrProtocol, queue, err)
 			}
-			if item.State != "review" {
-				return Ticket{}, fmt.Errorf("%w: claimed review ticket has state %q", ErrProtocol, item.State)
+			if item.State != queue {
+				return Ticket{}, fmt.Errorf("%w: claimed %s ticket has state %q", ErrProtocol, queue, item.State)
 			}
 			if item.Assignee != c.actor {
 				return Ticket{}, fmt.Errorf("%w: claimed item belongs to actor %q, expected %q", ErrProtocol, item.Assignee, c.actor)
 			}
 			return item, nil
 		}
-		timer := time.NewTimer(filteredReviewPoll)
+		timer := time.NewTimer(filteredQueuePoll)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
@@ -76,18 +140,12 @@ func (c *Client) WaitAndClaimReviewWithoutTags(ctx context.Context, tags []strin
 // HasReady reports whether Ticket's authoritative ready frontier contains
 // work for one queue without claiming it. The ready command owns the queue
 // semantics; Orc only consumes its boolean result for role backpressure.
-func (c *Client) HasReady(ctx context.Context, queue string) (bool, error) {
-	return c.hasReady(ctx, queue, nil)
+func (c *Client) HasReady(ctx context.Context, queue string, filters QueueFilters) (bool, error) {
+	return c.hasReady(ctx, queue, filters)
 }
 
-// HasReadyWithoutTags observes Ticket readiness while excluding configured
-// review-policy tags from the automatic reviewer queue.
-func (c *Client) HasReadyWithoutTags(ctx context.Context, queue string, tags []string) (bool, error) {
-	return c.hasReady(ctx, queue, tags)
-}
-
-func (c *Client) hasReady(ctx context.Context, queue string, tags []string) (bool, error) {
-	frontier, err := c.ReadyFrontier(ctx, queue, tags, 1)
+func (c *Client) hasReady(ctx context.Context, queue string, filters QueueFilters) (bool, error) {
+	frontier, err := c.ReadyFrontier(ctx, queue, filters, 1)
 	if err != nil {
 		return false, err
 	}
@@ -98,28 +156,36 @@ func (c *Client) hasReady(ctx context.Context, queue string, tags []string) (boo
 // Ownership is observed through Ticket's public JSON list interface; queue
 // selection itself remains delegated to HasReady/WaitAndClaim.
 func (c *Client) HasActiveClaim(ctx context.Context, queue string) (bool, error) {
-	return c.hasActiveClaim(ctx, queue, nil)
-}
-
-// HasActiveClaimWithoutTags observes this actor's active queue work while
-// excluding configured review-policy tags.
-func (c *Client) HasActiveClaimWithoutTags(ctx context.Context, queue string, tags []string) (bool, error) {
-	return c.hasActiveClaim(ctx, queue, tags)
+	if queue != "open" && queue != "review" {
+		return false, fmt.Errorf("ticket queue must be open or review")
+	}
+	var response struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	args := []string{"list", "--state", queue, "--assignee", c.actor, "--limit", "1", "--fields", "id"}
+	if err := c.invoke(ctx, args, &response); err != nil {
+		return false, err
+	}
+	return len(response.Items) > 0, nil
 }
 
 // ReadyFrontier returns Ticket's authoritative, bounded ready ordering without
 // claiming any item. Ticket owns eligibility, filtering, and rank semantics.
-func (c *Client) ReadyFrontier(ctx context.Context, queue string, tags []string, limit int) (ListResult, error) {
+func (c *Client) ReadyFrontier(ctx context.Context, queue string, filters QueueFilters, limit int) (ListResult, error) {
 	if queue != "open" && queue != "review" {
 		return ListResult{}, fmt.Errorf("ticket queue must be open or review")
 	}
 	if limit < 1 || limit > 20 {
 		return ListResult{}, fmt.Errorf("ticket ready frontier limit must be between 1 and 20")
 	}
-	args, err := appendWithoutTagArgs([]string{"ready", queue}, tags)
+	filters, err := CanonicalQueueFilters(filters)
 	if err != nil {
 		return ListResult{}, err
 	}
+	args := appendTagArgs([]string{"ready", queue}, filters.Tags)
+	args = appendWithoutTagArgs(args, filters.WithoutTags)
 	args = append(args, "--limit", fmt.Sprint(limit), "--fields", "id,title,state,assignee,priority")
 	var response ListResult
 	if err := c.invoke(ctx, args, &response); err != nil {
@@ -141,18 +207,15 @@ func (c *Client) ReadyFrontier(ctx context.Context, queue string, tags []string,
 }
 
 // ActiveClaims returns a bounded list of this actor's active claims in one
-// queue. Review policy tags are filtered the same way as the ready frontier.
-func (c *Client) ActiveClaims(ctx context.Context, queue string, tags []string, limit int) (ListResult, error) {
+// queue. It deliberately has no selector because ownership is actor-wide.
+func (c *Client) ActiveClaims(ctx context.Context, queue string, limit int) (ListResult, error) {
 	if queue != "open" && queue != "review" {
 		return ListResult{}, fmt.Errorf("ticket queue must be open or review")
 	}
 	if limit < 1 || limit > 20 {
 		return ListResult{}, fmt.Errorf("ticket active claim limit must be between 1 and 20")
 	}
-	args, err := appendWithoutTagArgs([]string{"list", "--state", queue, "--assignee", c.actor}, tags)
-	if err != nil {
-		return ListResult{}, err
-	}
+	args := []string{"list", "--state", queue, "--assignee", c.actor}
 	args = append(args, "--limit", fmt.Sprint(limit), "--fields", "id,title,state,assignee,priority")
 	var response ListResult
 	if err := c.invoke(ctx, args, &response); err != nil {
@@ -171,26 +234,6 @@ func (c *Client) ActiveClaims(ctx context.Context, queue string, tags []string, 
 		}
 	}
 	return response, nil
-}
-
-func (c *Client) hasActiveClaim(ctx context.Context, queue string, tags []string) (bool, error) {
-	if queue != "open" && queue != "review" {
-		return false, fmt.Errorf("ticket queue must be open or review")
-	}
-	var response struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
-	}
-	args, err := appendWithoutTagArgs([]string{"list", "--state", queue, "--assignee", c.actor}, tags)
-	if err != nil {
-		return false, err
-	}
-	args = append(args, "--limit", "1", "--fields", "id")
-	if err := c.invoke(ctx, args, &response); err != nil {
-		return false, err
-	}
-	return len(response.Items) > 0, nil
 }
 
 // ListOwned returns the actor's currently assigned tickets in one lifecycle
@@ -302,22 +345,22 @@ func (c *Client) verifyActorQueueConflict(ctx context.Context, err error, reques
 	return candidate, nil
 }
 
-const filteredReviewPoll = 100 * time.Millisecond
+const filteredQueuePoll = 100 * time.Millisecond
 
-func appendWithoutTagArgs(args, tags []string) ([]string, error) {
+func appendTagArgs(args, tags []string) []string {
 	result := append([]string(nil), args...)
-	seen := make(map[string]struct{}, len(tags))
 	for _, tag := range tags {
-		if strings.TrimSpace(tag) == "" || strings.TrimSpace(tag) != tag || !validTagToken(tag) {
-			return nil, fmt.Errorf("ticket tag filter is invalid")
-		}
-		if _, ok := seen[tag]; ok {
-			continue
-		}
-		seen[tag] = struct{}{}
+		result = append(result, "--tag", tag)
+	}
+	return result
+}
+
+func appendWithoutTagArgs(args, tags []string) []string {
+	result := append([]string(nil), args...)
+	for _, tag := range tags {
 		result = append(result, "--without-tag", tag)
 	}
-	return result, nil
+	return result
 }
 
 func validTagToken(tag string) bool {

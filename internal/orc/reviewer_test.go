@@ -214,6 +214,153 @@ func TestRunReviewerFailureStopsAndSavesSession(t *testing.T) {
 	}
 }
 
+func TestRunReviewerReleasesUnchangedReviewClaimAfterPreSessionFailure(t *testing.T) {
+	ticketID := "20260919-40012"
+	harnessErr := errors.New("Codex could not start")
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+		shows:        map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+	}
+	var diagnostics strings.Builder
+	config := reviewerConfig()
+	config.Diagnostics = &diagnostics
+	err := RunReviewer(context.Background(), config, tickets, &fakeCoderHarness{runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
+	if !errors.Is(err, harnessErr) || !strings.Contains(diagnostics.String(), "released unchanged review claim") || len(tickets.releases) != 1 || tickets.releases[0] != ticketID {
+		t.Fatalf("RunReviewer=%v diagnostics=%q releases=%#v", err, diagnostics.String(), tickets.releases)
+	}
+}
+
+func TestRunReviewerPreSessionRecoveryPreservesHarnessAndTicketErrors(t *testing.T) {
+	harnessErr := errors.New("Codex startup failed")
+	showErr := errors.New("Ticket show failed")
+	releaseErr := errors.New("Ticket release failed")
+	for _, test := range []struct {
+		name        string
+		showErr     error
+		releaseErr  error
+		wantRelease bool
+		wantRecover bool
+	}{
+		{name: "show failure", showErr: showErr},
+		{name: "release failure", releaseErr: releaseErr, wantRelease: true, wantRecover: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ticketID := "20260919-40013"
+			var diagnostics strings.Builder
+			config := reviewerConfig()
+			config.Diagnostics = &diagnostics
+			tickets := &fakeCoderTickets{
+				reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+				shows:        map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+				showErr:      test.showErr, releaseErr: test.releaseErr,
+			}
+			err := RunReviewer(context.Background(), config, tickets, &fakeCoderHarness{runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
+			if !errors.Is(err, harnessErr) {
+				t.Fatalf("RunReviewer=%v, want original harness error", err)
+			}
+			if test.showErr != nil && !errors.Is(err, showErr) {
+				t.Fatalf("RunReviewer=%v, want Show error", err)
+			}
+			if test.releaseErr != nil && !errors.Is(err, releaseErr) {
+				t.Fatalf("RunReviewer=%v, want Release error", err)
+			}
+			if test.wantRecover && !strings.Contains(err.Error(), "automatic claim recovery failed") {
+				t.Fatalf("RunReviewer=%v, want explicit recovery failure", err)
+			}
+			if test.wantRecover && !strings.Contains(diagnostics.String(), "automatic claim recovery failed") {
+				t.Fatalf("diagnostics=%q, want operator-visible recovery failure", diagnostics.String())
+			}
+			if (len(tickets.releases) == 1) != test.wantRelease {
+				t.Fatalf("release calls=%#v, wantRelease=%t", tickets.releases, test.wantRelease)
+			}
+			if test.showErr != nil && !strings.Contains(diagnostics.String(), "automatic claim recovery skipped because Ticket state could not be verified") {
+				t.Fatalf("diagnostics=%q, want unverified-state recovery diagnostic", diagnostics.String())
+			}
+		})
+	}
+}
+
+func TestRunReviewerDoesNotReleaseClaimAfterSessionLifecycleOrOwnershipChange(t *testing.T) {
+	harnessErr := errors.New("Codex startup failed")
+	for _, test := range []struct {
+		name       string
+		result     harness.RunResult
+		observed   ticketclient.Ticket
+		wantBounce bool
+		wantClean  bool
+	}{
+		{name: "session established", result: harness.RunResult{SessionID: "thread"}, observed: ticketclient.Ticket{State: "review", Assignee: "reviewer-1"}},
+		{name: "returned to open", observed: ticketclient.Ticket{State: "open", Assignee: "reviewer-1"}, wantBounce: true},
+		{name: "advanced to signoff", observed: ticketclient.Ticket{State: "signoff", Assignee: "reviewer-1"}},
+		{name: "terminal", observed: ticketclient.Ticket{State: ticketclient.StateClosed, Assignee: "reviewer-1"}, wantClean: true},
+		{name: "unassigned", observed: ticketclient.Ticket{State: "review"}},
+		{name: "other owner", observed: ticketclient.Ticket{State: "review", Assignee: "someone-else"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ticketID := "20260919-40014"
+			observed := test.observed
+			observed.ID = ticketID
+			tickets := &fakeCoderTickets{
+				reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+				shows:        map[string]ticketclient.Ticket{ticketID: observed},
+			}
+			stateStore := newFakeCoderState()
+			cleanup := &fakeCoderCleanup{}
+			err := RunReviewer(context.Background(), reviewerConfig(), tickets, &fakeCoderHarness{runRes: test.result, runErr: harnessErr}, stateStore, cleanup)
+			if !errors.Is(err, harnessErr) || len(tickets.releases) != 0 {
+				t.Fatalf("RunReviewer=%v releases=%#v, want harness error and no rollback", err, tickets.releases)
+			}
+			if (stateStore.bounces[ticketID] == 1) != test.wantBounce {
+				t.Fatalf("bounce count=%d wantBounce=%t", stateStore.bounces[ticketID], test.wantBounce)
+			}
+			if (len(cleanup.tickets) == 1) != test.wantClean {
+				t.Fatalf("cleanup=%#v wantClean=%t", cleanup.tickets, test.wantClean)
+			}
+		})
+	}
+}
+
+func TestRunReviewerCanReclaimTicketAfterPreSessionRecovery(t *testing.T) {
+	ticketID := "20260919-40015"
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{
+			{ID: ticketID, State: "review", Assignee: "reviewer-1"},
+			{ID: ticketID, State: "review", Assignee: "reviewer-1"},
+		},
+		shows: map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+	}
+	stateStore := newFakeCoderState()
+	harnessErr := errors.New("pre-session failure")
+	if err := RunReviewer(context.Background(), reviewerConfig(), tickets, &fakeCoderHarness{runErr: harnessErr}, stateStore, &fakeCoderCleanup{}); !errors.Is(err, harnessErr) {
+		t.Fatalf("first RunReviewer=%v, want pre-session harness failure", err)
+	}
+	if len(tickets.releases) != 1 {
+		t.Fatalf("release calls=%#v, want one startup rollback", tickets.releases)
+	}
+	second := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "retry-session"}}
+	if err := RunReviewer(context.Background(), reviewerConfig(), tickets, second, stateStore, &fakeCoderCleanup{}); err == nil || !strings.Contains(err.Error(), "expected signoff, open, or terminal") {
+		t.Fatalf("retry RunReviewer=%v, want existing unchanged-review lifecycle result", err)
+	}
+	if len(second.runs) != 1 || len(tickets.reviewClaims) != 0 {
+		t.Fatalf("retry did not reclaim ticket: harness runs=%d remaining claims=%#v", len(second.runs), tickets.reviewClaims)
+	}
+}
+
+func TestRunReviewerCancellationDuringHarnessDoesNotReleaseClaim(t *testing.T) {
+	ticketID := "20260919-40016"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+		shows:        map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+	}
+	agent := &fakeCoderHarness{runErr: context.Canceled, onRun: cancel}
+	err := RunReviewer(ctx, reviewerConfig(), tickets, agent, newFakeCoderState(), &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) || len(tickets.releases) != 0 {
+		t.Fatalf("RunReviewer=%v releases=%#v, want cancellation without startup rollback", err, tickets.releases)
+	}
+}
+
 func TestRunReviewerTerminalStateCleans(t *testing.T) {
 	ticketID := "20260919-40005"
 	tickets := &fakeCoderTickets{reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review"}}, shows: map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "rejected"}}}

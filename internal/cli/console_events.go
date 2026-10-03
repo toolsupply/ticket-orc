@@ -19,9 +19,15 @@ func readConsoleEvents(ctx context.Context, client *daemonclient.Client, events 
 	for {
 		stream, err := client.Events(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			consecutiveFailures++
 			if consecutiveFailures >= 3 {
-				errorsOut <- err
+				select {
+				case errorsOut <- err:
+				case <-ctx.Done():
+				}
 				return
 			}
 			if !waitConsoleReconnect(ctx, reconnectDelay) {
@@ -33,31 +39,42 @@ func readConsoleEvents(ctx context.Context, client *daemonclient.Client, events 
 			resyncConsoleStatus(ctx, client, events, errorsOut)
 		}
 		connected = true
-		consecutiveFailures = 0
-		event, nextErr := stream.Next()
-		if nextErr != nil && !errors.Is(nextErr, daemonclient.ErrEventGap) {
-			_ = stream.Close()
-			if errors.Is(nextErr, context.Canceled) || errors.Is(nextErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
+		reconnect := false
+		for {
+			event, nextErr := stream.Next()
+			if errors.Is(nextErr, daemonclient.ErrEventGap) {
+				resyncConsoleStatus(ctx, client, events, errorsOut)
+				nextErr = nil
+			}
+			if nextErr != nil {
+				_ = stream.Close()
+				if ctx.Err() != nil || errors.Is(nextErr, context.Canceled) || errors.Is(nextErr, context.DeadlineExceeded) {
+					return
+				}
+				consecutiveFailures++
+				if consecutiveFailures >= 3 {
+					select {
+					case errorsOut <- nextErr:
+					case <-ctx.Done():
+					}
+					return
+				}
+				if !waitConsoleReconnect(ctx, reconnectDelay) {
+					return
+				}
+				reconnect = true
+				break
+			}
+			consecutiveFailures = 0
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				_ = stream.Close()
 				return
 			}
-			consecutiveFailures++
-			if consecutiveFailures >= 3 {
-				errorsOut <- nextErr
-				return
-			}
-			if !waitConsoleReconnect(ctx, reconnectDelay) {
-				return
-			}
+		}
+		if reconnect {
 			continue
-		}
-		if errors.Is(nextErr, daemonclient.ErrEventGap) {
-			resyncConsoleStatus(ctx, client, events, errorsOut)
-		}
-		select {
-		case events <- event:
-		case <-ctx.Done():
-			_ = stream.Close()
-			return
 		}
 	}
 }
@@ -98,7 +115,7 @@ func resyncConsoleStatus(ctx context.Context, client *daemonclient.Client, event
 	}
 	for _, session := range status.Steer {
 		select {
-		case events <- daemon.Event{Type: "status.resync", Role: session.Role, Actor: session.Actor, Session: shortIdentity(session.Session), State: session.State, Code: session.Code, RepositoryID: session.RepositoryID, RepositoryName: session.RepositoryName}:
+		case events <- daemon.Event{Type: "status.resync", Role: session.Role, Actor: session.Actor, Harness: session.Harness, Session: shortIdentity(session.Session), State: session.State, Code: session.Code, RepositoryID: session.RepositoryID, RepositoryName: session.RepositoryName}:
 		case <-ctx.Done():
 			return
 		}
@@ -127,13 +144,20 @@ func (renderer *consoleWatchRenderer) seedRepositories(repositories []daemon.Rep
 	}
 }
 
+func (renderer *consoleWatchRenderer) hasRepository(id string) bool {
+	_, ok := renderer.repositories[id]
+	return ok
+}
+
 func (renderer *consoleWatchRenderer) render(out io.Writer, event daemon.Event, at time.Time) {
+	var output strings.Builder
 	date := at.Local().Format("2006-01-02")
 	if renderer.date != "" && renderer.date != date {
-		fmt.Fprintf(out, "--- %s ---\n", date)
+		fmt.Fprintf(&output, "--- %s ---\n", date)
 	}
 	renderer.date = date
-	renderConsoleEventAt(out, event, at, renderer.repositories)
+	renderConsoleEventAt(&output, event, at, renderer.repositories)
+	_, _ = io.WriteString(out, output.String())
 }
 
 func renderConsoleEventAt(out io.Writer, event daemon.Event, at time.Time, repositories map[string]daemon.RepositoryStatus) {
@@ -142,12 +166,16 @@ func renderConsoleEventAt(out io.Writer, event daemon.Event, at time.Time, repos
 		if ticket := consoleEventTicket(event); ticket != "" && !strings.Contains(message, consoleField(ticket)) {
 			message += " " + consoleField(ticket)
 		}
+		repositoryName := event.RepositoryName
 		repositoryPath := ""
 		if repository, ok := repositories[event.RepositoryID]; ok {
+			if strings.TrimSpace(repository.Name) != "" {
+				repositoryName = repository.Name
+			}
 			repositoryPath = repository.Path
 		}
-		repository := repositoryDisplayLabel(event.RepositoryName, repositoryPath, event.RepositoryID)
-		if event.RepositoryID == "" && event.RepositoryName == "" {
+		repository := repositoryDisplayLabel(repositoryName, repositoryPath, event.RepositoryID)
+		if event.RepositoryID == "" && repositoryName == "" {
 			repository = "—"
 		}
 		role := valueOrDash(event.Role)
@@ -202,7 +230,7 @@ type consoleEventTracker struct {
 	lastEventMessage string
 }
 
-type steerWatchIdentity struct{ Role, Session string }
+type steerWatchIdentity struct{ Role, Harness, Session string }
 type consoleWatchWorker struct{ Role, Actor, RepositoryID, RepositoryName string }
 
 func newConsoleEventTracker() *consoleEventTracker {
@@ -223,7 +251,7 @@ func (tracker *consoleEventTracker) seed(status daemon.Status) {
 	}
 	for _, session := range status.Steer {
 		key := session.RepositoryID + "\x00" + session.Actor
-		tracker.steerSessions[key] = steerWatchIdentity{Role: session.Role, Session: shortIdentity(session.Session)}
+		tracker.steerSessions[key] = steerWatchIdentity{Role: session.Role, Harness: session.Harness, Session: shortIdentity(session.Session)}
 	}
 }
 
@@ -236,7 +264,7 @@ func (tracker *consoleEventTracker) prepare(event daemon.Event) daemon.Event {
 		}
 		if event.Actor != "" && event.Worker == "" {
 			key := event.RepositoryID + "\x00" + event.Actor
-			tracker.steerSessions[key] = steerWatchIdentity{Role: event.Role, Session: event.Session}
+			tracker.steerSessions[key] = steerWatchIdentity{Role: event.Role, Harness: event.Harness, Session: event.Session}
 		}
 		return event
 	}
@@ -269,13 +297,13 @@ func (tracker *consoleEventTracker) prepare(event daemon.Event) daemon.Event {
 		switch {
 		case !found:
 			event.Phase = "session_joined"
-		case previous.Session != event.Session:
+		case previous.Harness != event.Harness || previous.Session != event.Session:
 			event.Phase = "session_replaced"
 		case previous.Role != event.Role:
 			event.Phase = "role_changed"
 		}
 	}
-	tracker.steerSessions[key] = steerWatchIdentity{Role: event.Role, Session: event.Session}
+	tracker.steerSessions[key] = steerWatchIdentity{Role: event.Role, Harness: event.Harness, Session: event.Session}
 	return event
 }
 
@@ -296,7 +324,7 @@ func (tracker *consoleEventTracker) accept(event daemon.Event) bool {
 		tracker.states[event.Worker] = event.State
 	}
 	message := consoleEventMessage(event)
-	key := strings.Join([]string{event.Type, event.Worker, event.Ticket, event.State, event.Phase, event.Code, event.RepositoryID, event.RepositoryKey, event.Actor, event.Session, message}, "\x00")
+	key := strings.Join([]string{event.Type, event.Worker, event.Ticket, event.State, event.Phase, event.Code, event.RepositoryID, event.RepositoryKey, event.Actor, event.Harness, event.Session, message}, "\x00")
 	if key == tracker.lastEvent && !consoleEventMustRemainVisible(event) {
 		return false
 	}

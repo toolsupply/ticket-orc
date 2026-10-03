@@ -26,8 +26,8 @@ type EventStream struct {
 	response       *http.Response
 	reader         *bufio.Reader
 	lastSeq        uint64
+	baselineSet    bool
 	failureContext string
-	gap            bool
 	closed         bool
 }
 
@@ -64,7 +64,7 @@ func (c *Client) Events(ctx context.Context) (*EventStream, error) {
 		_ = response.Body.Close()
 		return nil, &Error{Kind: ErrorProtocol, Message: "daemon event stream has an unsupported content type", StatusCode: response.StatusCode}
 	}
-	return &EventStream{response: response, reader: bufio.NewReader(io.LimitReader(response.Body, maxResponseBytes+1)), failureContext: c.discoveryContext()}, nil
+	return &EventStream{response: response, reader: bufio.NewReader(response.Body), failureContext: c.discoveryContext()}, nil
 }
 
 // Next returns the next classified event. Heartbeats and comments are
@@ -74,63 +74,109 @@ func (s *EventStream) Next() (daemon.Event, error) {
 	if s == nil || s.closed || s.reader == nil {
 		return daemon.Event{}, io.EOF
 	}
+	for {
+		event, sequence, hasSequence, err := s.readEvent()
+		if err != nil {
+			return daemon.Event{}, err
+		}
+		if event.Type == "stream.sync" {
+			if s.baselineSet {
+				return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: "daemon event stream sync was not the first event"}
+			}
+			if !hasSequence || sequence != event.Seq {
+				return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: "daemon event stream sync sequence is invalid"}
+			}
+			s.lastSeq = event.Seq
+			s.baselineSet = true
+			continue
+		}
+		if event.Seq == 0 && hasSequence {
+			event.Seq = sequence
+		}
+		if !s.baselineSet {
+			// Older protocol-1 daemons do not send stream.sync. The first real
+			// event becomes the baseline for those streams.
+			s.lastSeq = event.Seq
+			s.baselineSet = true
+			return event, nil
+		}
+		gap := event.Seq != s.lastSeq+1
+		s.lastSeq = event.Seq
+		if gap {
+			return event, ErrEventGap
+		}
+		return event, nil
+	}
+}
+
+func (s *EventStream) readEvent() (daemon.Event, uint64, bool, error) {
 	var event daemon.Event
 	var data bytes.Buffer
 	var sequence uint64
+	var hasSequence bool
 	for {
-		line, err := s.reader.ReadString('\n')
+		line, err := readBoundedEventLine(s.reader)
 		if err != nil && len(line) == 0 {
 			if errors.Is(err, io.EOF) {
-				return daemon.Event{}, io.EOF
+				return daemon.Event{}, 0, false, io.EOF
 			}
-			return daemon.Event{}, &Error{Kind: ErrorTransport, Message: "read daemon event stream" + s.failureContext, Cause: err}
+			var clientErr *Error
+			if errors.As(err, &clientErr) {
+				return daemon.Event{}, 0, false, err
+			}
+			return daemon.Event{}, 0, false, &Error{Kind: ErrorTransport, Message: "read daemon event stream" + s.failureContext, Cause: err}
 		}
 		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		switch {
 		case line == "":
 			if data.Len() == 0 {
 				if err != nil {
-					return daemon.Event{}, io.EOF
+					return daemon.Event{}, 0, false, io.EOF
 				}
 				continue
 			}
 			if err := json.Unmarshal(data.Bytes(), &event); err != nil {
-				return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: "decode daemon event", Cause: err}
+				return daemon.Event{}, 0, false, &Error{Kind: ErrorProtocol, Message: "decode daemon event", Cause: err}
 			}
-			if sequence != 0 && event.Seq == 0 {
-				event.Seq = sequence
-			}
-			if s.lastSeq != 0 && event.Seq != s.lastSeq+1 {
-				s.gap = true
-			}
-			s.lastSeq = event.Seq
-			if s.gap {
-				s.gap = false
-				return event, ErrEventGap
-			}
-			return event, nil
+			return event, sequence, hasSequence, nil
 		case strings.HasPrefix(line, ":"):
 			continue
 		case strings.HasPrefix(line, "id:"):
 			value, parseErr := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "id:")), 10, 64)
 			if parseErr == nil {
 				sequence = value
+				hasSequence = true
 			}
 		case strings.HasPrefix(line, "data:"):
 			value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data.Len()+len(value) > maxResponseBytes {
-				return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: "daemon event is too large"}
+				return daemon.Event{}, 0, false, &Error{Kind: ErrorProtocol, Message: "daemon event is too large"}
 			}
 			data.WriteString(value)
 		case strings.HasPrefix(line, "event:"):
 			// The JSON envelope's type is authoritative; the SSE label is
 			// intentionally ignored if an older daemon omits it.
 		default:
-			return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: fmt.Sprintf("unsupported daemon event field %q", line)}
+			return daemon.Event{}, 0, false, &Error{Kind: ErrorProtocol, Message: fmt.Sprintf("unsupported daemon event field %q", line)}
 		}
 		if err != nil {
-			return daemon.Event{}, io.EOF
+			return daemon.Event{}, 0, false, io.EOF
 		}
+	}
+}
+
+func readBoundedEventLine(reader *bufio.Reader) (string, error) {
+	var line []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line)+len(fragment) > maxResponseBytes {
+			return "", &Error{Kind: ErrorProtocol, Message: "daemon event line is too large"}
+		}
+		line = append(line, fragment...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return string(line), err
 	}
 }
 

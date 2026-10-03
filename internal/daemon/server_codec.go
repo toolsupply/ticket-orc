@@ -22,6 +22,7 @@ func writeControlError(w http.ResponseWriter, err error) {
 		if message == "" {
 			message = "worker operation failed"
 		}
+		message = boundedErrorMessage(message)
 		errorBody := map[string]any{"code": controlErr.Code, "message": message, "mutation_applied": controlErr.Applied}
 		if controlErr.Result != nil {
 			if controlErr.Result.State != "" {
@@ -59,6 +60,7 @@ func writeGroupControlError(w http.ResponseWriter, result supervisor.GroupResult
 	if message == "" {
 		message = "group operation failed"
 	}
+	message = boundedErrorMessage(message)
 	// Keep the typed error metadata and every attempted worker result in one
 	// bounded response so clients can reconcile partial progress exactly.
 	writeJSON(w, status, map[string]any{
@@ -134,10 +136,15 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	if len(message) > 256 {
-		message = message[:256]
-	}
+	message = boundedErrorMessage(message)
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
+}
+
+func boundedErrorMessage(message string) string {
+	if len(message) > 256 {
+		return message[:256]
+	}
+	return message
 }
 
 // DecodeJSON strictly decodes one bounded JSON document and rejects unknown

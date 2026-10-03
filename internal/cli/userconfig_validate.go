@@ -26,19 +26,19 @@ func validateAndNormalizeFileConfig(config *FileConfig, configDir string) error 
 	if config.Roles == nil {
 		config.Roles = map[string]RoleFileConfig{}
 	}
-	if len(config.Roles) > 0 || config.DefaultRole != "" || len(config.Workers) > 0 {
-		if err := validateRolePolicies(config); err != nil {
-			return err
-		}
-	}
 	if config.Workers == nil {
 		config.Workers = map[string]WorkerFileConfig{}
 	}
 	if config.Repositories == nil {
 		config.Repositories = map[string]RepositoryFileConfig{}
 	}
-	if err := validateReviewSkipTags("review.skip_tags", config.Review.SkipTags); err != nil {
+	if err := validateTicketTagList("review.skip_tags", config.Review.SkipTags); err != nil {
 		return err
+	}
+	if len(config.Roles) > 0 || config.DefaultRole != "" || len(config.Workers) > 0 {
+		if err := validateRolePolicies(config); err != nil {
+			return err
+		}
 	}
 	if err := validateMinimumReuseContextPercent("defaults.minimum_reuse_context_percent", config.Defaults.MinimumReuseContextPercent); err != nil {
 		return err
@@ -198,6 +198,18 @@ func validateRolePolicies(config *FileConfig) error {
 		if role.TicketQueue != "open" && role.TicketQueue != "review" {
 			return fmt.Errorf("roles.%s.ticket_queue must be open or review", name)
 		}
+		if err := validateTicketTagList("roles."+name+".ticket_tags", role.TicketTags); err != nil {
+			return err
+		}
+		if role.TicketQueue == "review" {
+			for _, required := range role.TicketTags {
+				for _, excluded := range config.Review.SkipTags {
+					if required == excluded {
+						return fmt.Errorf("roles.%s.ticket_tags requires tag %q excluded by review.skip_tags", name, required)
+					}
+				}
+			}
+		}
 		if role.ReviewCompletion != "" && role.TicketQueue != "review" {
 			return fmt.Errorf("roles.%s.review_completion is only valid for review roles", name)
 		}
@@ -236,19 +248,16 @@ func validateMinimumReuseContextPercent(path string, value *int) error {
 	return fmt.Errorf("%s must be from 0 to 100", path)
 }
 
-func validateReviewSkipTags(label string, tags []string) error {
+func validateTicketTagList(label string, tags []string) error {
 	if len(tags) > 64 {
 		return fmt.Errorf("%s must contain at most 64 tags", label)
 	}
 	seen := make(map[string]struct{}, len(tags))
 	for _, tag := range tags {
-		if strings.TrimSpace(tag) == "" || strings.TrimSpace(tag) != tag || strings.IndexFunc(tag, unicode.IsControl) >= 0 || len(tag) > maxIdentifierBytes || !isSafeIdentifier(tag) {
-			return fmt.Errorf("%s contains an invalid Ticket tag", label)
-		}
-		if tag != strings.ToLower(tag) {
-			return fmt.Errorf("%s contains a non-canonical Ticket tag", label)
-		}
-		if !isCanonicalTagToken(tag) {
+		if !isCanonicalTicketTag(tag) {
+			if tag != strings.ToLower(tag) && isCanonicalTagToken(strings.ToLower(tag)) {
+				return fmt.Errorf("%s contains a non-canonical Ticket tag", label)
+			}
 			return fmt.Errorf("%s contains an invalid Ticket tag", label)
 		}
 		if _, ok := seen[tag]; ok {
@@ -263,7 +272,17 @@ func isCanonicalTagToken(value string) bool {
 	if value == "" || ((value[0] < 'a' || value[0] > 'z') && (value[0] < '0' || value[0] > '9')) {
 		return false
 	}
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
 	return true
+}
+
+func isCanonicalTicketTag(value string) bool {
+	return len(value) <= 64 && strings.TrimSpace(value) == value && strings.IndexFunc(value, unicode.IsControl) < 0 && isCanonicalTagToken(value)
 }
 
 func validateRepositoryName(name string) error {

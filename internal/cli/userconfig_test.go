@@ -14,6 +14,8 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
 func writeConfigFixture(t *testing.T, path, data string) {
@@ -183,7 +185,7 @@ func TestLoadFileConfigPreservesResolvedImplicitDefault(t *testing.T) {
 	if loaded.Instance.ConfigPath != path || loaded.Instance.Explicit || loaded.Config.Version != 1 {
 		t.Fatalf("loaded = %#v, want path %q and implicit config", loaded, path)
 	}
-	want := filepath.Join(filepath.Dir(path), ".local", loaded.Config.ID)
+	want := filepath.Join(filepath.Dir(path), ".local")
 	if loaded.Instance.LocalDir != want || loaded.Config.LocalDir != want {
 		t.Fatalf("omitted local_dir = %q (config %q), want %q", loaded.Instance.LocalDir, loaded.Config.LocalDir, want)
 	}
@@ -199,21 +201,27 @@ func TestLoadFileConfigPreservesArbitraryExplicitFilename(t *testing.T) {
 	}
 }
 
-func TestLoadFileConfigOmittedLocalDirUsesConfigIDNamespace(t *testing.T) {
+func TestLoadFileConfigOmittedLocalDirUsesOneConfigDirectoryRoot(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, defaultInstanceDirectoryName, instanceConfigFileName)
-	writeConfigFixture(t, path, `{"version":1}`)
+	writeConfigFixture(t, path, `{"version":1,"id":"1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"}`)
 	loaded, err := LoadFileConfig(root, path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(root, defaultInstanceDirectoryName, ".local", loaded.Config.ID)
+	want := filepath.Join(root, defaultInstanceDirectoryName, ".local")
 	if loaded.Instance.LocalDir != want {
 		t.Fatalf("omitted local_dir = %q, want %q", loaded.Instance.LocalDir, want)
 	}
+	otherPath := filepath.Join(root, defaultInstanceDirectoryName, "other.json")
+	writeConfigFixture(t, otherPath, `{"version":1,"id":"2e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"}`)
+	other, err := LoadFileConfig(root, otherPath, true)
+	if err != nil || other.Instance.LocalDir != want {
+		t.Fatalf("second config default root = %q, err=%v, want shared root %q", other.Instance.LocalDir, err, want)
+	}
 }
 
-func TestLoadFileConfigLocalDirResolutionAndIDNamespace(t *testing.T) {
+func TestLoadFileConfigLocalDirResolutionIsIndependentOfID(t *testing.T) {
 	root := t.TempDir()
 	firstPath := filepath.Join(root, "a.json")
 	secondPath := filepath.Join(root, "b.json")
@@ -229,16 +237,8 @@ func TestLoadFileConfigLocalDirResolutionAndIDNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Instance.LocalDir != filepath.Join(root, ".local", firstID) || second.Instance.LocalDir != filepath.Join(root, ".local", secondID) {
+	if first.Instance.LocalDir != filepath.Join(root, ".local") || second.Instance.LocalDir != first.Instance.LocalDir {
 		t.Fatalf("local roots = %q, %q", first.Instance.LocalDir, second.Instance.LocalDir)
-	}
-	oldRoot := first.Instance.LocalDir
-	if err := os.MkdirAll(oldRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sentinel := filepath.Join(oldRoot, "sentinel")
-	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
 	}
 	writeConfigFixture(t, secondPath, fmt.Sprintf(`{"version":1,"id":%q}`, firstID))
 	sameID, err := LoadFileConfig(t.TempDir(), secondPath, true)
@@ -248,11 +248,8 @@ func TestLoadFileConfigLocalDirResolutionAndIDNamespace(t *testing.T) {
 	newID := "3e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
 	writeConfigFixture(t, secondPath, fmt.Sprintf(`{"version":1,"id":%q}`, newID))
 	changedID, err := LoadFileConfig(t.TempDir(), secondPath, true)
-	if err != nil || changedID.Instance.LocalDir != filepath.Join(root, ".local", newID) {
+	if err != nil || changedID.Instance.LocalDir != filepath.Join(root, ".local") {
 		t.Fatalf("changed ID local root = %q, err=%v", changedID.Instance.LocalDir, err)
-	}
-	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
-		t.Fatalf("changing config ID modified old root sentinel: data=%q err=%v", data, err)
 	}
 
 	absolute := filepath.Join(t.TempDir(), "exact-root")
@@ -351,6 +348,8 @@ func TestLoadFileConfigStrictJSONAndFinalSchema(t *testing.T) {
 		{"trailing", `{"version":1} {}`, "trailing content"},
 		{"version", `{"version":2}`, "unsupported version"},
 		{"unknown worker field", `{"version":1,"workers":{"one":{"role":"coder","future":true}}}`, "unknown field"},
+		{"worker ticket tags override", `{"version":1,"workers":{"one":{"role":"coder","ticket_tags":["backend"]}}}`, "unknown field"},
+		{"default ticket tags override", `{"version":1,"defaults":{"ticket_tags":["backend"]}}`, "unknown field"},
 		{"removed defaults state_dir", `{"version":1,"defaults":{"state_dir":"state"}}`, "unknown field at defaults.state_dir"},
 		{"removed role state_dir", `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","state_dir":"state"}}}`, "unknown field at roles.coder.state_dir"},
 		{"removed worker state_dir", `{"version":1,"workers":{"one":{"role":"coder","state_dir":"state"}}}`, "unknown field at workers.one.state_dir"},
@@ -361,6 +360,8 @@ func TestLoadFileConfigStrictJSONAndFinalSchema(t *testing.T) {
 		{"uppercase review tag", `{"version":1,"review":{"skip_tags":["No-Review"]}}`, "non-canonical"},
 		{"duplicate review tag", `{"version":1,"review":{"skip_tags":["trivial","trivial"]}}`, "duplicate"},
 		{"invalid review tag", `{"version":1,"review":{"skip_tags":["needs review"]}}`, "invalid Ticket tag"},
+		{"invalid role tag punctuation", `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["to:team-a"]}}}`, "invalid Ticket tag"},
+		{"contradictory review tag", `{"version":1,"default_role":"reviewer","review":{"skip_tags":["no-review"]},"roles":{"reviewer":{"ticket_queue":"review","nudge_prompt":"work","ticket_tags":["no-review"]}}}`, "excluded by review.skip_tags"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -380,6 +381,99 @@ func TestLoadFileConfigStrictJSONAndFinalSchema(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestRoleTicketTagsParsingAndResolvedCanonicalization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["urgent","backend"]},"reviewer":{"ticket_queue":"review","nudge_prompt":"review"}},"review":{"skip_tags":["no-review"]}}`)
+	loaded, err := LoadFileConfig(filepath.Dir(path), path, true)
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if !reflect.DeepEqual(loaded.Config.Roles["coder"].TicketTags, []string{"urgent", "backend"}) {
+		t.Fatalf("parsed ticket_tags = %#v", loaded.Config.Roles["coder"].TicketTags)
+	}
+	role := loaded.Config.Roles["coder"]
+	originalTags := append([]string(nil), role.TicketTags...)
+	filters, err := resolvedRoleQueueFilters(role, loaded.Config.Review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ticketclient.QueueFilters{Tags: []string{"backend", "urgent"}}
+	if !reflect.DeepEqual(filters, want) {
+		t.Fatalf("open role filters = %#v, want %#v", filters, want)
+	}
+	if !reflect.DeepEqual(role.TicketTags, originalTags) {
+		t.Fatalf("selector resolution mutated parsed config: %#v", role.TicketTags)
+	}
+	role.TicketTags = []string{"urgent", "backend"}
+	first, _ := resolvedRoleQueueFilters(role, loaded.Config.Review)
+	role.TicketTags = []string{"backend", "urgent"}
+	second, _ := resolvedRoleQueueFilters(role, loaded.Config.Review)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("reordered selectors differ: %#v vs %#v", first, second)
+	}
+	base := supervisor.RunWorker{Name: "worker", Config: supervisor.RoleConfig{
+		Role: RoleCoder, RoleName: "coder", TicketQueue: "open", TicketTags: strings.Join(first.Tags, "\x1f"),
+	}}
+	reordered := base
+	reordered.Config.TicketTags = strings.Join(second.Tags, "\x1f")
+	if !equalLaunchSnapshots(base, reordered) {
+		t.Fatal("reordered selectors should not require a worker restart")
+	}
+	reviewer := loaded.Config.Roles["reviewer"]
+	reviewFilters, err := resolvedRoleQueueFilters(reviewer, loaded.Config.Review)
+	if err != nil || !reflect.DeepEqual(reviewFilters, ticketclient.QueueFilters{WithoutTags: []string{"no-review"}}) {
+		t.Fatalf("review filters = %#v, %v", reviewFilters, err)
+	}
+}
+
+func TestTicketTagListBoundaries(t *testing.T) {
+	valid := make([]string, 64)
+	for i := range valid {
+		valid[i] = fmt.Sprintf("tag-%02d", i)
+	}
+	valid[0] = strings.Repeat("a", 64)
+	if err := validateTicketTagList("roles.coder.ticket_tags", valid); err != nil {
+		t.Fatalf("valid boundary tags: %v", err)
+	}
+	tooMany := append(append([]string(nil), valid...), "extra")
+	if err := validateTicketTagList("roles.coder.ticket_tags", tooMany); err == nil {
+		t.Fatal("accepted more than 64 tags")
+	}
+	if err := validateTicketTagList("roles.coder.ticket_tags", []string{"duplicate", "duplicate"}); err == nil {
+		t.Fatal("accepted duplicate tags")
+	}
+	for _, invalid := range []string{"Uppercase", "", "has space", "to:team-a", strings.Repeat("a", 65)} {
+		if err := validateTicketTagList("roles.coder.ticket_tags", []string{invalid}); err == nil {
+			t.Errorf("accepted invalid tag %q", invalid)
+		}
+	}
+}
+
+func TestRoleTicketTagsOmittedAndEmptyResolveUnrestricted(t *testing.T) {
+	var snapshots []supervisor.RunWorker
+	for _, field := range []string{"", `,"ticket_tags":[]`} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work"`+field+`}},"workers":{"worker":{"role":"coder","actor":"worker"}}}`)
+		config, help, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "worker"}, emptyEnv)
+		if help || err != nil {
+			t.Fatalf("parseRoleConfig for %q: help=%v err=%v", field, help, err)
+		}
+		if config.TicketTags != "" {
+			t.Fatalf("ticket tags for %q = %q, want unrestricted", field, config.TicketTags)
+		}
+		if config.RoleName != "coder" || config.TicketQueue != "open" {
+			t.Fatalf("effective configured role policy for %q = %q/%q, want coder/open", field, config.RoleName, config.TicketQueue)
+		}
+		snapshots = append(snapshots, supervisor.RunWorker{Name: "worker", Config: supervisor.RoleConfig{
+			Role: config.Role, RoleName: config.RoleName, TicketQueue: config.TicketQueue,
+			TicketTags: config.TicketTags, ReviewSkipTags: config.ReviewSkipTags,
+		}})
+	}
+	if len(snapshots) != 2 || !equalLaunchSnapshots(snapshots[0], snapshots[1]) {
+		t.Fatalf("omitted and empty selector launch snapshots differ: %#v", snapshots)
 	}
 }
 
@@ -854,7 +948,7 @@ func TestInstanceContextKeepsRunJoinAndStateFilesTogether(t *testing.T) {
 			if err != nil || help {
 				t.Fatalf("parse run config=%#v help=%t err=%v", runConfig, help, err)
 			}
-			localDir := filepath.Join(instanceDir, ".local", test.wantID)
+			localDir := filepath.Join(instanceDir, ".local")
 			if runConfig.ConfigPath != configPath || runConfig.StateDir != localDir {
 				t.Fatalf("run paths config=%q state=%q, want config %q and local root %q", runConfig.ConfigPath, runConfig.StateDir, configPath, localDir)
 			}

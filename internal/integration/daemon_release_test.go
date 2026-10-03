@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -104,8 +106,28 @@ func TestRunAuthenticatedDaemonControlAndEvents(t *testing.T) {
 		t.Fatalf("events response=%d content-type=%q", eventsResponse.StatusCode, eventsResponse.Header.Get("Content-Type"))
 	}
 	reader := bufio.NewReader(eventsResponse.Body)
-	if line, readErr := reader.ReadString('\n'); readErr != nil || !strings.HasPrefix(line, ": connected") {
-		t.Fatalf("event connection line=%q err=%v", line, readErr)
+	idLine, readErr := reader.ReadString('\n')
+	if readErr != nil {
+		t.Fatalf("event sync id line=%q err=%v", idLine, readErr)
+	}
+	eventLine, readErr := reader.ReadString('\n')
+	if readErr != nil || eventLine != "event: stream.sync\n" {
+		t.Fatalf("event sync type line=%q err=%v", eventLine, readErr)
+	}
+	dataLine, readErr := reader.ReadString('\n')
+	if readErr != nil || !strings.HasPrefix(dataLine, "data: ") {
+		t.Fatalf("event sync data line=%q err=%v", dataLine, readErr)
+	}
+	if line, readErr := reader.ReadString('\n'); readErr != nil || line != "\n" {
+		t.Fatalf("event sync terminator=%q err=%v", line, readErr)
+	}
+	var syncEvent daemon.Event
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(dataLine, "data: ")), &syncEvent); err != nil {
+		t.Fatalf("decode sync payload %q: %v", dataLine, err)
+	}
+	var syncID uint64
+	if _, err := fmt.Sscanf(idLine, "id: %d\n", &syncID); err != nil || syncEvent.Type != "stream.sync" || syncEvent.Seq != syncID {
+		t.Fatalf("sync frame id=%q event=%#v err=%v", idLine, syncEvent, err)
 	}
 	if _, err := postDaemon(t, client, endpoint, "/v1/workers/worker/pause", ""); err != nil {
 		t.Fatal(err)
@@ -167,7 +189,127 @@ func TestRunStartsAuthenticatedDaemonWithoutWorkers(t *testing.T) {
 	}
 }
 
-func TestDefaultRuntimeRootsAreNamespacedByConfigID(t *testing.T) {
+func TestRunPublishesConfiguredInstanceIDAcrossRestart(t *testing.T) {
+	binary, helperDir := buildFixture(t)
+	root := t.TempDir()
+	const instanceID = "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
+	stateDir := filepath.Join(root, "state")
+	configPath := filepath.Join(root, "config.json")
+	firstReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstReservation.Close()
+	secondReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondReservation.Close()
+	firstPort := firstReservation.Addr().(*net.TCPAddr).Port
+	secondPort := secondReservation.Addr().(*net.TCPAddr).Port
+	versionData, err := os.ReadFile(filepath.Join(filepath.Dir(mustCallerFile()), "../..", "VERSION"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVersion := strings.TrimSpace(string(versionData))
+
+	writeConfig := func(port int) {
+		t.Helper()
+		config := map[string]any{
+			"version":   1,
+			"id":        instanceID,
+			"local_dir": stateDir,
+			"supervisor": map[string]any{
+				"listen":         "127.0.0.1",
+				"port":           port,
+				"startup_groups": []string{},
+			},
+		}
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type runningDaemon struct {
+		cmd      *exec.Cmd
+		endpoint daemon.Endpoint
+	}
+	start := func(port int) runningDaemon {
+		t.Helper()
+		writeConfig(port)
+		cmd := exec.Command(binary, "run", "--config", configPath)
+		var stderr synchronizedBuffer
+		cmd.Stderr = &stderr
+		cmd.Env = testEnv(helperDir, nil, nil)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		})
+		endpoint := waitForDaemonEndpoint(t, stateDir, stderr.String)
+		endpointJSON, err := os.ReadFile(daemon.EndpointPath(stateDir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(endpointJSON), `"instance_id":"`+instanceID+`"`) || !strings.Contains(string(endpointJSON), `"endpoint_key":"`+endpoint.EndpointKey+`"`) {
+			t.Fatalf("endpoint JSON = %s, want configured instance ID and endpoint key", endpointJSON)
+		}
+		response := authenticatedRequest(t, &http.Client{Timeout: 3 * time.Second}, endpoint, http.MethodGet, "/v1/status", "")
+		defer response.Body.Close()
+		statusJSON, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status daemon.Status
+		if response.StatusCode != http.StatusOK || json.Unmarshal(statusJSON, &status) != nil {
+			t.Fatalf("status response=%d JSON=%s", response.StatusCode, statusJSON)
+		}
+		if status.InstanceID != instanceID || status.Version != wantVersion ||
+			!strings.Contains(string(statusJSON), `"instance_id":"`+instanceID+`"`) ||
+			!strings.Contains(string(statusJSON), `"version":"`+wantVersion+`"`) {
+			t.Fatalf("status JSON = %s, want instance %q and runtime version %q", statusJSON, instanceID, wantVersion)
+		}
+		if strings.Contains(string(statusJSON), endpoint.EndpointKey) {
+			t.Fatalf("status JSON leaked endpoint key: %s", statusJSON)
+		}
+		return runningDaemon{cmd: cmd, endpoint: endpoint}
+	}
+	stop := func(running runningDaemon) {
+		t.Helper()
+		if _, err := postDaemon(t, &http.Client{Timeout: 3 * time.Second}, running.endpoint, "/v1/shutdown", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := running.cmd.Wait(); err != nil {
+			t.Fatalf("daemon shutdown: %v", err)
+		}
+	}
+
+	if err := firstReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := start(firstPort)
+	stop(first)
+	if err := secondReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := start(secondPort)
+	defer stop(second)
+	if first.endpoint.InstanceID != instanceID || second.endpoint.InstanceID != instanceID || first.endpoint.InstanceID != second.endpoint.InstanceID {
+		t.Fatalf("endpoint instance IDs across restart = %q, %q; want %q", first.endpoint.InstanceID, second.endpoint.InstanceID, instanceID)
+	}
+	if first.endpoint.Port == second.endpoint.Port || first.endpoint.EndpointKey != second.endpoint.EndpointKey {
+		t.Fatalf("restart settings unexpectedly changed: first=%#v second=%#v", first.endpoint, second.endpoint)
+	}
+}
+
+func TestDefaultRuntimeRootIsSharedAndBoundToConfigID(t *testing.T) {
 	binary, helperDir := buildFixture(t)
 	configDir := t.TempDir()
 	const firstID = "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
@@ -212,20 +354,21 @@ func TestDefaultRuntimeRootsAreNamespacedByConfigID(t *testing.T) {
 	writeConfig(firstConfig, firstID)
 	writeConfig(secondConfig, secondID)
 	writeConfig(sameConfig, firstID)
-	firstLocal := filepath.Join(configDir, ".local", firstID)
-	secondLocal := filepath.Join(configDir, ".local", secondID)
+	firstLocal := filepath.Join(configDir, ".local")
 	firstCmd, firstEndpoint := start(firstConfig, firstLocal)
-	secondCmd, secondEndpoint := start(secondConfig, secondLocal)
-	if firstEndpoint.URL == secondEndpoint.URL || daemon.EndpointPath(firstLocal) == daemon.EndpointPath(secondLocal) {
-		t.Fatalf("different config IDs share daemon endpoint identity: first=%#v second=%#v", firstEndpoint, secondEndpoint)
+	secondCmd := exec.Command(binary, "run", "--config", secondConfig)
+	secondCmd.Env = testEnv(helperDir, nil, nil)
+	if output, err := secondCmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "runtime belongs to instance "+firstID) || !strings.Contains(string(output), "config declares "+secondID) {
+		t.Fatalf("different-ID daemon error=%v output=%q, want shared-root ownership rejection", err, output)
 	}
-	for _, localDir := range []string{firstLocal, secondLocal} {
-		if _, err := os.Stat(filepath.Join(localDir, "run", "lock")); err != nil {
-			t.Fatalf("daemon lock missing under %s: %v", localDir, err)
-		}
-		if _, err := os.Stat(daemon.EndpointKeyPath(localDir)); err != nil {
-			t.Fatalf("endpoint capability key missing under %s: %v", localDir, err)
-		}
+	if _, err := os.Stat(filepath.Join(firstLocal, "run", "lock")); err != nil {
+		t.Fatalf("daemon lock missing under %s: %v", firstLocal, err)
+	}
+	if _, err := os.Stat(daemon.EndpointKeyPath(firstLocal)); err != nil {
+		t.Fatalf("endpoint capability key missing under %s: %v", firstLocal, err)
+	}
+	if _, err := os.Stat(filepath.Join(firstLocal, "instance.json")); err != nil {
+		t.Fatalf("runtime ownership marker missing under %s: %v", firstLocal, err)
 	}
 	firstEndpointData, err := os.ReadFile(daemon.EndpointPath(firstLocal))
 	if err != nil {
@@ -240,8 +383,8 @@ func TestDefaultRuntimeRootsAreNamespacedByConfigID(t *testing.T) {
 		t.Fatalf("same-ID attempt changed the existing endpoint: error=%v", err)
 	}
 	configEntries, err := os.ReadDir(configDir)
-	if err != nil || len(configEntries) != 4 || configEntries[0].Name() != ".local" || configEntries[1].Name() != "first.json" || configEntries[2].Name() != "same-id.json" || configEntries[3].Name() != "second.json" {
-		t.Fatalf("runtime data leaked beside portable configs: entries=%v error=%v", configEntries, err)
+	if err != nil || len(configEntries) != 5 || configEntries[0].Name() != ".local" || configEntries[1].Name() != ".local.guard" || configEntries[2].Name() != "first.json" || configEntries[3].Name() != "same-id.json" || configEntries[4].Name() != "second.json" {
+		t.Fatalf("unexpected entries beside portable configs: entries=%v error=%v", configEntries, err)
 	}
 	if _, err := os.Stat(daemon.EndpointKeyPath(configDir)); !os.IsNotExist(err) {
 		t.Fatalf("endpoint capability key leaked beside portable configs: %v", err)
@@ -253,7 +396,7 @@ func TestDefaultRuntimeRootsAreNamespacedByConfigID(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeConfig(cloneConfig, firstID)
-	cloneLocal := filepath.Join(cloneDir, ".local", firstID)
+	cloneLocal := filepath.Join(cloneDir, ".local")
 	if _, err := os.Stat(cloneLocal); !os.IsNotExist(err) {
 		t.Fatalf("portable config clone already has local runtime data: %v", err)
 	}
@@ -268,11 +411,10 @@ func TestDefaultRuntimeRootsAreNamespacedByConfigID(t *testing.T) {
 		t.Fatalf("clone leaked endpoint metadata beside config.json: %v", err)
 	}
 	cloneEntries, err := os.ReadDir(cloneDir)
-	if err != nil || len(cloneEntries) != 2 || cloneEntries[0].Name() != ".local" || cloneEntries[1].Name() != "config.json" {
-		t.Fatalf("clone runtime data leaked beside config.json: entries=%v error=%v", cloneEntries, err)
+	if err != nil || len(cloneEntries) != 3 || cloneEntries[0].Name() != ".local" || cloneEntries[1].Name() != ".local.guard" || cloneEntries[2].Name() != "config.json" {
+		t.Fatalf("unexpected entries beside cloned config: entries=%v error=%v", cloneEntries, err)
 	}
 	stop(cloneCmd, cloneEndpoint)
-	stop(secondCmd, secondEndpoint)
 	stop(firstCmd, firstEndpoint)
 }
 

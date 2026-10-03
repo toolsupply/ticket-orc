@@ -35,7 +35,9 @@ func TestRepositoryWatchManagerRejectsActivationAfterRemoval(t *testing.T) {
 	started := make(chan struct{})
 	releaseStart := make(chan struct{})
 	returned := make(chan *activationTestProcess, 1)
-	manager := NewRepositoryWatchManager(ctx, runtime, RepositoryRegistry{"project": repository}, nil, func(context.Context, ConfiguredRepository, func(RepositoryWatchEvent)) (RepositoryWatchProcess, error) {
+	var lateNotify func(RepositoryWatchEvent)
+	manager := NewRepositoryWatchManager(ctx, runtime, RepositoryRegistry{"project": repository}, nil, func(_ context.Context, _ ConfiguredRepository, notify func(RepositoryWatchEvent)) (RepositoryWatchProcess, error) {
+		lateNotify = notify
 		close(started)
 		<-releaseStart
 		process := newActivationTestProcess()
@@ -70,6 +72,7 @@ func TestRepositoryWatchManagerRejectsActivationAfterRemoval(t *testing.T) {
 	runtime.RemoveRepositoryStatus(repository.Key)
 	observer.cancel()
 	manager.mu.Unlock()
+	lateNotify(RepositoryWatchEvent{Ticket: "20260930-00001", Event: "late", State: "open"})
 
 	select {
 	case <-process.stopped:

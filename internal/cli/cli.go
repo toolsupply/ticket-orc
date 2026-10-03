@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/terminaltext"
+	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
 // Version is the build version reported by the version command. Release and
@@ -29,6 +31,7 @@ type gcExecutor func(GCConfig, io.Writer, io.Writer) error
 type runExecutor func(RunConfig, io.Writer, io.Writer) error
 type configCheckExecutor func(ConfigCheckConfig, io.Writer, io.Writer, envLookup) error
 type doctorExecutor func(doctorConfig, io.Writer, io.Writer, envLookup) error
+type ticketCompatibilityCheck func() error
 
 type renderedRunFailure struct {
 	cause error
@@ -50,32 +53,72 @@ func runFailureWasRendered(err error) bool {
 }
 
 type commandExecutors struct {
-	role         roleExecutor
-	state        stateExecutor
-	currentState currentStateExecutor
-	gc           gcExecutor
-	run          runExecutor
-	configCheck  configCheckExecutor
-	doctor       doctorExecutor
+	role                roleExecutor
+	state               stateExecutor
+	currentState        currentStateExecutor
+	gc                  gcExecutor
+	run                 runExecutor
+	configCheck         configCheckExecutor
+	doctor              doctorExecutor
+	ticketCompatibility ticketCompatibilityCheck
 }
 
 // Run executes one CLI invocation and returns its process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
-	return run(args, stdout, stderr, os.LookupEnv, executeRole)
+	return runConfigured(args, stdout, stderr, os.LookupEnv, executeRole, ticketVersionCompatibility(os.LookupEnv))
+}
+
+func ticketVersionCompatibility(lookupEnv envLookup) ticketCompatibilityCheck {
+	return func() error {
+		// Managed role subprocesses are started only after their parent run
+		// process has checked this executable. Reuse that startup decision
+		// instead of launching one version subprocess per worker.
+		if value, ok := lookupEnv(supervisedRoleEnv); ok && value == "1" {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return ticketclient.RequireMinimumVersion(ctx)
+	}
 }
 
 func run(args []string, stdout, stderr io.Writer, lookupEnv envLookup, execute roleExecutor) int {
+	return runConfigured(args, stdout, stderr, lookupEnv, execute, nil)
+}
+
+func runConfigured(args []string, stdout, stderr io.Writer, lookupEnv envLookup, execute roleExecutor, compatibility ticketCompatibilityCheck) int {
 	return runWithExecutors(args, stdout, stderr, lookupEnv, commandExecutors{
 		role:  execute,
 		state: executeState,
 		currentState: func(config StateConfig, out io.Writer, lookup envLookup) error {
 			return executeSessionState(config, out, lookup, runTicketJSON)
 		},
-		gc:          executeGC,
-		run:         executeRun,
-		configCheck: executeConfigCheck,
-		doctor:      executeDoctor,
+		gc:                  executeGC,
+		run:                 executeRun,
+		configCheck:         executeConfigCheck,
+		doctor:              executeDoctor,
+		ticketCompatibility: compatibility,
 	})
+}
+
+func requireTicketCompatibility(execute commandExecutors, stderr io.Writer) bool {
+	if execute.ticketCompatibility == nil {
+		return true
+	}
+	if err := execute.ticketCompatibility(); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", terminaltext.Sanitize(err.Error(), true))
+		return false
+	}
+	return true
+}
+
+func commandHasHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
 }
 
 func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLookup, execute commandExecutors) int {
@@ -96,14 +139,29 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 	case "init":
 		return executeInit(args[1:], stdout, stderr, lookupEnv)
 	case "join":
+		if !commandHasHelp(args[1:]) && !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		return executeJoin(args[1:], stdout, stderr, lookupEnv)
 	case "leave":
+		if !commandHasHelp(args[1:]) && !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		return executeLeave(args[1:], stdout, stderr, lookupEnv)
 	case "whoami":
+		if !commandHasHelp(args[1:]) && !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		return executeWhoami(args[1:], stdout, stderr, lookupEnv)
 	case "next":
+		if !commandHasHelp(args[1:]) && !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		return executeNext(args[1:], stdout, stderr, lookupEnv)
 	case "queue":
+		if !commandHasHelp(args[1:]) && !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		return executeQueue(args[1:], stdout, stderr, lookupEnv)
 	case string(RoleCoder), string(RoleReviewer):
 		config, help, err := parseRoleConfig(supervisor.Role(args[0]), args[1:], lookupEnv)
@@ -113,6 +171,9 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 		if help {
 			writeRoleHelp(stdout, supervisor.Role(args[0]))
 			return 0
+		}
+		if !requireTicketCompatibility(execute, stderr) {
+			return 1
 		}
 		if err := execute.role(config); err != nil {
 			renderRoleFailure(stderr, err)
@@ -132,6 +193,9 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 			return 0
 		}
 		if execute.currentState != nil {
+			if !requireTicketCompatibility(execute, stderr) {
+				return 1
+			}
 			if err := execute.currentState(config, stdout, lookupEnv); err != nil {
 				fmt.Fprintf(stderr, "error: %v\n", err)
 				return 1
@@ -152,6 +216,9 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 			writeGCHelp(stdout)
 			return 0
 		}
+		if !requireTicketCompatibility(execute, stderr) {
+			return 1
+		}
 		if err := execute.gc(config, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
@@ -168,6 +235,9 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 		}
 		if execute.run == nil {
 			return usageError(stderr, "run executor is unavailable")
+		}
+		if !requireTicketCompatibility(execute, stderr) {
+			return 1
 		}
 		if err := execute.run(config, stdout, stderr); err != nil {
 			if !runFailureWasRendered(err) {
@@ -189,7 +259,7 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 			return usageError(stderr, "doctor executor is unavailable")
 		}
 		if err := execute.doctor(config, stdout, stderr, lookupEnv); err != nil {
-			fmt.Fprintf(stderr, "error: doctor recovery failed: %s\n", terminaltext.Sanitize(err.Error(), true))
+			fmt.Fprintf(stderr, "error: %s\n", terminaltext.Sanitize(err.Error(), true))
 			return 1
 		}
 		return 0
@@ -201,6 +271,9 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 		if help {
 			writeReviewReportHelp(stdout)
 			return 0
+		}
+		if !requireTicketCompatibility(execute, stderr) {
+			return 1
 		}
 		if err := executeReviewReport(context.Background(), config, stdout); err != nil {
 			fmt.Fprintf(stderr, "error: review report failed: %s\n", terminaltext.Sanitize(err.Error(), true))
@@ -215,6 +288,10 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 		if help {
 			writeEndpointHelp(stdout)
 			return 0
+		}
+		if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.FileConfig.ID, config.Instance.LocalDirConfigured); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
 		}
 		endpoint, err := daemon.ReadEndpoint(config.StateDir)
 		if err != nil {
@@ -281,7 +358,11 @@ func renderRoleFailure(out io.Writer, err error) {
 	}
 	if failure.Classification == "child_exit" && failure.ExitCode > 0 {
 		fmt.Fprintf(out, "error: Codex process exited with status %d", failure.ExitCode)
-		renderRoleFailureMetadata(out, failure)
+		renderRoleFailureMetadataAfterPrefix(out, failure)
+		if detail := safeRoleFailureDetail(err); detail != "" {
+			fmt.Fprintf(out, " detail=%s", detail)
+		}
+		fmt.Fprintln(out)
 		return
 	}
 	fmt.Fprintf(out, "error: worker failure classification=%s phase=%s", safeFailureToken(failure.Classification), safeFailurePhase(failure.Phase))
@@ -293,7 +374,10 @@ func safeRoleFailureDetail(err error) string {
 	if err == nil {
 		return ""
 	}
-	detail := terminaltext.Sanitize(err.Error(), true)
+	// Failure details share a stream with structured worker events. Keep
+	// untrusted diagnostics on one line so they cannot manufacture a trusted
+	// EventStreamPrefix line for the supervisor to consume.
+	detail := terminaltext.Sanitize(err.Error(), false)
 	if detail == "" || containsUnsafeRoleFailureDetail(detail) {
 		return "worker failure detail redacted"
 	}

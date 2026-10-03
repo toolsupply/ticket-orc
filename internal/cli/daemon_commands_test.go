@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,6 +85,20 @@ func TestParseDaemonOptionsResolveOneLocalRoot(t *testing.T) {
 	}
 	if _, _, _, err := parseDaemonCommandOptions([]string{"--state-dir", "/split/root"}, emptyEnv, false); err == nil || !strings.Contains(err.Error(), "unknown option --state-dir") {
 		t.Fatalf("state-dir override error = %v", err)
+	}
+}
+
+func TestInvalidDaemonCommandDoesNotCreateRuntimeRoot(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	writeConfigFixture(t, configPath, `{"version":1}`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"worker", "start", "--config", configPath}, &stdout, &stderr, emptyEnv, rejectExecution)
+	if code == 0 || !strings.Contains(stderr.String(), "usage: ticket-orc worker start") {
+		t.Fatalf("invalid worker command code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".local")); !os.IsNotExist(err) {
+		t.Fatalf("invalid command created runtime root: lstat err=%v", err)
 	}
 }
 

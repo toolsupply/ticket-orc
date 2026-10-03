@@ -61,6 +61,7 @@ type DefaultsFileConfig struct {
 
 type RoleFileConfig struct {
 	TicketQueue                string                      `json:"ticket_queue"`
+	TicketTags                 []string                    `json:"ticket_tags"`
 	NudgePrompt                string                      `json:"nudge_prompt"`
 	Groups                     []string                    `json:"groups"`
 	RequiredSkills             []string                    `json:"required_skills"`
@@ -122,10 +123,11 @@ type SupervisorFileConfig struct {
 
 // InstanceContext carries every resolved filesystem path for one Orc instance.
 type InstanceContext struct {
-	ConfigPath  string
-	InstanceDir string
-	LocalDir    string
-	Explicit    bool
+	ConfigPath         string
+	InstanceDir        string
+	LocalDir           string
+	LocalDirConfigured bool
+	Explicit           bool
 }
 
 // LoadedFileConfig pairs validated configuration with the instance that owns it.

@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// RepositoryDetailBodyBudget keeps worst-case JSON escaping within the
+// RepositoryDetailBodyBudgetBytes keeps worst-case JSON escaping within the
 // ticketclient response frame limit while remaining large enough for normal
 // ticket display bodies. Ticket's own show limit is 1 MiB, but JSON can expand
 // control characters by up to six bytes each before the 2 MiB frame cap.
-const repositoryDetailBodyBudget = 256 << 10
+const RepositoryDetailBodyBudgetBytes = 256 << 10
 
 // ListAllForReport returns a bounded snapshot of every ticket through Ticket's
 // public list projection. It is intentionally separate from lifecycle queue
@@ -271,13 +271,13 @@ func (c *Client) ShowFullBody(ctx context.Context, id string) (TicketDetail, err
 		return TicketDetail{}, err
 	}
 	var detail TicketDetail
-	if err := c.invoke(ctx, []string{"show", id, "--full", "--max-bytes", fmt.Sprint(repositoryDetailBodyBudget)}, &detail); err != nil {
+	if err := c.invoke(ctx, []string{"show", id, "--full", "--max-bytes", fmt.Sprint(RepositoryDetailBodyBudgetBytes)}, &detail); err != nil {
 		return TicketDetail{}, err
 	}
 	if detail.ID != id {
 		return TicketDetail{}, fmt.Errorf("%w: show returned ticket %q, expected %q", ErrProtocol, detail.ID, id)
 	}
-	if len([]byte(detail.Body)) > repositoryDetailBodyBudget {
+	if len([]byte(detail.Body)) > RepositoryDetailBodyBudgetBytes {
 		return TicketDetail{}, fmt.Errorf("%w: show body exceeds bounded display limit", ErrProtocol)
 	}
 	return detail, nil

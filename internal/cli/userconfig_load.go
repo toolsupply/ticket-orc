@@ -9,14 +9,11 @@ import (
 	"github.com/toolsupply/ticket-orc/internal/jsonx"
 )
 
-func resolveLocalDir(configPath, configID, configured string) (string, error) {
+func resolveLocalDir(configPath, configured string) (string, error) {
 	configDir := filepath.Dir(configPath)
 	localDir := configured
 	if strings.TrimSpace(localDir) == "" {
-		if !isUUIDv4(configID) {
-			return "", fmt.Errorf("config id must be a UUIDv4 before resolving the local directory")
-		}
-		localDir = filepath.Join(configDir, ".local", configID)
+		localDir = filepath.Join(configDir, defaultRuntimeRootName)
 	} else if !filepath.IsAbs(localDir) {
 		localDir = filepath.Join(configDir, localDir)
 	}
@@ -94,7 +91,8 @@ func loadInstanceConfig(instance InstanceContext) (LoadedFileConfig, error) {
 	if err := validateAndNormalizeFileConfig(&config, filepath.Dir(path)); err != nil {
 		return LoadedFileConfig{}, fmt.Errorf("config file %s rejected: %w", path, err)
 	}
-	instance.LocalDir, err = resolveLocalDir(path, config.ID, config.LocalDir)
+	instance.LocalDirConfigured = strings.TrimSpace(config.LocalDir) != ""
+	instance.LocalDir, err = resolveLocalDir(path, config.LocalDir)
 	if err != nil {
 		return LoadedFileConfig{}, fmt.Errorf("config file %s rejected: %w", path, err)
 	}

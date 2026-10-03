@@ -364,7 +364,7 @@ func aggregateReviewReport(report *reviewReport, evidenceByTicket map[string]rev
 
 func renderReviewReport(out io.Writer, report reviewReport) {
 	fmt.Fprintln(out, "Ticket review flow report")
-	fmt.Fprintf(out, "Window: %s to %s\n", report.WindowStart.Format(time.RFC3339), report.WindowEnd.Format(time.RFC3339))
+	fmt.Fprintf(out, "Window: %s to %s\n", report.WindowStart.Local().Format(time.RFC3339), report.WindowEnd.Local().Format(time.RFC3339))
 	fmt.Fprintf(out, "Tickets examined: %d\n", report.TicketsExamined)
 	fmt.Fprintf(out, "Tickets with review activity: %d\n", report.TicketsWithActivity)
 	fmt.Fprintf(out, "First-pass approvals/signoffs: %d\n", report.FirstPassApprovals)

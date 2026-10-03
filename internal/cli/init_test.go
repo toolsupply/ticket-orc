@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/toolsupply/ticket-orc/internal/state"
 )
 
 func TestInitCreatesMinimalSecureInstanceAndRequiresForceToReplace(t *testing.T) {
@@ -33,8 +37,8 @@ func TestInitCreatesMinimalSecureInstanceAndRequiresForceToReplace(t *testing.T)
 	if err != nil || string(ignore) != initGitignore {
 		t.Fatalf("init ignore = %q, error=%v, want generated mutable-data policy", ignore, err)
 	}
-	if string(ignore) != "/.local/\n" {
-		t.Fatalf("init ignore = %q, want only the local runtime directory ignored", ignore)
+	if string(ignore) != "/.local/\n/.local.guard/\n" {
+		t.Fatalf("init ignore = %q, want runtime and coordination directories ignored", ignore)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 2 || entries[0].Name() != ".gitignore" || entries[1].Name() != "config.json" {
@@ -100,7 +104,7 @@ func TestInitCreatesMinimalSecureInstanceAndRequiresForceToReplace(t *testing.T)
 		t.Fatalf("reviewer nudge has incomplete review guidance or lifecycle/Skill instructions: %q", prompt)
 	}
 	loaded, err := LoadFileConfig(dir, path, true)
-	wantLocalDir := filepath.Join(dir, ".local", id)
+	wantLocalDir := filepath.Join(dir, ".local")
 	if err != nil || loaded.Config.ID != id || loaded.Instance.LocalDir != wantLocalDir {
 		t.Fatalf("load initialized config id=%q local_dir=%q err=%v, want runtime root %q", loaded.Config.ID, loaded.Instance.LocalDir, err, wantLocalDir)
 	}
@@ -186,7 +190,7 @@ func TestInitGlobalAndTicketORCOverrideSelection(t *testing.T) {
 		t.Fatalf("--global did not take precedence over TICKET_ORC: %v", err)
 	}
 	globalIgnore, err := os.ReadFile(filepath.Join(globalDir, ".gitignore"))
-	if err != nil || string(globalIgnore) != "/.local/\n" {
+	if err != nil || string(globalIgnore) != initGitignore {
 		t.Fatalf("--global ignore = %q, error=%v; want same local-data policy", globalIgnore, err)
 	}
 	globalEntries, err := os.ReadDir(globalDir)
@@ -197,7 +201,7 @@ func TestInitGlobalAndTicketORCOverrideSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load --global config: %v", err)
 	}
-	wantGlobalLocalDir := filepath.Join(globalDir, ".local", globalConfig.Config.ID)
+	wantGlobalLocalDir := filepath.Join(globalDir, ".local")
 	if globalConfig.Instance.LocalDir != wantGlobalLocalDir {
 		t.Fatalf("--global implicit runtime root=%q, want %q", globalConfig.Instance.LocalDir, wantGlobalLocalDir)
 	}
@@ -210,7 +214,7 @@ func TestInitGlobalAndTicketORCOverrideSelection(t *testing.T) {
 }
 
 func TestRunHelpDocumentsLocalRuntimeDirectory(t *testing.T) {
-	for _, phrase := range []string{"top-level local_dir", "exact root", "Relative paths are resolved from the configuration", "file.", ".local/<config-id>"} {
+	for _, phrase := range []string{"top-level local_dir", "exact root", "Relative paths are resolved from the configuration", "file.", ".local beside"} {
 		if !strings.Contains(runCommandHelp, phrase) {
 			t.Fatalf("run help is missing %q", phrase)
 		}
@@ -236,6 +240,630 @@ func TestInitForcePreservesExistingGitignore(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(dir, ".gitignore")); err != nil || string(got) != string(customIgnore) {
 		t.Fatalf("existing ignore changed to %q, error=%v", got, err)
+	}
+}
+
+func TestInitForceRemovesDefaultRuntimeLayouts(t *testing.T) {
+	for _, layout := range []string{"direct", "legacy", "obsolete migration artifact"} {
+		t.Run(layout, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "instance")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dir, instanceConfigFileName)
+			writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+			localRoot := filepath.Join(dir, ".local")
+			switch layout {
+			case "direct":
+				if err := ensureRuntimeOwnership(localRoot, runtimeMarkerTestID, false); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(localRoot, "run"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(localRoot, "run", "sentinel"), []byte("owned"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "legacy":
+				for _, id := range []string{runtimeMarkerTestID, runtimeMarkerOtherID} {
+					root := filepath.Join(localRoot, id)
+					if err := os.MkdirAll(root, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(root, "sentinel"), []byte("owned"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "obsolete migration artifact":
+				if err := ensureRuntimeOwnership(localRoot, runtimeMarkerTestID, false); err != nil {
+					t.Fatal(err)
+				}
+				holdingChild := filepath.Join(dir, obsoleteRuntimeMigrationName, runtimeMarkerTestID)
+				if err := os.MkdirAll(holdingChild, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeRuntimeMarker(filepath.Join(holdingChild, runtimeMarkerFileName), runtimeMarker{Version: runtimeMarkerVersion, Layout: runtimeLayoutVersion, InstanceID: runtimeMarkerTestID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code != 0 {
+				t.Fatalf("force init code=%d stderr=%q", code, stderr.String())
+			}
+			if _, err := os.Lstat(localRoot); !os.IsNotExist(err) {
+				t.Fatalf("runtime root remains after force reset: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, obsoleteRuntimeMigrationName)); !os.IsNotExist(err) {
+				t.Fatalf("migration holding path remains after force reset: %v", err)
+			}
+			loaded, err := LoadFileConfig(dir, configPath, true)
+			if err != nil || loaded.Config.ID == runtimeMarkerTestID {
+				t.Fatalf("forced config ID=%q err=%v, want a fresh ID", loaded.Config.ID, err)
+			}
+			if err := ensureLoadedRuntime(loaded); err != nil {
+				t.Fatalf("lazily recreate runtime after force reset: %v", err)
+			}
+			marker, err := readAndValidateRuntimeMarker(localRoot)
+			if err != nil || marker.InstanceID != loaded.Config.ID {
+				t.Fatalf("recreated runtime marker=%#v err=%v, want fresh config ID %s", marker, err, loaded.Config.ID)
+			}
+		})
+	}
+}
+
+func TestInitForceRefusesActiveDaemonWithoutChangingInstance(t *testing.T) {
+	for _, layout := range []string{"direct", "legacy", "external"} {
+		t.Run(layout, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "instance")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dir, instanceConfigFileName)
+			runtimeRoot := filepath.Join(dir, ".local")
+			switch layout {
+			case "legacy":
+				runtimeRoot = filepath.Join(runtimeRoot, runtimeMarkerTestID)
+				writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+			case "external":
+				runtimeRoot = filepath.Join(t.TempDir(), "external-runtime")
+				if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`","local_dir":`+mustJSONString(t, runtimeRoot)+`}`)
+				if err := ensureRuntimeOwnership(runtimeRoot, runtimeMarkerTestID, true); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+				if err := ensureRuntimeOwnership(runtimeRoot, runtimeMarkerTestID, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(runtimeRoot, "sentinel"), []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock, err := state.TryAcquireLock(context.Background(), filepath.Join(runtimeRoot, "run"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Release()
+
+			var stdout, stderr bytes.Buffer
+			if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code == 0 || !strings.Contains(stderr.String(), "instance is running") {
+				t.Fatalf("force init code=%d stderr=%q, want active-instance refusal", code, stderr.String())
+			}
+			after, err := os.ReadFile(configPath)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("config changed after active-daemon refusal: %v", err)
+			}
+			if data, err := os.ReadFile(filepath.Join(runtimeRoot, "sentinel")); err != nil || string(data) != "keep" {
+				t.Fatalf("runtime changed after active-daemon refusal: data=%q err=%v", data, err)
+			}
+		})
+	}
+}
+
+func TestInitForceProtectsSelectedChildDaemonWithDirectMarker(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "instance")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	localRoot := filepath.Join(dir, defaultRuntimeRootName)
+	if err := ensureRuntimeOwnership(localRoot, runtimeMarkerTestID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "sentinel"), []byte("direct"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(localRoot, runtimeMarkerTestID)
+	if err := os.MkdirAll(filepath.Join(selected, "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	childSentinel := filepath.Join(selected, "sentinel")
+	if err := os.WriteFile(childSentinel, []byte("selected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.TryAcquireLock(context.Background(), filepath.Join(selected, "run"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code == 0 || !strings.Contains(stderr.String(), "instance is running") {
+		t.Fatalf("force init code=%d stderr=%q, want selected-child daemon refusal", code, stderr.String())
+	}
+	if after, err := os.ReadFile(configPath); err != nil || string(after) != string(before) {
+		t.Fatalf("config changed after active-child refusal: %v", err)
+	}
+	if direct, err := os.ReadFile(filepath.Join(localRoot, "sentinel")); err != nil || string(direct) != "direct" {
+		t.Fatalf("direct runtime changed after active-child refusal: %q err=%v", direct, err)
+	}
+	if child, err := os.ReadFile(childSentinel); err != nil || string(child) != "selected" {
+		t.Fatalf("selected child changed after active-child refusal: %q err=%v", child, err)
+	}
+}
+
+func TestInitForceRequiresExternalRuntimeOwnershipMarker(t *testing.T) {
+	for _, ownership := range []string{"matching", "missing", "mismatching", "malformed", "unsupported"} {
+		t.Run(ownership, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "instance")
+			external := filepath.Join(t.TempDir(), "runtime")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(external, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dir, instanceConfigFileName)
+			writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`","local_dir":`+mustJSONString(t, external)+`}`)
+			if ownership != "missing" {
+				markerID := runtimeMarkerTestID
+				if ownership == "mismatching" {
+					markerID = runtimeMarkerOtherID
+				}
+				layout := 2
+				if ownership == "unsupported" {
+					layout = 3
+				}
+				if err := writeRuntimeMarker(filepath.Join(external, runtimeMarkerFileName), runtimeMarker{Version: 1, Layout: layout, InstanceID: markerID}); err != nil {
+					t.Fatal(err)
+				}
+				if ownership == "malformed" {
+					if err := os.WriteFile(filepath.Join(external, runtimeMarkerFileName), []byte(`{"version":1}`), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := os.WriteFile(filepath.Join(external, "sentinel"), []byte("owned"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir}))
+			if ownership == "matching" {
+				if code != 0 {
+					t.Fatalf("force init code=%d stderr=%q", code, stderr.String())
+				}
+				if _, err := os.Lstat(external); !os.IsNotExist(err) {
+					t.Fatalf("owned external runtime remains: %v", err)
+				}
+				return
+			}
+			if code == 0 {
+				t.Fatalf("force init code=%d stderr=%q, want ownership refusal", code, stderr.String())
+			}
+			if data, err := os.ReadFile(filepath.Join(external, "sentinel")); err != nil || string(data) != "owned" {
+				t.Fatalf("unowned external runtime changed: data=%q err=%v", data, err)
+			}
+			after, err := os.ReadFile(configPath)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("config changed after ownership refusal: %v", err)
+			}
+		})
+	}
+}
+
+func mustJSONString(t *testing.T, value string) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestInitForceResetsGlobalLegacyRuntime(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	dir := filepath.Join(home, defaultInstanceDirectoryName)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	legacyRoot := filepath.Join(dir, ".local", runtimeMarkerTestID)
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "sentinel"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--global", "--force"}, &stdout, &stderr, emptyEnv); code != 0 {
+		t.Fatalf("global force init code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".local")); !os.IsNotExist(err) {
+		t.Fatalf("global legacy runtime remains: %v", err)
+	}
+}
+
+func TestInitForceResetsProjectLocalLegacyRuntime(t *testing.T) {
+	project := t.TempDir()
+	t.Chdir(project)
+	dir := filepath.Join(project, defaultInstanceDirectoryName)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	legacyRoot := filepath.Join(dir, ".local", runtimeMarkerTestID)
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "sentinel"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, emptyEnv); code != 0 {
+		t.Fatalf("project-local force init code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".local")); !os.IsNotExist(err) {
+		t.Fatalf("project-local legacy runtime remains: %v", err)
+	}
+}
+
+func TestInitForceRefusesAmbiguousMigrationHoldingState(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "instance")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	if err := ensureRuntimeOwnership(filepath.Join(dir, ".local"), runtimeMarkerTestID, false); err != nil {
+		t.Fatal(err)
+	}
+	holding := filepath.Join(dir, obsoleteRuntimeMigrationName)
+	if err := os.Mkdir(holding, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(holding, "unexpected"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code == 0 || !strings.Contains(stderr.String(), "unrecognized entry") {
+		t.Fatalf("force init code=%d stderr=%q, want ambiguous-state refusal", code, stderr.String())
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("config changed after ambiguous-state refusal: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(holding, "unexpected")); err != nil || string(data) != "keep" {
+		t.Fatalf("ambiguous holding state changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestInitForceRemovesRecognizedPromotedMigrationArtifact(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "instance")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	localRoot := filepath.Join(dir, defaultRuntimeRootName)
+	if err := ensureRuntimeOwnership(localRoot, runtimeMarkerTestID, false); err != nil {
+		t.Fatal(err)
+	}
+	// This is the interrupted post-promotion form: the active runtime already
+	// has a direct marker while a UUID-named orphan remains in the old holding
+	// directory without its own marker.
+	orphan := filepath.Join(dir, obsoleteRuntimeMigrationName, runtimeMarkerOtherID)
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, "sentinel"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code != 0 {
+		t.Fatalf("force init code=%d stderr=%q", code, stderr.String())
+	}
+	for _, path := range []string{localRoot, filepath.Join(dir, obsoleteRuntimeMigrationName)} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("runtime artifact remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestInitForceRefusesTopLevelRuntimeSymlinkAndDoesNotFollowNestedSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating directory symlinks may require elevated Windows privileges")
+	}
+	t.Run("top-level", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "instance")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		configPath := filepath.Join(dir, instanceConfigFileName)
+		writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+		target := t.TempDir()
+		if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, defaultRuntimeRootName)); err != nil {
+			t.Skipf("create directory symlink: %v", err)
+		}
+		before, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code == 0 || !strings.Contains(stderr.String(), "runtime root is not a real directory") {
+			t.Fatalf("force init code=%d stderr=%q, want symlink refusal", code, stderr.String())
+		}
+		after, err := os.ReadFile(configPath)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("config changed after symlink refusal: %v", err)
+		}
+		if data, err := os.ReadFile(filepath.Join(target, "sentinel")); err != nil || string(data) != "keep" {
+			t.Fatalf("symlink target changed: data=%q err=%v", data, err)
+		}
+	})
+	t.Run("nested", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "instance")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeConfigFixture(t, filepath.Join(dir, instanceConfigFileName), `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+		localRoot := filepath.Join(dir, defaultRuntimeRootName)
+		if err := os.Mkdir(localRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := t.TempDir()
+		if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(localRoot, "linked-data")); err != nil {
+			t.Skipf("create nested directory symlink: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code != 0 {
+			t.Fatalf("force init code=%d stderr=%q", code, stderr.String())
+		}
+		if _, err := os.Lstat(localRoot); !os.IsNotExist(err) {
+			t.Fatalf("runtime root remains: %v", err)
+		}
+		if data, err := os.ReadFile(filepath.Join(target, "sentinel")); err != nil || string(data) != "keep" {
+			t.Fatalf("nested symlink target changed: data=%q err=%v", data, err)
+		}
+	})
+}
+
+func TestRuntimeGuardSerializesForceResetAgainstDaemonStartup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "instance")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	writeConfigFixture(t, configPath, `{"version":1,"id":"`+runtimeMarkerTestID+`"}`)
+	localRoot := filepath.Join(dir, ".local")
+	if err := ensureRuntimeOwnership(localRoot, runtimeMarkerTestID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "sentinel"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	forceGuard, err := acquireRuntimeGuard(context.Background(), localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := inspectInitRuntimeReset(dir, configPath)
+	if err != nil {
+		forceGuard.Release()
+		t.Fatalf("force reset ownership check: %v", err)
+	}
+	guardPath, err := runtimeGuardPath(localRoot)
+	if err != nil {
+		forceGuard.Release()
+		t.Fatal(err)
+	}
+	if _, err := state.TryAcquireLock(context.Background(), guardPath); !errors.Is(err, state.ErrLockTimeout) {
+		forceGuard.Release()
+		t.Fatalf("startup guard probe during force reset = %v, want lock contention", err)
+	}
+
+	if err := plan.apply(); err != nil {
+		forceGuard.Release()
+		t.Fatalf("apply checked force reset: %v", err)
+	}
+	if err := writeInitConfig(configPath, []byte(`{"version":1,"id":"`+runtimeMarkerOtherID+`"}`), true); err != nil {
+		forceGuard.Release()
+		t.Fatalf("replace config ID: %v", err)
+	}
+	if err := forceGuard.Release(); err != nil {
+		t.Fatal(err)
+	}
+	startupGuard, err := acquireRuntimeGuard(context.Background(), localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validationErr := validateRunConfigIdentity(RunConfig{
+		ConfigPath: configPath, StateDir: localRoot, InstanceID: runtimeMarkerTestID,
+	})
+	startupGuard.Release()
+	if validationErr == nil || !strings.Contains(validationErr.Error(), "config changed before runtime startup") {
+		t.Fatalf("stale startup validation error = %v", validationErr)
+	}
+	if _, err := os.Lstat(localRoot); !os.IsNotExist(err) {
+		t.Fatalf("stale startup recreated the reset runtime root: %v", err)
+	}
+}
+
+func TestRuntimeGuardUsesCanonicalInstancePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating directory symlinks requires elevated privileges on Windows")
+	}
+	root := t.TempDir()
+	instanceDir := filepath.Join(root, "instance")
+	if err := os.Mkdir(instanceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "instance-alias")
+	if err := os.Symlink(instanceDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := acquireRuntimeGuard(context.Background(), instanceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Release()
+
+	aliasGuardPath, err := runtimeGuardPath(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.TryAcquireLock(context.Background(), aliasGuardPath); !errors.Is(err, state.ErrLockTimeout) {
+		t.Fatalf("symlink alias guard probe = %v, want lock contention", err)
+	}
+}
+
+func TestForceResetSharesGuardWithStartupForExternalRuntime(t *testing.T) {
+	root := t.TempDir()
+	configDirA := filepath.Join(root, "instance-a")
+	configDirB := filepath.Join(root, "instance-b")
+	sharedRuntime := filepath.Join(root, "shared-runtime")
+	for _, dir := range []string{configDirA, configDirB} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(FileConfig{Version: 1, ID: runtimeMarkerTestID, LocalDir: sharedRuntime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeConfigFixture(t, filepath.Join(dir, instanceConfigFileName), string(data))
+	}
+	if err := ensureRuntimeOwnership(sharedRuntime, runtimeMarkerTestID, true); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(sharedRuntime, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("shared runtime"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	startupGuard, err := acquireRuntimeGuard(context.Background(), sharedRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonLock, err := state.TryAcquireLock(context.Background(), filepath.Join(sharedRuntime, "run"))
+	if err != nil {
+		startupGuard.Release()
+		t.Fatal(err)
+	}
+	defer daemonLock.Release()
+
+	resetGuardRoot := initRuntimeResetGuardRoot(configDirA, filepath.Join(configDirA, instanceConfigFileName))
+	if resetGuardRoot != sharedRuntime {
+		startupGuard.Release()
+		t.Fatalf("reset guard root = %q, want shared runtime %q", resetGuardRoot, sharedRuntime)
+	}
+	guardPath, err := runtimeGuardPath(resetGuardRoot)
+	if err != nil {
+		startupGuard.Release()
+		t.Fatal(err)
+	}
+	if _, err := state.TryAcquireLock(context.Background(), guardPath); !errors.Is(err, state.ErrLockTimeout) {
+		startupGuard.Release()
+		t.Fatalf("force reset guard probe = %v, want startup lock contention", err)
+	}
+	if err := startupGuard.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": configDirA})); code == 0 || !strings.Contains(stderr.String(), "instance is running") {
+		t.Fatalf("force reset code=%d stderr=%q, want active shared daemon refusal", code, stderr.String())
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "shared runtime" {
+		t.Fatalf("force reset changed shared runtime: data=%q err=%v", data, err)
+	}
+	loaded, err := LoadFileConfig(configDirA, filepath.Join(configDirA, instanceConfigFileName), true)
+	if err != nil || loaded.Config.ID != runtimeMarkerTestID {
+		t.Fatalf("force reset changed instance A config: ID=%q err=%v", loaded.Config.ID, err)
+	}
+}
+
+func TestInitForceReplacesMalformedConfigAndRemovesStandardRuntime(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "instance")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, instanceConfigFileName)
+	external := filepath.Join(t.TempDir(), "external-runtime")
+	if err := os.Mkdir(external, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(external, "sentinel"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"local_dir":`+mustJSONString(t, external)+`, invalid`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localRoot := filepath.Join(dir, ".local")
+	if err := os.MkdirAll(localRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "sentinel"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--force"}, &stdout, &stderr, mapEnv(map[string]string{"TICKET_ORC": dir})); code != 0 {
+		t.Fatalf("force init code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(localRoot); !os.IsNotExist(err) {
+		t.Fatalf("standard runtime remains after malformed-config reset: %v", err)
+	}
+	if _, err := LoadFileConfig(dir, configPath, true); err != nil {
+		t.Fatalf("replacement config is invalid: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(external, "sentinel")); err != nil || string(data) != "keep" {
+		t.Fatalf("malformed config cleanup touched arbitrary external path: data=%q err=%v", data, err)
 	}
 }
 

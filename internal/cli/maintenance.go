@@ -30,17 +30,20 @@ type StateConfig struct {
 	Output     string
 	Instance   InstanceContext
 	FileConfig FileConfig
+	Endpoint   steerEndpointSelector
 }
 
 // GCConfig controls terminal-ticket garbage collection.
 type GCConfig struct {
-	Worker          string
-	Actor           string
-	WorkingDir      string
-	Target          ticketclient.Target
-	SessionCleanup  supervisor.CleanupPolicy
-	CleanupExplicit bool
-	StateDir        string
+	Worker             string
+	Actor              string
+	WorkingDir         string
+	Target             ticketclient.Target
+	SessionCleanup     supervisor.CleanupPolicy
+	CleanupExplicit    bool
+	StateDir           string
+	InstanceID         string
+	LocalDirConfigured bool
 }
 
 func roleTicketTarget(config supervisor.RoleConfig) ticketclient.Target {
@@ -82,7 +85,9 @@ func maintenanceStore(ctx context.Context, stateDir, actor, workingDir string, t
 }
 
 func parseStateConfig(args []string, lookupEnv envLookup) (StateConfig, bool, error) {
-	values, help, err := parseMaintenanceFlags(args, map[string]struct{}{"config": {}, "output": {}})
+	values, help, err := parseMaintenanceFlags(args, map[string]struct{}{
+		"config": {}, "output": {}, "harness": {}, "session": {}, "transport": {},
+	})
 	if err != nil || help {
 		return StateConfig{}, help, err
 	}
@@ -100,7 +105,23 @@ func parseStateConfig(args []string, lookupEnv envLookup) (StateConfig, bool, er
 	if output != "" && output != string(OutputJSON) && output != string(OutputCompact) && output != string(OutputQuiet) {
 		return StateConfig{}, false, fmt.Errorf("output must be compact, quiet, or json")
 	}
-	return StateConfig{StateDir: loaded.Instance.LocalDir, Output: output, Instance: loaded.Instance, FileConfig: loaded.Config}, false, nil
+	selector := steerEndpointSelector{Harness: values["harness"], SessionID: values["session"], Transport: values["transport"]}
+	selector.Explicit = hasAny(values, "harness", "session", "transport")
+	if selector.Explicit {
+		if err := validateEndpointSelector(selector); err != nil {
+			return StateConfig{}, false, err
+		}
+	}
+	return StateConfig{StateDir: loaded.Instance.LocalDir, Output: output, Instance: loaded.Instance, FileConfig: loaded.Config, Endpoint: selector}, false, nil
+}
+
+func hasAny(values map[string]string, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := values[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGCConfig(args []string, lookupEnv envLookup) (GCConfig, bool, error) {
@@ -136,12 +157,14 @@ func parseGCConfig(args []string, lookupEnv envLookup) (GCConfig, bool, error) {
 		return GCConfig{}, false, fmt.Errorf("actor %q does not match selected worker %q actor %q", explicit, values["worker"], actor)
 	}
 	config := GCConfig{
-		Worker:          values["worker"],
-		Actor:           actor,
-		WorkingDir:      worker.WorkingDir,
-		SessionCleanup:  supervisor.CleanupPolicy(value("session-cleanup", "TICKET_ORC_SESSION_CLEANUP", cleanup)),
-		CleanupExplicit: hasExplicitValue(values, lookupEnv, "session-cleanup", "TICKET_ORC_SESSION_CLEANUP") || loaded.Config.Defaults.SessionCleanup != "",
-		StateDir:        loaded.Instance.LocalDir,
+		Worker:             values["worker"],
+		Actor:              actor,
+		WorkingDir:         worker.WorkingDir,
+		SessionCleanup:     supervisor.CleanupPolicy(value("session-cleanup", "TICKET_ORC_SESSION_CLEANUP", cleanup)),
+		CleanupExplicit:    hasExplicitValue(values, lookupEnv, "session-cleanup", "TICKET_ORC_SESSION_CLEANUP") || loaded.Config.Defaults.SessionCleanup != "",
+		StateDir:           loaded.Instance.LocalDir,
+		InstanceID:         loaded.Config.ID,
+		LocalDirConfigured: loaded.Instance.LocalDirConfigured,
 	}
 	config.Target = roleTicketTarget(worker)
 	if !oneOf(string(config.SessionCleanup), string(CleanupDelete), string(CleanupArchive), string(CleanupKeep)) {
@@ -212,6 +235,9 @@ func parseMaintenanceFlags(args []string, allowed map[string]struct{}) (map[stri
 }
 
 func executeState(config StateConfig, stdout io.Writer) error {
+	if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.FileConfig.ID, config.Instance.LocalDirConfigured); err != nil {
+		return err
+	}
 	// State inspection intentionally uses the explicit administrative view so
 	// operators can see every repository namespace without routing worker state.
 	snapshot, err := state.NewAdministrative(config.StateDir).Read(context.Background())
@@ -227,6 +253,9 @@ func executeState(config StateConfig, stdout io.Writer) error {
 }
 
 func executeGC(config GCConfig, stdout, stderr io.Writer) error {
+	if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.InstanceID, config.LocalDirConfigured); err != nil {
+		return err
+	}
 	tickets, err := ticketclient.NewWithWorkingDirAndTarget(config.Actor, config.WorkingDir, config.Target)
 	if err != nil {
 		return err
@@ -361,7 +390,7 @@ func contextTelemetrySummary(telemetry contextheadroom.Telemetry, now time.Time)
 	if now.Before(telemetry.ObservedAt) || now.Sub(telemetry.ObservedAt) > 24*time.Hour {
 		status = "stale"
 	}
-	return fmt.Sprintf("%s used=%d window=%d remaining=%d observed_at=%s", status, telemetry.Used, telemetry.Window, telemetry.Remaining, telemetry.ObservedAt.UTC().Format(time.RFC3339))
+	return fmt.Sprintf("%s used=%d window=%d remaining=%d observed_at=%s", status, telemetry.Used, telemetry.Window, telemetry.Remaining, telemetry.ObservedAt.Local().Format(time.RFC3339))
 }
 
 func stateValue(value string) string {

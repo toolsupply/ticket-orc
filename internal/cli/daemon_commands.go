@@ -15,11 +15,13 @@ import (
 )
 
 type daemonCommandOptions struct {
-	localDir       string
-	output         supervisor.OutputMode
-	endpoint       string
-	environmentURL string
-	configPath     string
+	localDir           string
+	instanceID         string
+	localDirConfigured bool
+	output             supervisor.OutputMode
+	endpoint           string
+	environmentURL     string
+	configPath         string
 }
 
 func writeDaemonHelp(out io.Writer, command string) {
@@ -138,6 +140,8 @@ func parseDaemonCommandOptions(args []string, lookupEnv envLookup, allowOutput b
 			return daemonCommandOptions{}, nil, false, configErr
 		}
 		options.localDir = loaded.Instance.LocalDir
+		options.instanceID = loaded.Config.ID
+		options.localDirConfigured = loaded.Instance.LocalDirConfigured
 	}
 	return options, positionals, help, nil
 }
@@ -162,13 +166,25 @@ func executeDaemonCommand(args []string, stdout, stderr io.Writer, lookupEnv env
 		if command == "group" && (len(positional) != 2 || (positional[0] != "start" && positional[0] != "stop")) {
 			return usageError(stderr, "usage: ticket-orc group start|stop NAME")
 		}
-		if command == "worker" {
-			return executeDaemonWorker(options, positional[0], positional[1], stdout, stderr)
-		}
-		return executeDaemonGroup(options, positional[0], positional[1], stdout, stderr)
-	}
-	if len(positional) != 0 {
+	} else if len(positional) != 0 {
 		return usageError(stderr, "%s accepts no positional arguments", command)
+	}
+	switch command {
+	case "status", "reload", "pause", "resume", "abort", "shutdown", "worker", "group":
+	default:
+		return usageError(stderr, "unknown daemon command: %s", command)
+	}
+	if options.localDir != "" {
+		if err := ensureRuntimeOwnershipIfKnown(options.localDir, options.instanceID, options.localDirConfigured); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+	}
+	if command == "worker" {
+		return executeDaemonWorker(options, positional[0], positional[1], stdout, stderr)
+	}
+	if command == "group" {
+		return executeDaemonGroup(options, positional[0], positional[1], stdout, stderr)
 	}
 	switch command {
 	case "status":
@@ -273,7 +289,7 @@ func executeDaemonStatus(options daemonCommandOptions, stdout, stderr io.Writer)
 
 func renderDaemonCompactStatus(stdout io.Writer, status daemon.Status) {
 	fmt.Fprintln(stdout)
-	fmt.Fprintf(stdout, "daemon mode=%s version=%s protocol=%d pid=%d url=%s started=%s\n", status.Mode, status.Version, status.Protocol, status.PID, status.URL, status.StartedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(stdout, "daemon mode=%s version=%s protocol=%d pid=%d url=%s started=%s\n", status.Mode, status.Version, status.Protocol, status.PID, status.URL, status.StartedAt.Local().Format(time.RFC3339))
 	for _, worker := range status.Workers {
 		fmt.Fprintf(stdout, "worker %s state=%s role=%s harness=%s", worker.Name, worker.State, worker.Role, worker.Harness)
 		if worker.TicketActor != "" {

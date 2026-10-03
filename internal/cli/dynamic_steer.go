@@ -4,28 +4,127 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
-	"github.com/toolsupply/ticket-orc/internal/harness/codex"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/steertransport"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
-const steerPollInterval = time.Second
-const steerOperationTimeout = 5 * time.Second
+const (
+	steerPollInterval     = time.Second
+	steerOperationTimeout = 5 * time.Second
+)
 
 const steerClaimRecoveryPrompt = "[ticket-orc] This session replaces the previous session for this Ticket actor. There is already an active Ticket claim. Inspect the actor's current claim and continue it before taking new work. After resolving it, continue processing actionable work for the current actor until none remains."
 const steerSessionBootstrapPrompt = "[ticket-orc] This session is registered for Orc-steered Ticket work.\n\nFor Orc-steered work, follow the installed ticket-orc-worker Skill and the Ticket Tasks Skill it references. If those instructions are not currently available or clear in this session, consult them before acting on Orc work. Ticket remains authoritative for work selection, ownership, and lifecycle."
 
 type steerRolePolicy struct {
 	TicketQueue      string
+	QueueFilters     ticketclient.QueueFilters
 	NudgePrompt      string
 	ReviewCompletion string
+}
+
+type steerPolicySnapshot struct {
+	generation uint64
+	roles      map[string]steerRolePolicy
+}
+
+// steerPolicyStore publishes immutable steering policy generations. A
+// dispatch reservation spans only the state transition and queue operation;
+// Replace waits for existing reservations before making a new generation
+// visible, without holding the mutex while external work runs.
+type steerPolicyStore struct {
+	mu         sync.Mutex
+	changed    *sync.Cond
+	generation uint64
+	active     int
+	roles      map[string]steerRolePolicy
+}
+
+func newSteerPolicyStore(roles map[string]steerRolePolicy) *steerPolicyStore {
+	store := &steerPolicyStore{generation: 1, roles: cloneSteerRolePolicies(roles)}
+	store.changed = sync.NewCond(&store.mu)
+	return store
+}
+
+func cloneSteerRolePolicies(roles map[string]steerRolePolicy) map[string]steerRolePolicy {
+	cloned := make(map[string]steerRolePolicy, len(roles))
+	for name, policy := range roles {
+		policy.QueueFilters.Tags = append([]string(nil), policy.QueueFilters.Tags...)
+		policy.QueueFilters.WithoutTags = append([]string(nil), policy.QueueFilters.WithoutTags...)
+		sort.Strings(policy.QueueFilters.Tags)
+		sort.Strings(policy.QueueFilters.WithoutTags)
+		cloned[name] = policy
+	}
+	return cloned
+}
+
+func (store *steerPolicyStore) Snapshot() steerPolicySnapshot {
+	if store == nil {
+		return steerPolicySnapshot{}
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return steerPolicySnapshot{generation: store.generation, roles: cloneSteerRolePolicies(store.roles)}
+}
+
+func (store *steerPolicyStore) Replace(roles map[string]steerRolePolicy) (uint64, bool) {
+	if store == nil {
+		return 0, false
+	}
+	cloned := cloneSteerRolePolicies(roles)
+	store.mu.Lock()
+	if reflect.DeepEqual(store.roles, cloned) {
+		generation := store.generation
+		store.mu.Unlock()
+		return generation, false
+	}
+	for store.active > 0 {
+		store.changed.Wait()
+	}
+	// Waiting releases the mutex, so another replacement may have published
+	// this same policy while active dispatch reservations drained.
+	if reflect.DeepEqual(store.roles, cloned) {
+		generation := store.generation
+		store.mu.Unlock()
+		return generation, false
+	}
+	store.generation++
+	store.roles = cloned
+	generation := store.generation
+	store.mu.Unlock()
+	return generation, true
+}
+
+func (store *steerPolicyStore) WithGeneration(generation uint64, operation func() error) (bool, error) {
+	if store == nil {
+		return false, nil
+	}
+	store.mu.Lock()
+	if generation != store.generation {
+		store.mu.Unlock()
+		return false, nil
+	}
+	store.active++
+	store.mu.Unlock()
+	defer func() {
+		store.mu.Lock()
+		store.active--
+		if store.active == 0 {
+			store.changed.Broadcast()
+		}
+		store.mu.Unlock()
+	}()
+	return true, operation()
 }
 
 func steerReviewCompletionPrompt(policy steerRolePolicy) string {
@@ -95,7 +194,7 @@ func (s *dynamicSteerStatus) publishDelivery(reg state.SteerRegistration, stateN
 		return
 	}
 	publish(daemon.Event{
-		Type: "steer.delivery", Role: reg.Role, Actor: reg.Actor, Session: shortIdentity(reg.ThreadID),
+		Type: "steer.delivery", Role: reg.Role, Actor: reg.Actor, Harness: reg.Harness, Session: shortIdentity(reg.SessionID),
 		State: stateName, Ticket: ticket, RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName,
 	})
 }
@@ -123,27 +222,27 @@ func (s *dynamicSteerStatus) replace(items []daemon.SteerStatus) {
 	}
 	for _, item := range items {
 		old, found := previousByKey[steerStatusKey(item)]
-		if found && old == item {
+		if found && reflect.DeepEqual(old, item) {
 			continue
 		}
-		publish(daemon.Event{Type: "steer.status", Role: item.Role, Actor: item.Actor, Session: shortIdentity(item.Session), State: item.State, Code: item.Code, Ticket: item.Ticket, RepositoryID: item.RepositoryID, RepositoryName: item.RepositoryName})
+		publish(daemon.Event{Type: "steer.status", Role: item.Role, Actor: item.Actor, Harness: item.Harness, Session: shortIdentity(item.Session), State: item.State, Code: item.Code, Ticket: item.Ticket, RepositoryID: item.RepositoryID, RepositoryName: item.RepositoryName})
 	}
 	for _, old := range previous {
 		found := false
 		for _, item := range items {
-			if item.RepositoryID == old.RepositoryID && item.Actor == old.Actor && item.Session == old.Session {
+			if item.RepositoryID == old.RepositoryID && item.Actor == old.Actor && item.Harness == old.Harness && item.Session == old.Session {
 				found = true
 				break
 			}
 		}
 		if !found {
-			publish(daemon.Event{Type: "steer.status", Role: old.Role, Actor: old.Actor, Session: shortIdentity(old.Session), State: "left", Code: "registration_removed", RepositoryID: old.RepositoryID, RepositoryName: old.RepositoryName})
+			publish(daemon.Event{Type: "steer.status", Role: old.Role, Actor: old.Actor, Harness: old.Harness, Session: shortIdentity(old.Session), State: "left", Code: "registration_removed", RepositoryID: old.RepositoryID, RepositoryName: old.RepositoryName})
 		}
 	}
 }
 
 func steerStatusKey(item daemon.SteerStatus) string {
-	return item.RepositoryID + "\x00" + item.Actor + "\x00" + item.Session
+	return item.RepositoryID + "\x00" + item.Actor + "\x00" + item.Harness + "\x00" + item.Session
 }
 
 func sameSteerStatuses(left, right []daemon.SteerStatus) bool {
@@ -151,7 +250,7 @@ func sameSteerStatuses(left, right []daemon.SteerStatus) bool {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if !reflect.DeepEqual(left[i], right[i]) {
 			return false
 		}
 	}
@@ -163,7 +262,7 @@ func registrationStartupStatuses(registrations []state.SteerRegistration, observ
 	for _, registration := range registrations {
 		status := daemon.SteerStatus{
 			RepositoryID: registration.RepositoryID, RepositoryName: registration.RepositoryName,
-			Role: registration.Role, Actor: registration.Actor, Session: registration.ThreadID,
+			Role: registration.Role, Actor: registration.Actor, Harness: registration.Harness, Session: registration.SessionID,
 			State: "checking",
 		}
 		if observationCode != "" {
@@ -175,13 +274,98 @@ func registrationStartupStatuses(registrations []state.SteerRegistration, observ
 	return items
 }
 
+func applySteerStatusPolicy(status *daemon.SteerStatus, policy steerRolePolicy) {
+	if status == nil {
+		return
+	}
+	status.EffectiveTicketQueue = policy.TicketQueue
+	status.EffectiveTicketTags = append([]string(nil), policy.QueueFilters.Tags...)
+	status.EffectiveReviewSkipTags = append([]string(nil), policy.QueueFilters.WithoutTags...)
+}
+
 type steerClient interface {
-	ActiveClaims(context.Context, string, []string, int) (ticketclient.ListResult, error)
-	ReadyFrontier(context.Context, string, []string, int) (ticketclient.ListResult, error)
+	ActiveClaims(context.Context, string, int) (ticketclient.ListResult, error)
+	ReadyFrontier(context.Context, string, ticketclient.QueueFilters, int) (ticketclient.ListResult, error)
 	Close() error
 }
+
+type steerDirtySnapshot struct {
+	all          bool
+	repositories map[string]struct{}
+}
+
+func (snapshot steerDirtySnapshot) empty() bool {
+	return !snapshot.all && len(snapshot.repositories) == 0
+}
+
+func (snapshot steerDirtySnapshot) includes(repositoryID string) bool {
+	if snapshot.all {
+		return true
+	}
+	_, ok := snapshot.repositories[repositoryID]
+	return ok
+}
+
+// steerDirtySet coalesces reconciliation reasons without blocking producers.
+// Drain swaps the pending set under the same lock used by Mark, so marks that
+// arrive while reconciliation is running belong to the next snapshot.
+type steerDirtySet struct {
+	mu           sync.Mutex
+	all          bool
+	repositories map[string]struct{}
+	wake         chan struct{}
+}
+
+func newSteerDirtySet() *steerDirtySet {
+	return &steerDirtySet{repositories: make(map[string]struct{}), wake: make(chan struct{}, 1)}
+}
+
+func (dirty *steerDirtySet) MarkAll() {
+	dirty.mu.Lock()
+	dirty.all = true
+	dirty.repositories = nil
+	dirty.signalLocked()
+	dirty.mu.Unlock()
+}
+
+func (dirty *steerDirtySet) MarkRepository(repositoryID string) {
+	if repositoryID == "" {
+		return
+	}
+	dirty.mu.Lock()
+	if !dirty.all {
+		if dirty.repositories == nil {
+			dirty.repositories = make(map[string]struct{})
+		}
+		dirty.repositories[repositoryID] = struct{}{}
+	}
+	dirty.signalLocked()
+	dirty.mu.Unlock()
+}
+
+func (dirty *steerDirtySet) Drain() steerDirtySnapshot {
+	dirty.mu.Lock()
+	snapshot := steerDirtySnapshot{all: dirty.all, repositories: dirty.repositories}
+	dirty.all = false
+	dirty.repositories = make(map[string]struct{})
+	select {
+	case <-dirty.wake:
+	default:
+	}
+	dirty.mu.Unlock()
+	return snapshot
+}
+
+func (dirty *steerDirtySet) Wake() <-chan struct{} { return dirty.wake }
+
+func (dirty *steerDirtySet) signalLocked() {
+	select {
+	case dirty.wake <- struct{}{}:
+	default:
+	}
+}
+
 type steerClientFactory func(state.SteerRegistration) (steerClient, error)
-type steerQueue func(context.Context, string, string, string) error
 type steerRuntimePersistence interface {
 	Snapshot(context.Context) (state.SteerRuntimeSnapshot, error)
 	Reconcile(context.Context, []state.SteerRegistration) error
@@ -203,14 +387,14 @@ type steerNotificationPlan struct {
 }
 
 func observeSteerActiveTicket(ctx context.Context, client steerClient, policy steerRolePolicy) (string, error) {
-	return boundedActorActive(ctx, client, policy.TicketQueue)
+	return boundedActorActive(ctx, client)
 }
 
 func observeSteerReadyTicket(ctx context.Context, client steerClient, policy steerRolePolicy, stateName, activeTicket string) (string, error) {
 	if activeTicket != "" || (stateName != string(orc.SteerIdle) && stateName != string(orc.SteerConsumed)) {
 		return "", nil
 	}
-	return boundedReady(ctx, client, policy.TicketQueue)
+	return boundedReady(ctx, client, policy.TicketQueue, policy.QueueFilters)
 }
 
 func planSteerNotification(policy steerRolePolicy, stateName string, activeTicket, readyTicket string, recoveryPending, bootstrapPending bool) steerNotificationPlan {
@@ -227,7 +411,7 @@ func planSteerNotification(policy steerRolePolicy, stateName string, activeTicke
 		action:        action,
 		previousState: stateName,
 		send:          action.Queue || recovery || bootstrap,
-		workBearing:   active || ready,
+		workBearing:   ready,
 		bootstrap:     bootstrap,
 		recovery:      recovery,
 		ticket:        readyTicket,
@@ -276,7 +460,7 @@ type steerDeliveryResult struct {
 	code  string
 }
 
-func sendSteerNotification(ctx context.Context, reg state.SteerRegistration, plan steerNotificationPlan, queue steerQueue, persistence steerRuntimePersistence, statuses *dynamicSteerStatus, writeFailures, lastPersistedStates map[string]string) steerDeliveryResult {
+func sendSteerNotification(ctx context.Context, stateDir string, reg state.SteerRegistration, plan steerNotificationPlan, router *steertransport.Router, persistence steerRuntimePersistence, statuses *dynamicSteerStatus, writeFailures, lastPersistedStates map[string]string) steerDeliveryResult {
 	key := steerRegistrationKey(reg)
 	result := steerDeliveryResult{state: string(plan.action.Next)}
 	current, err := persistence.Update(ctx, reg, string(orc.SteerSending), "")
@@ -298,7 +482,7 @@ func sendSteerNotification(ctx context.Context, reg state.SteerRegistration, pla
 	statuses.publishDelivery(reg, result.state, plan.ticket)
 
 	queueCtx, queueCancel := context.WithTimeout(ctx, steerOperationTimeout)
-	queueErr := queue(queueCtx, reg.CodexHome, reg.ThreadID, plan.message)
+	queueErr := router.Deliver(queueCtx, stateDir, reg, steertransport.Message{Kind: steertransport.MessageSteer, Text: plan.message})
 	queueCancel()
 	if queueErr == nil {
 		statuses.publishDelivery(reg, plan.completionState, plan.ticket)
@@ -317,8 +501,7 @@ func sendSteerNotification(ctx context.Context, reg state.SteerRegistration, pla
 		}
 		return result
 	}
-	var processErr *codex.ProcessError
-	if errors.As(queueErr, &processErr) {
+	if steertransport.IsRejected(queueErr) {
 		current, err = persistence.Update(ctx, reg, string(orc.SteerDegraded), "queue_rejected")
 		if err != nil {
 			writeFailures[key] = "runtime_state_write_failed"
@@ -351,30 +534,66 @@ func sendSteerNotification(ctx context.Context, reg state.SteerRegistration, pla
 	return result
 }
 
-func runDynamicSteer(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, queue steerQueue, statuses *dynamicSteerStatus) {
-	runDynamicSteerWithPersistence(ctx, stateDir, policies, runtime, clients, queue, statuses, nil)
+func runDynamicSteer(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus) {
+	runDynamicSteerWithPersistence(ctx, stateDir, policies, runtime, clients, router, statuses, nil)
 }
 
-func runDynamicSteerWithPersistence(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, queue steerQueue, statuses *dynamicSteerStatus, persistence steerRuntimePersistence) {
-	runDynamicSteerWithObserver(ctx, stateDir, policies, runtime, clients, queue, statuses, persistence, newRegistrationObserver(state.NewRegistrationStore(stateDir)))
+func runDynamicSteerWithPersistence(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence) {
+	runDynamicSteerWithObserver(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, newRegistrationObserver(state.NewRegistrationStore(stateDir)))
 }
 
-func runDynamicSteerWithObserver(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, queue steerQueue, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver) {
-	runDynamicSteerWithGate(ctx, stateDir, policies, runtime, clients, queue, statuses, persistence, observer, nil, nil)
+func runDynamicSteerWithObserver(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver) {
+	runDynamicSteerWithGate(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, observer, nil, nil)
 }
 
-func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, queue steerQueue, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, wake <-chan struct{}) {
-	if ctx == nil || len(policies) == 0 {
+func runDynamicSteerWithDirtySet(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, dirty *steerDirtySet) {
+	runDynamicSteerWithGate(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, newRegistrationObserver(state.NewRegistrationStore(stateDir)), nil, dirty)
+}
+
+func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, dirty *steerDirtySet) {
+	registrationTicker := time.NewTicker(steerPollInterval)
+	defer registrationTicker.Stop()
+	runDynamicSteerWithSchedule(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, observer, gate, dirty, registrationTicker.C)
+}
+
+func runDynamicSteerWithPolicyStoreGate(ctx context.Context, stateDir string, policies *steerPolicyStore, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, dirty *steerDirtySet) {
+	registrationTicker := time.NewTicker(steerPollInterval)
+	defer registrationTicker.Stop()
+	runDynamicSteerWithPolicyStore(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, observer, gate, dirty, registrationTicker.C, nil)
+}
+
+func runDynamicSteerWithSchedule(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, dirty *steerDirtySet, registrationTicks <-chan time.Time) {
+	runDynamicSteerWithElapsedSchedule(ctx, stateDir, policies, runtime, clients, router, statuses, persistence, observer, gate, dirty, registrationTicks, nil)
+}
+
+// runDynamicSteerWithElapsedSchedule has a separate elapsed-time input so
+// tests can advance the former full-sweep interval without a wall-clock wait.
+// Production has no elapsed-time work trigger and passes nil.
+func runDynamicSteerWithElapsedSchedule(ctx context.Context, stateDir string, policies map[string]steerRolePolicy, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, dirty *steerDirtySet, registrationTicks, elapsedTicks <-chan time.Time) {
+	runDynamicSteerWithPolicyStore(ctx, stateDir, newSteerPolicyStore(policies), runtime, clients, router, statuses, persistence, observer, gate, dirty, registrationTicks, elapsedTicks)
+}
+
+func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, policies *steerPolicyStore, runtime *supervisor.RuntimeState[supervisor.RunWorker], clients steerClientFactory, router *steertransport.Router, statuses *dynamicSteerStatus, persistence steerRuntimePersistence, observer *registrationObserver, gate *dispatchGate, dirty *steerDirtySet, registrationTicks, elapsedTicks <-chan time.Time) {
+	if ctx == nil || policies == nil || len(policies.Snapshot().roles) == 0 {
 		return
+	}
+	if dirty == nil {
+		dirty = newSteerDirtySet()
 	}
 	if clients == nil {
 		clients = func(reg state.SteerRegistration) (steerClient, error) {
 			return ticketclient.NewWithWorkingDirAndTarget(reg.Actor, reg.RepositoryPath, ticketclient.Target{Repository: reg.RepositoryPath})
 		}
 	}
-	if queue == nil {
-		queue = func(ctx context.Context, home, thread, message string) error {
-			return codex.New().Queue(ctx, home, thread, message)
+	if observer == nil {
+		observer = newRegistrationObserver(state.NewRegistrationStore(stateDir))
+	}
+	if router == nil {
+		var err error
+		router, err = newDefaultSteerTransportRouter()
+		if err != nil {
+			statuses.replace(steerFailureStatuses(observer.lastRegistrations(), "transport_unavailable", policies.Snapshot()))
+			return
 		}
 	}
 	if persistence == nil {
@@ -383,24 +602,70 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 	connections := map[string]steerClient{}
 	writeFailures := map[string]string{}
 	lastPersistedStates := map[string]string{}
-	tick := func() {
+	latestObservation := registrationObservation{}
+	haveObservation := false
+	forceFullAfterRecovery := false
+	spoolReconciled := false
+	lastRegistrations := []state.SteerRegistration{}
+	statusCache := map[string]daemon.SteerStatus{}
+	observeRegistrations := func() (bool, steerDirtySnapshot) {
 		readCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 		observation := observer.Observe(readCtx)
 		cancel()
 		if observation.Code != "" {
 			closeSteerClients(connections)
-			statuses.replace(registrationFailureStatuses(observation))
+			items := registrationFailureStatuses(observation, policies.Snapshot())
+			statusCache = indexSteerStatuses(observation.Registrations, items)
+			statuses.replace(items)
+			forceFullAfterRecovery = true
+			return false, steerDirtySnapshot{}
+		}
+		if !spoolReconciled {
+			reconcileCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
+			err := reconcileSteerSpoolEndpoints(reconcileCtx, observer.store, stateDir)
+			cancel()
+			if err != nil {
+				items := steerFailureStatuses(observation.Registrations, "spool_reconciliation_failed", policies.Snapshot())
+				statusCache = indexSteerStatuses(observation.Registrations, items)
+				statuses.replace(items)
+				return false, steerDirtySnapshot{}
+			}
+			spoolReconciled = true
+		}
+		changed := steerDirtySnapshot{repositories: make(map[string]struct{})}
+		if !haveObservation {
+			changed.all = true
+			haveObservation = true
+		} else {
+			for repositoryID := range changedSteerRepositories(lastRegistrations, observation.Registrations) {
+				changed.repositories[repositoryID] = struct{}{}
+			}
+		}
+		if forceFullAfterRecovery {
+			changed.all = true
+			changed.repositories = nil
+			forceFullAfterRecovery = false
+		}
+		latestObservation = observation
+		lastRegistrations = append(lastRegistrations[:0], observation.Registrations...)
+		return true, changed
+	}
+	tick := func(work steerDirtySnapshot) {
+		if !haveObservation || work.empty() {
 			return
 		}
+		policySnapshot := policies.Snapshot()
+		observation := latestObservation
 		if err := persistence.Reconcile(ctx, observation.Registrations); err != nil {
 			closeSteerClients(connections)
-			items := steerFailureStatuses(observation.Registrations, "runtime_state_unavailable")
+			items := steerFailureStatuses(observation.Registrations, "runtime_state_unavailable", policies.Snapshot())
 			for i := range items {
 				reg := observation.Registrations
 				if i < len(reg) {
 					applySteerWriteFailure(&items[i], reg[i], writeFailures, lastPersistedStates)
 				}
 			}
+			statusCache = indexSteerStatuses(observation.Registrations, items)
 			statuses.replace(items)
 			return
 		}
@@ -427,16 +692,27 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 		currentStatus := make([]daemon.SteerStatus, 0, len(observation.Registrations))
 		for _, reg := range observation.Registrations {
 			regKey := steerRegistrationKey(reg)
-			policy, ok := policies[reg.Role]
+			policy, ok := policySnapshot.roles[reg.Role]
 			if !ok {
-				status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Session: reg.ThreadID, State: "degraded", Code: "unknown_role"}
+				status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Harness: reg.Harness, Session: reg.SessionID, State: "degraded", Code: "unknown_role"}
 				applySteerWriteFailure(&status, reg, writeFailures, lastPersistedStates)
 				currentStatus = append(currentStatus, status)
 				continue
 			}
+			status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Harness: reg.Harness, Session: reg.SessionID}
+			applySteerStatusPolicy(&status, policy)
 			key := regKey
 			activeKeys[key] = true
-			status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Session: reg.ThreadID}
+			if !work.includes(reg.RepositoryID) {
+				if status, found := statusCache[key]; found {
+					applySteerStatusPolicy(&status, policy)
+					currentStatus = append(currentStatus, status)
+				} else {
+					status.State = "checking"
+					currentStatus = append(currentStatus, status)
+				}
+				continue
+			}
 			if managedOwner(runtime, reg) {
 				status.State = "conflict"
 				status.Code = "managed_owner"
@@ -496,7 +772,7 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 			active := activeTicket != ""
 			if !active && recoveryPending {
 				current := false
-				allowed, persistErr := withSteerDispatch(gate, func() error {
+				allowed, policyCurrent, persistErr := withSteerPolicyDispatch(gate, policies, policySnapshot.generation, func() error {
 					var err error
 					current, err = persistence.ConfirmNoActiveClaim(ctx, reg)
 					return err
@@ -511,6 +787,12 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 				if !allowed {
 					status.State = stateName
 					status.Code = steerDispatchSuppressedCode(gate)
+				} else if !policyCurrent {
+					dirty.MarkRepository(reg.RepositoryID)
+					status.State = stateName
+					status.Code = "policy_changed"
+					currentStatus = append(currentStatus, status)
+					continue
 				} else if !current {
 					delete(writeFailures, regKey)
 					delete(lastPersistedStates, regKey)
@@ -547,7 +829,7 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 			if plan.send {
 				var result steerDeliveryResult
 				registrationCurrent := false
-				allowed, sendErr := withSteerDispatch(gate, func() error {
+				allowed, policyCurrent, sendErr := withSteerPolicyDispatch(gate, policies, policySnapshot.generation, func() error {
 					currentCtx, currentCancel := context.WithTimeout(ctx, steerOperationTimeout)
 					var currentErr error
 					registrationCurrent, currentErr = currentSteerRegistration(currentCtx, observer.store, reg)
@@ -559,7 +841,7 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 						result = steerDeliveryResult{state: stateName, code: "registration_replaced"}
 						return nil
 					}
-					result = sendSteerNotification(ctx, reg, plan, queue, persistence, statuses, writeFailures, lastPersistedStates)
+					result = sendSteerNotification(ctx, stateDir, reg, plan, router, persistence, statuses, writeFailures, lastPersistedStates)
 					return nil
 				})
 				if sendErr != nil {
@@ -568,6 +850,10 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 				} else if !allowed {
 					status.State = stateName
 					status.Code = steerDispatchSuppressedCode(gate)
+				} else if !policyCurrent {
+					dirty.MarkRepository(reg.RepositoryID)
+					status.State = stateName
+					status.Code = "policy_changed"
 				} else if !registrationCurrent {
 					status.State = stateName
 					status.Code = "registration_replaced"
@@ -577,7 +863,7 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 				}
 			} else if action.Next != orc.SteerDeliveryState(stateName) || action.Retire {
 				current := false
-				allowed, persistErr := withSteerDispatch(gate, func() error {
+				allowed, policyCurrent, persistErr := withSteerPolicyDispatch(gate, policies, policySnapshot.generation, func() error {
 					var err error
 					current, err = persistence.Update(ctx, reg, string(action.Next), action.Code)
 					return err
@@ -589,6 +875,10 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 				} else if !allowed {
 					status.State = stateName
 					status.Code = steerDispatchSuppressedCode(gate)
+				} else if !policyCurrent {
+					dirty.MarkRepository(reg.RepositoryID)
+					status.State = stateName
+					status.Code = "policy_changed"
 				} else if !current {
 					delete(writeFailures, regKey)
 					delete(lastPersistedStates, regKey)
@@ -611,23 +901,34 @@ func runDynamicSteerWithGate(ctx context.Context, stateDir string, policies map[
 			}
 		}
 		statuses.replace(currentStatus)
+		statusCache = indexSteerStatuses(observation.Registrations, currentStatus)
 	}
-	tick()
-	ticker := time.NewTicker(steerPollInterval)
-	defer ticker.Stop()
 	defer func() {
 		for _, client := range connections {
 			_ = client.Close()
 		}
 	}()
+	pending := dirty.Drain()
+	if observed, changes := observeRegistrations(); observed {
+		tick(mergeSteerDirtySnapshots(pending, changes))
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			tick()
-		case <-wake:
-			tick()
+		case <-registrationTicks:
+			pending := dirty.Drain()
+			if observed, changes := observeRegistrations(); observed {
+				tick(mergeSteerDirtySnapshots(pending, changes))
+			}
+		case <-elapsedTicks:
+			// Time passing alone is not authoritative Ticket evidence and must
+			// not trigger ActiveClaims or ReadyFrontier reads.
+		case <-dirty.Wake():
+			pending := dirty.Drain()
+			if observed, changes := observeRegistrations(); observed {
+				tick(mergeSteerDirtySnapshots(pending, changes))
+			}
 		}
 	}
 }
@@ -637,6 +938,16 @@ func withSteerDispatch(gate *dispatchGate, operation func() error) (bool, error)
 		return true, operation()
 	}
 	return gate.WithDispatch(operation)
+}
+
+func withSteerPolicyDispatch(gate *dispatchGate, policies *steerPolicyStore, generation uint64, operation func() error) (bool, bool, error) {
+	policyCurrent := false
+	allowed, err := withSteerDispatch(gate, func() error {
+		var policyErr error
+		policyCurrent, policyErr = policies.WithGeneration(generation, operation)
+		return policyErr
+	})
+	return allowed, policyCurrent, err
 }
 
 func steerDispatchSuppressedCode(gate *dispatchGate) string {
@@ -665,10 +976,69 @@ func steerRegistrationKey(reg state.SteerRegistration) string {
 	return fmt.Sprintf("%s\x00%s\x00%s", reg.RepositoryID, reg.Actor, reg.RegistrationID)
 }
 
-func steerFailureStatuses(registrations []state.SteerRegistration, code string) []daemon.SteerStatus {
+func changedSteerRepositories(previous, current []state.SteerRegistration) map[string]struct{} {
+	previousByKey := make(map[string]state.SteerRegistration, len(previous))
+	currentByKey := make(map[string]state.SteerRegistration, len(current))
+	for _, registration := range previous {
+		previousByKey[registrationObservationKey(registration)] = registration
+	}
+	for _, registration := range current {
+		currentByKey[registrationObservationKey(registration)] = registration
+	}
+	changed := make(map[string]struct{})
+	for key, registration := range previousByKey {
+		if next, found := currentByKey[key]; !found || !sameSteerRegistration(next, registration) {
+			changed[registration.RepositoryID] = struct{}{}
+			if found {
+				changed[next.RepositoryID] = struct{}{}
+			}
+		}
+	}
+	for key, registration := range currentByKey {
+		if previous, found := previousByKey[key]; !found || !sameSteerRegistration(previous, registration) {
+			changed[registration.RepositoryID] = struct{}{}
+		}
+	}
+	delete(changed, "")
+	return changed
+}
+
+func mergeSteerDirtySnapshots(left, right steerDirtySnapshot) steerDirtySnapshot {
+	if left.all || right.all {
+		return steerDirtySnapshot{all: true}
+	}
+	merged := steerDirtySnapshot{repositories: make(map[string]struct{}, len(left.repositories)+len(right.repositories))}
+	for repositoryID := range left.repositories {
+		merged.repositories[repositoryID] = struct{}{}
+	}
+	for repositoryID := range right.repositories {
+		merged.repositories[repositoryID] = struct{}{}
+	}
+	return merged
+}
+
+func registrationObservationKey(registration state.SteerRegistration) string {
+	return registration.RepositoryID + "\x00" + registration.Actor
+}
+
+func indexSteerStatuses(registrations []state.SteerRegistration, statuses []daemon.SteerStatus) map[string]daemon.SteerStatus {
+	indexed := make(map[string]daemon.SteerStatus, len(registrations))
+	for i, registration := range registrations {
+		if i < len(statuses) {
+			indexed[steerRegistrationKey(registration)] = statuses[i]
+		}
+	}
+	return indexed
+}
+
+func steerFailureStatuses(registrations []state.SteerRegistration, code string, policies steerPolicySnapshot) []daemon.SteerStatus {
 	items := make([]daemon.SteerStatus, 0, len(registrations))
 	for _, reg := range registrations {
-		items = append(items, daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Session: reg.ThreadID, State: "degraded", Code: code})
+		status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Harness: reg.Harness, Session: reg.SessionID, State: "degraded", Code: code}
+		if policy, ok := policies.roles[reg.Role]; ok {
+			applySteerStatusPolicy(&status, policy)
+		}
+		items = append(items, status)
 	}
 	if len(items) == 0 {
 		items = append(items, daemon.SteerStatus{State: "degraded", Code: code})
@@ -676,8 +1046,8 @@ func steerFailureStatuses(registrations []state.SteerRegistration, code string) 
 	return items
 }
 
-func registrationFailureStatuses(observation registrationObservation) []daemon.SteerStatus {
-	return steerFailureStatuses(observation.Registrations, observation.Code)
+func registrationFailureStatuses(observation registrationObservation, policies steerPolicySnapshot) []daemon.SteerStatus {
+	return steerFailureStatuses(observation.Registrations, observation.Code, policies)
 }
 
 func closeSteerClients(connections map[string]steerClient) {
@@ -704,34 +1074,27 @@ func discardSteerClient(connections map[string]steerClient, key string) {
 // A Ticket claim belongs to its actor, independent of Orc's current role. Check
 // both supported queues so changing roles cannot hide work claimed in the
 // previous role's queue.
-func boundedActorActive(parent context.Context, client steerClient, currentQueue string) (string, error) {
-	if currentQueue != "open" && currentQueue != "review" {
-		return "", fmt.Errorf("ticket queue must be open or review")
-	}
+func boundedActorActive(parent context.Context, client steerClient) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, steerOperationTimeout)
 	defer cancel()
-	active, err := client.ActiveClaims(ctx, currentQueue, nil, 1)
+	active, err := client.ActiveClaims(ctx, "open", 1)
 	if err != nil || len(active.Items) > 0 {
 		if len(active.Items) > 0 {
 			return active.Items[0].ID, nil
 		}
 		return "", err
 	}
-	otherQueue := "open"
-	if currentQueue == "open" {
-		otherQueue = "review"
-	}
-	active, err = client.ActiveClaims(ctx, otherQueue, nil, 1)
+	active, err = client.ActiveClaims(ctx, "review", 1)
 	if err != nil || len(active.Items) == 0 {
 		return "", err
 	}
 	return active.Items[0].ID, nil
 }
 
-func boundedReady(parent context.Context, client steerClient, queue string) (string, error) {
+func boundedReady(parent context.Context, client steerClient, queue string, filters ticketclient.QueueFilters) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, steerOperationTimeout)
 	defer cancel()
-	frontier, err := client.ReadyFrontier(ctx, queue, nil, 1)
+	frontier, err := client.ReadyFrontier(ctx, queue, filters, 1)
 	if err != nil || len(frontier.Items) == 0 {
 		return "", err
 	}

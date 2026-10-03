@@ -19,7 +19,7 @@ import (
 func TestContextTelemetrySummaryShowsKnownAndStaleValues(t *testing.T) {
 	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	telemetry := contextheadroom.Telemetry{Known: true, Used: 800, Window: 1000, Remaining: 200, ObservedAt: now.Add(-time.Hour)}
-	if got := contextTelemetrySummary(telemetry, now); got != "known used=800 window=1000 remaining=200 observed_at=2026-09-23T11:00:00Z" {
+	if got := contextTelemetrySummary(telemetry, now); got != "known used=800 window=1000 remaining=200 observed_at="+telemetry.ObservedAt.Local().Format(time.RFC3339) {
 		t.Fatalf("known telemetry summary = %q", got)
 	}
 	if got := contextTelemetrySummary(telemetry, now.Add(25*time.Hour)); !strings.HasPrefix(got, "stale used=800 window=1000 remaining=200") {
@@ -27,6 +27,19 @@ func TestContextTelemetrySummaryShowsKnownAndStaleValues(t *testing.T) {
 	}
 	if got := contextTelemetrySummary(contextheadroom.Telemetry{}, now); got != "unknown" {
 		t.Fatalf("unknown telemetry summary = %q", got)
+	}
+}
+
+func TestContextTelemetrySummaryUsesLocalTimestampAcrossDateBoundary(t *testing.T) {
+	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	observedAt := time.Date(2026, 9, 28, 1, 30, 0, 0, time.UTC)
+	telemetry := contextheadroom.Telemetry{Known: true, Used: 800, Window: 1000, Remaining: 200, ObservedAt: observedAt}
+	now := observedAt.Add(time.Hour)
+	if got, want := contextTelemetrySummary(telemetry, now), "known used=800 window=1000 remaining=200 observed_at=2026-09-27T18:30:00-07:00"; got != want {
+		t.Fatalf("known local telemetry summary = %q, want %q", got, want)
+	}
+	if got := contextTelemetrySummary(telemetry, now.Add(25*time.Hour)); !strings.HasPrefix(got, "stale used=800 window=1000 remaining=200 observed_at=") {
+		t.Fatalf("local timestamp change affected stale classification: %q", got)
 	}
 }
 

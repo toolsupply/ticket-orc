@@ -347,7 +347,9 @@ func TestServerPublishesAuthenticatedOrderedSSEEventsAndHeartbeat(t *testing.T) 
 	}
 	defer server.Close()
 	endpoint := server.Endpoint()
-	request, err := http.NewRequest(http.MethodGet, endpoint.CapabilityURL()+"/v1/events", nil)
+	requestContext, cancelRequest := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRequest()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, endpoint.CapabilityURL()+"/v1/events", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,52 +362,47 @@ func TestServerPublishesAuthenticatedOrderedSSEEventsAndHeartbeat(t *testing.T) 
 		t.Fatalf("events response status=%d headers=%v", response.StatusCode, response.Header)
 	}
 	reader := bufio.NewReader(response.Body)
-	line, err := reader.ReadString('\n')
-	if err != nil || line != ": connected\n" {
-		t.Fatalf("connected line=%q err=%v", line, err)
+	readFrame := func() string {
+		t.Helper()
+		var frame strings.Builder
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			frame.WriteString(line)
+			if line == "\n" {
+				return frame.String()
+			}
+		}
+	}
+	if got, want := readFrame(), "id: 0\nevent: stream.sync\ndata: {\"seq\":0,\"type\":\"stream.sync\"}\n\n"; got != want {
+		t.Fatalf("initial SSE frame = %q, want %q", got, want)
 	}
 	server.PublishEvent(Event{Type: "worker.state", Worker: "coder", State: "running"})
-	var eventLines []string
-	for len(eventLines) < 3 {
-		line, err = reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.HasPrefix(line, "id: ") || strings.HasPrefix(line, "event: ") || strings.HasPrefix(line, "data: ") || strings.HasPrefix(line, ": heartbeat") {
-			eventLines = append(eventLines, strings.TrimSpace(line))
-		}
-	}
-	if !strings.Contains(strings.Join(eventLines, "\n"), "id: 1") || !strings.Contains(strings.Join(eventLines, "\n"), "worker.state") {
-		t.Fatalf("SSE event lines = %#v", eventLines)
-	}
+	var eventFrame string
 	for {
-		line, err = reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\n" {
+		eventFrame = readFrame()
+		if !strings.HasPrefix(eventFrame, ": heartbeat") {
 			break
 		}
 	}
-	server.PublishEvent(Event{Type: "worker.state", Worker: "coder", State: "running"})
-	var secondLines []string
-	for {
-		line, err = reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		secondLines = append(secondLines, strings.TrimSpace(line))
-		if line == "\n" {
-			break
-		}
+	if want := "id: 1\nevent: worker.state\ndata: {\"seq\":1,\"type\":\"worker.state\",\"worker\":\"coder\",\"state\":\"running\"}\n\n"; eventFrame != want {
+		t.Fatalf("first domain SSE frame = %q, want %q", eventFrame, want)
 	}
-	secondEvent := strings.Join(secondLines, "\n")
+	server.PublishEvent(Event{Type: "worker.state", Worker: "coder", State: "running"})
+	secondEvent := readFrame()
 	if !strings.Contains(secondEvent, "id: 2") || !strings.Contains(secondEvent, `"state":"running"`) {
 		t.Fatalf("second SSE event = %q", secondEvent)
 	}
 	for _, forbidden := range []string{"steer prompt", "queue target", endpoint.EndpointKey, "raw transport error"} {
 		if strings.Contains(secondEvent, forbidden) {
 			t.Fatalf("second SSE event leaked %q: %q", forbidden, secondEvent)
+		}
+	}
+	for {
+		if frame := readFrame(); strings.HasPrefix(frame, ": heartbeat\n") {
+			break
 		}
 	}
 }
@@ -529,6 +526,113 @@ func TestMutationContextIgnoresRequestCancellationHonorsDeadlineAndShutdown(t *t
 	case <-mutation.Done():
 	case <-time.After(time.Second):
 		t.Fatal("mutation was not canceled by daemon shutdown")
+	}
+}
+
+func TestServerInstanceIDIsIndependentOfEndpointKeyAndListener(t *testing.T) {
+	const instanceID = "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"
+	const version = "0.1.1"
+	stateDir := t.TempDir()
+	firstReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstReservation.Close()
+	secondReservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondReservation.Close()
+	firstPort := firstReservation.Addr().(*net.TCPAddr).Port
+	secondPort := secondReservation.Addr().(*net.TCPAddr).Port
+	start := func(endpointKey string, port int) (*Server, Endpoint) {
+		t.Helper()
+		server, err := NewServer(Config{
+			StateDir:      stateDir,
+			InstanceID:    instanceID,
+			EndpointKey:   endpointKey,
+			ListenAddress: "127.0.0.1",
+			Port:          port,
+			Version:       version,
+			Status: func() Status {
+				return Status{InstanceID: "callback-must-not-override-config"}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := server.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				t.Errorf("shutdown test server: %v", err)
+			}
+		})
+		endpointJSON, err := os.ReadFile(EndpointPath(stateDir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(endpointJSON), `"instance_id":"`+instanceID+`"`) || !strings.Contains(string(endpointJSON), `"endpoint_key":"`+endpointKey+`"`) {
+			t.Fatalf("endpoint JSON = %s, want configured instance ID and endpoint key", endpointJSON)
+		}
+		request, err := http.NewRequest(http.MethodGet, server.Endpoint().CapabilityURL()+"/v1/status", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		statusJSON, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status Status
+		if response.StatusCode != http.StatusOK || json.Unmarshal(statusJSON, &status) != nil {
+			t.Fatalf("status response=%d JSON=%s", response.StatusCode, statusJSON)
+		}
+		if status.InstanceID != instanceID || status.Version != version ||
+			!strings.Contains(string(statusJSON), `"instance_id":"`+instanceID+`"`) ||
+			!strings.Contains(string(statusJSON), `"version":"`+version+`"`) {
+			t.Fatalf("status JSON = %s, want configured instance %q and version %q", statusJSON, instanceID, version)
+		}
+		if strings.Contains(string(statusJSON), endpointKey) {
+			t.Fatalf("status JSON leaked endpoint key: %s", statusJSON)
+		}
+		return server, server.Endpoint()
+	}
+	shutdown := func(server *Server) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := firstReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first, firstEndpoint := start(testEndpointKey, firstPort)
+	shutdown(first)
+	secondKey, err := GenerateEndpointKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secondReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, secondEndpoint := start(secondKey, secondPort)
+	defer shutdown(second)
+	if firstEndpoint.InstanceID != secondEndpoint.InstanceID || firstEndpoint.InstanceID != instanceID {
+		t.Fatalf("instance IDs across restart = %q, %q; want %q", firstEndpoint.InstanceID, secondEndpoint.InstanceID, instanceID)
+	}
+	if firstEndpoint.EndpointKey == secondEndpoint.EndpointKey || firstEndpoint.Port == secondEndpoint.Port {
+		t.Fatalf("instance ID test did not vary endpoint settings: first=%#v second=%#v", firstEndpoint, secondEndpoint)
 	}
 }
 

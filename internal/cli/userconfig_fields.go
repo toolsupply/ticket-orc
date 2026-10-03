@@ -82,7 +82,7 @@ func validateConfigJSONFields(data []byte) error {
 }
 
 var defaultConfigFields = configFieldSet("required_skills", "harness", "model", "reasoning", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "review_completion", "ticket_prompt", "working_dir", "repository", "ticket", "output", "codex", "pi", "claude")
-var roleConfigFields = configFieldSet("ticket_queue", "nudge_prompt", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
+var roleConfigFields = configFieldSet("ticket_queue", "ticket_tags", "nudge_prompt", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
 var workerConfigFields = configFieldSet("role", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
 
 func configFieldSet(fields ...string) map[string]struct{} {

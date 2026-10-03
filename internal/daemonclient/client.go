@@ -129,7 +129,13 @@ func NewWithHTTPClient(stateDir string, client *http.Client) (*Client, error) {
 func (c *Client) Status(ctx context.Context) (daemon.Status, error) {
 	var status daemon.Status
 	err := c.do(ctx, http.MethodGet, "/v1/status", nil, &status)
-	return status, err
+	if err != nil {
+		return daemon.Status{}, err
+	}
+	if c.endpoint.InstanceID != "" && status.InstanceID != "" && c.endpoint.InstanceID != status.InstanceID {
+		return daemon.Status{}, &Error{Kind: ErrorProtocol, Message: "daemon status instance ID does not match endpoint"}
+	}
+	return status, nil
 }
 
 func (c *Client) Workers(ctx context.Context) ([]daemon.WorkerStatus, error) {
@@ -148,6 +154,20 @@ func (c *Client) Repositories(ctx context.Context) ([]daemon.RepositoryStatus, e
 	}
 	err := c.do(ctx, http.MethodGet, "/v1/repositories", nil, &response)
 	return response.Repositories, err
+}
+
+// Groups returns the daemon's bounded public projection of configured groups.
+func (c *Client) Groups(ctx context.Context) ([]daemon.GroupStatus, error) {
+	var response struct {
+		Groups []daemon.GroupStatus `json:"groups"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/groups", nil, &response); err != nil {
+		return nil, err
+	}
+	if response.Groups == nil {
+		return []daemon.GroupStatus{}, nil
+	}
+	return response.Groups, nil
 }
 
 // Repository returns one configured repository by its authoritative

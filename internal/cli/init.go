@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/toolsupply/ticket-orc/internal/state"
 )
 
 func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
@@ -71,12 +74,24 @@ func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 	}
 	data = append(data, '\n')
 	configPath := filepath.Join(dir, instanceConfigFileName)
+	var runtimeGuard state.Lock
 	if !force {
 		if _, err := os.Lstat(configPath); err == nil {
 			fmt.Fprintf(stderr, "error: config already exists: %s (use --force to overwrite)\n", configPath)
 			return 1
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(stderr, "error: inspect config path %s: %v\n", configPath, err)
+			return 1
+		}
+	} else {
+		runtimeGuard, err = acquireRuntimeGuard(context.Background(), initRuntimeResetGuardRoot(dir, configPath))
+		if err != nil {
+			fmt.Fprintf(stderr, "error: acquire Orc instance reset guard: %v\n", err)
+			return 1
+		}
+		defer runtimeGuard.Release()
+		if err := resetInitRuntime(dir, configPath); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
 	}
@@ -125,12 +140,16 @@ func resolveInitInstanceDir(cwd string, global bool, lookupEnv envLookup) (strin
 }
 
 const initGitignore = `/.local/
+/.local.guard/
+`
+
+const previousInitGitignore = `/.local/
 `
 
 func writeInitGitignore(dir string) error {
 	path := filepath.Join(dir, ".gitignore")
 	if _, err := os.Lstat(path); err == nil {
-		return nil
+		return upgradeInitGitignore(dir)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect Orc ignore file %s: %w", path, err)
 	}
@@ -168,6 +187,28 @@ func writeInitGitignore(dir string) error {
 	}
 	if err := verifyInstanceFile(path, 0o600); err != nil {
 		return fmt.Errorf("verify Orc ignore file %s: %w", path, err)
+	}
+	return nil
+}
+
+func upgradeInitGitignore(dir string) error {
+	path := filepath.Join(dir, ".gitignore")
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) || err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Orc ignore file %s: %w", path, err)
+	}
+	data, err := os.ReadFile(path)
+	if err == nil && string(data) != previousInitGitignore {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read Orc ignore file %s: %w", path, err)
+	}
+	if err := state.WriteAtomicMode(path, []byte(initGitignore), 0o600); err != nil {
+		return fmt.Errorf("update Orc ignore file %s: %w", path, err)
 	}
 	return nil
 }

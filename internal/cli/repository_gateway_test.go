@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -53,6 +55,14 @@ func TestRepositoryGatewayLookupUsesTicketIDOnly(t *testing.T) {
 	}
 	if _, err := manager.repositoryTarget("project"); err == nil {
 		t.Fatal("repository key was accepted as an API identity")
+	}
+}
+
+func TestRepositoryGatewayAdvertisesConfiguredTicketBodyBudget(t *testing.T) {
+	manager := &workerManager{}
+	gateway := manager.repositoryGateway()
+	if gateway.GetTicket == nil || gateway.TicketBodyBudgetBytes != ticketclient.RepositoryDetailBodyBudgetBytes {
+		t.Fatalf("repository gateway detail callback=%v body budget=%d, want configured budget %d", gateway.GetTicket != nil, gateway.TicketBodyBudgetBytes, ticketclient.RepositoryDetailBodyBudgetBytes)
 	}
 }
 
@@ -153,5 +163,51 @@ func TestRepositoryTicketDetailFailureIsSafeAndHasNoPartialResult(t *testing.T) 
 	}
 	if strings.Contains(err.Error(), "private raw command output") || strings.Contains(err.Error(), "/private/TASK.md") {
 		t.Fatalf("error leaked Ticket output: %v", err)
+	}
+}
+
+func TestTicketTransportFailureDoesNotAssertMutationWasNotApplied(t *testing.T) {
+	uncertain := repositoryMutationFailure(&ticketclient.TransportError{Category: "read response"})
+	mutationErr, ok := uncertain.(*daemon.RepositoryMutationError)
+	if !ok || mutationErr.AppliedKnown {
+		t.Fatalf("uncertain mutation error = %#v, want unknown application certainty", uncertain)
+	}
+	endpointKey, err := daemon.GenerateEndpointKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := daemon.NewServer(daemon.Config{
+		EndpointKey: endpointKey,
+		StateDir:    t.TempDir(),
+		RepositoryGateway: daemon.RepositoryGateway{CreateTicket: func(context.Context, string, daemon.RepositoryTicketCreateRequest) (daemon.RepositoryTicketMutation, error) {
+			return daemon.RepositoryTicketMutation{}, uncertain
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := server.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodPost, server.Endpoint().CapabilityURL()+"/v1/repositories/"+joinTestRepositoryID+"/tickets", strings.NewReader(`{"actor":"ui","title":"example"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	want := `{"error":{"code":"repository_mutation_failed","message":"Ticket repository mutation failed"}}` + "\n"
+	if response.StatusCode != http.StatusBadGateway || string(body) != want {
+		t.Fatalf("status=%d response=%s want status=%d body=%s", response.StatusCode, body, http.StatusBadGateway, want)
 	}
 }

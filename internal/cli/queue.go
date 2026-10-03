@@ -35,6 +35,7 @@ type queueForecastOwner struct {
 
 	repositoryPath string
 	deliveryCode   string
+	filters        ticketclient.QueueFilters
 }
 
 func executeQueue(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
@@ -69,6 +70,10 @@ func executeQueue(args []string, stdout, stderr io.Writer, lookupEnv envLookup) 
 	}
 	loaded, err := loadInvocationConfig(values, lookupEnv)
 	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := ensureLoadedRuntime(loaded); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
@@ -128,13 +133,24 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 	}
 	owners := make([]queueForecastOwner, 0, len(status.Workers)+len(status.Steer))
 	for _, worker := range status.Workers {
-		roleName := worker.Role
-		if configured, ok := loaded.Config.Workers[worker.Name]; ok {
-			roleName = configured.Role
+		roleName, queue := worker.EffectiveRoleName, worker.EffectiveTicketQueue
+		if roleName == "" || queue == "" {
+			// Older status snapshots lack effective policy. Resolve them from the
+			// desired config only as a compatibility fallback.
+			if configured, ok := loaded.Config.Workers[worker.Name]; ok {
+				if roleName == "" {
+					roleName = configured.Role
+				}
+			}
+			if roleName == "" {
+				roleName = worker.Role
+			}
+			if role, ok := loaded.Config.Roles[roleName]; ok && queue == "" {
+				queue = role.TicketQueue
+			}
 		}
-		role, ok := loaded.Config.Roles[roleName]
-		if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
-			return nil, fmt.Errorf("managed worker %q has unsupported role or queue %q", worker.Name, roleName)
+		if roleName == "" || (queue != "open" && queue != "review") {
+			return nil, fmt.Errorf("managed worker %q has unsupported role or queue %q/%q", worker.Name, roleName, queue)
 		}
 		repoID, repoPath, repoName := worker.RepositoryID, worker.RepositoryPath, worker.RepositoryName
 		if repoID == "" && worker.RepositoryKey != "" {
@@ -145,29 +161,42 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 		if repoID == "" || repoPath == "" || worker.TicketActor == "" {
 			continue
 		}
+		filters, err := managedForecastFilters(queue, worker)
+		if err != nil {
+			return nil, fmt.Errorf("resolve effective Ticket filters for managed worker %q: %w", worker.Name, err)
+		}
 		owners = append(owners, queueForecastOwner{
 			Owner: worker.Name, Kind: "managed", RepositoryID: repoID,
 			Repository: repositoryDisplayLabel(repoName, repoPath, repoID), Role: roleName,
-			Actor: worker.TicketActor, Queue: role.TicketQueue, State: worker.State,
+			Actor: worker.TicketActor, Queue: queue, State: worker.State,
 			Reason: managedForecastReason(worker), Active: []ticketclient.Ticket{}, repositoryPath: repoPath,
+			filters: filters,
 		})
 	}
 	for _, session := range status.Steer {
 		registration, ok := registrationByKey[session.RepositoryID+"\x00"+session.Actor]
-		if !ok || registration.ThreadID != session.Session {
+		if !ok || registration.Harness != session.Harness || registration.SessionID != session.Session {
 			continue
 		}
-		role, ok := loaded.Config.Roles[registration.Role]
-		if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
-			return nil, fmt.Errorf("steer session %q has unsupported role or queue %q", session.Actor, registration.Role)
+		queue := session.EffectiveTicketQueue
+		filters := ticketclient.QueueFilters{
+			Tags:        append([]string(nil), session.EffectiveTicketTags...),
+			WithoutTags: append([]string(nil), session.EffectiveReviewSkipTags...),
+		}
+		if queue != "" && queue != "open" && queue != "review" {
+			return nil, fmt.Errorf("steer session %q has unsupported role or queue %q/%q", session.Actor, registration.Role, queue)
 		}
 		ownerName := repositoryDisplayLabel(registration.RepositoryName, registration.RepositoryPath, registration.RepositoryID) + "/" + session.Actor
 		owner := queueForecastOwner{
 			Owner: ownerName, Kind: "steer", RepositoryID: registration.RepositoryID,
 			Repository: repositoryDisplayLabel(registration.RepositoryName, registration.RepositoryPath, registration.RepositoryID),
-			Role:       registration.Role, Actor: session.Actor, Session: session.Session, Queue: role.TicketQueue,
+			Role:       registration.Role, Actor: session.Actor, Session: session.Session, Queue: queue,
 			State: session.State, Reason: steerForecastReason(session), Delivery: session.State,
 			Active: []ticketclient.Ticket{}, repositoryPath: registration.RepositoryPath, deliveryCode: session.Code,
+			filters: filters,
+		}
+		if queue == "" {
+			owner.Reason = "role policy unavailable"
 		}
 		if session.ManagedOwner != "" {
 			owner.Reason = "actor is owned by managed worker " + session.ManagedOwner
@@ -189,14 +218,16 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			// avoid displaying its active claim twice under the rejected session.
 			continue
 		}
-		identity := currentTicketIdentity{Actor: owner.Actor, RepositoryID: owner.RepositoryID, RepositoryPath: owner.repositoryPath, RepositoryName: owner.Repository}
+		identity := currentTicketIdentity{ticketRoutingIdentity: ticketRoutingIdentity{
+			Actor: owner.Actor, RepositoryID: owner.RepositoryID, RepositoryPath: owner.repositoryPath, RepositoryName: owner.Repository,
+		}}
 		client, err := open(identity)
 		if err != nil {
 			return nil, fmt.Errorf("open Ticket reader for %s/%s: %w", owner.Repository, owner.Actor, err)
 		}
-		activeOpen, err := client.ActiveClaims(ctx, "open", nil, localTicketLimit)
+		activeOpen, err := client.ActiveClaims(ctx, "open", localTicketLimit)
 		if err == nil {
-			activeReview, reviewErr := client.ActiveClaims(ctx, "review", nil, localTicketLimit)
+			activeReview, reviewErr := client.ActiveClaims(ctx, "review", localTicketLimit)
 			err = reviewErr
 			if err == nil {
 				owner.Active = append(owner.Active, activeOpen.Items...)
@@ -207,14 +238,14 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			_ = client.Close()
 			return nil, fmt.Errorf("read active claims for %s/%s: %w", owner.Repository, owner.Actor, err)
 		}
-		frontierKey := owner.RepositoryID + "\x00" + owner.Queue
+		if owner.Queue != "open" && owner.Queue != "review" {
+			_ = client.Close()
+			continue
+		}
+		frontierKey := queueForecastFrontierKey(*owner)
 		frontier, found := frontiers[frontierKey]
 		if !found {
-			var tags []string
-			if owner.Queue == "review" {
-				tags = append(tags, loaded.Config.Review.SkipTags...)
-			}
-			frontier, err = client.ReadyFrontier(ctx, owner.Queue, tags, localTicketLimit)
+			frontier, err = client.ReadyFrontier(ctx, owner.Queue, owner.filters, localTicketLimit)
 			if err == nil {
 				frontiers[frontierKey] = frontier
 			}
@@ -224,24 +255,37 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			return nil, fmt.Errorf("read %s ready frontier for %s: %w", owner.Queue, owner.Repository, err)
 		}
 	}
-	// Ticket supplies the ordered ready frontier. Assign each item once in
-	// stable owner order so roles sharing a queue never claim the same item in
-	// the forecast.
+	// Ticket supplies each selector's ordered ready frontier. Assign IDs once
+	// per repository/queue in stable owner order because selector frontiers can
+	// overlap.
 	frontierOffsets := make(map[string]int)
+	assignedByQueue := make(map[string]map[string]struct{})
 	for index := range owners {
 		owner := &owners[index]
 		if owner.Reason != "" && owner.Reason != "already notified" {
 			continue
 		}
-		key := owner.RepositoryID + "\x00" + owner.Queue
+		key := queueForecastFrontierKey(*owner)
 		frontier := frontiers[key]
 		offset := frontierOffsets[key]
-		if offset < len(frontier.Items) {
-			item := frontier.Items[offset]
-			owner.Next = &item
-			frontierOffsets[key] = offset + 1
+		queueKey := queueForecastDedupKey(*owner)
+		assigned := assignedByQueue[queueKey]
+		if assigned == nil {
+			assigned = make(map[string]struct{})
+			assignedByQueue[queueKey] = assigned
 		}
-		owner.MoreReady = frontier.More || frontierOffsets[key] < len(frontier.Items)
+		for offset < len(frontier.Items) {
+			item := frontier.Items[offset]
+			offset++
+			if _, exists := assigned[item.ID]; exists {
+				continue
+			}
+			owner.Next = &item
+			assigned[item.ID] = struct{}{}
+			break
+		}
+		frontierOffsets[key] = offset
+		owner.MoreReady = frontier.More || offset < len(frontier.Items)
 		if owner.Reason == "" {
 			if owner.Kind == "steer" {
 				action := orc.AdvanceSteerDelivery(orc.SteerDeliveryState(owner.Delivery), orc.Evidence{Active: len(owner.Active) > 0, Ready: owner.Next != nil})
@@ -255,6 +299,27 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 		}
 	}
 	return owners, nil
+}
+
+func managedForecastFilters(queue string, worker daemon.WorkerStatus) (ticketclient.QueueFilters, error) {
+	filters := ticketclient.QueueFilters{Tags: append([]string(nil), worker.EffectiveTicketTags...)}
+	if queue == "review" {
+		filters.WithoutTags = append([]string(nil), worker.EffectiveReviewSkipTags...)
+	}
+	return ticketclient.CanonicalQueueFilters(filters)
+}
+
+func queueForecastFrontierKey(owner queueForecastOwner) string {
+	filters, err := ticketclient.CanonicalQueueFilters(owner.filters)
+	if err != nil {
+		filters = owner.filters
+	}
+	encoded, _ := json.Marshal(filters)
+	return owner.RepositoryID + "\x00" + owner.Queue + "\x00" + string(encoded)
+}
+
+func queueForecastDedupKey(owner queueForecastOwner) string {
+	return owner.RepositoryID + "\x00" + owner.Queue
 }
 
 func managedForecastReason(worker daemon.WorkerStatus) string {

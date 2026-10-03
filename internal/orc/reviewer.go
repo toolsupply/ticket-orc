@@ -12,10 +12,6 @@ import (
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
-type ReviewerTagFilter interface {
-	WaitAndClaimReviewWithoutTags(context.Context, []string) (ticketclient.Ticket, error)
-}
-
 // ReviewerConfig contains policy and process settings for one reviewer loop.
 type ReviewerConfig struct {
 	WorkerName                 string
@@ -30,7 +26,7 @@ type ReviewerConfig struct {
 	StateDir                   string
 	OutputMode                 string
 	ReviewCompletion           string
-	ReviewSkipTags             []string
+	QueueFilters               ticketclient.QueueFilters
 	CodexSandbox               string
 	PiProvider                 string
 	ClaudePermissionMode       string
@@ -42,8 +38,9 @@ type ReviewerConfig struct {
 }
 
 type ReviewerTickets interface {
-	WaitAndClaimReview(context.Context) (ticketclient.Ticket, error)
+	WaitAndClaimReview(context.Context, ticketclient.QueueFilters) (ticketclient.Ticket, error)
 	Show(context.Context, string) (ticketclient.Ticket, error)
+	Release(context.Context, string) (ticketclient.Transition, error)
 	CloseTicket(context.Context, string) (ticketclient.Transition, error)
 }
 
@@ -107,15 +104,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var claimed ticketclient.Ticket
-		var err error
-		if filtered, ok := tickets.(ReviewerTagFilter); ok && len(config.ReviewSkipTags) > 0 {
-			claimed, err = filtered.WaitAndClaimReviewWithoutTags(ctx, config.ReviewSkipTags)
-		} else if len(config.ReviewSkipTags) > 0 {
-			return fmt.Errorf("reviewer Ticket client does not support review skip tags")
-		} else {
-			claimed, err = tickets.WaitAndClaimReview(ctx)
-		}
+		claimed, err := tickets.WaitAndClaimReview(ctx, config.QueueFilters)
 		if err != nil {
 			return &WorkWaitError{Role: "reviewer", Cause: err}
 		}
@@ -137,7 +126,18 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		observed, runErr := tickets.Show(ctx, claimed.ID)
 		turnErr := errors.Join(turn.err, runErr)
 		if runErr != nil {
+			if turn.err != nil && turn.result.SessionID == "" && ctx.Err() == nil {
+				logReviewer(config.Diagnostics, "%s: automatic claim recovery skipped because Ticket state could not be verified", claimed.ID)
+			}
 			return turnErr
+		}
+		if attempted, released, recoveryErr := releaseFailedStartupClaim(ctx, tickets, claimed.ID, config.Actor, "review", turn.result, turn.err, observed); attempted {
+			if released {
+				logReviewer(config.Diagnostics, "%s: failed before session startup; released unchanged review claim", claimed.ID)
+			} else {
+				logReviewer(config.Diagnostics, "%s: automatic claim recovery failed after pre-session harness failure", claimed.ID)
+			}
+			return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, recoveryErr)
 		}
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "reviewer", State: observed.State, Ticket: observed.ID})
 		lifecycleErr := finishReviewerLifecycle(ctx, config, tickets, cleanup, orchestrationState, observed)

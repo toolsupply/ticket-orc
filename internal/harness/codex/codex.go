@@ -203,7 +203,7 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 	if err != nil {
 		return harness.RunResult{}, err
 	}
-	args := []string{"exec", "--json"}
+	args := []string{"exec", "--skip-git-repo-check", "--json"}
 	if request.Model != "" {
 		args = append(args, "-m", request.Model)
 	}

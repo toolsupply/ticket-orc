@@ -136,7 +136,7 @@ func TestRoleConfigResolvesWorkerPrecedence(t *testing.T) {
 	if config.WorkerName != "worker-a" || config.Actor != "environment-actor" || config.Model != "cli-model" || config.Reasoning != "high" || config.MaxBounces != 5 || config.SessionPolicy != SessionPolicyFresh || config.SessionCleanup != CleanupKeep || config.Output != OutputQuiet {
 		t.Fatalf("resolved config = %#v", config)
 	}
-	if want := filepath.Join(filepath.Dir(path), ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"); config.StateDir != want {
+	if want := filepath.Join(filepath.Dir(path), ".local"); config.StateDir != want {
 		t.Fatalf("state dir = %q, want %q", config.StateDir, want)
 	}
 }
@@ -388,18 +388,33 @@ func TestCoderReviewSkipTagResolutionAndFinalGate(t *testing.T) {
 	writeConfigFixture(t, path, `{
   "version": 1,
   "review": {"skip_tags":["trivial","no-review"]},
-  "roles": {"reviewer":{"review_completion":"signoff"}},
+  "roles": {"coder":{"ticket_tags":["urgent","backend"]},"reviewer":{"review_completion":"signoff"}},
   "workers": {"coder":{"role":"coder","actor":"coder"}}
 }`)
 	config, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "coder"}, emptyEnv)
 	if err != nil {
 		t.Fatalf("parseRoleConfig: %v", err)
 	}
-	if config.ReviewSkipTags != "trivial\x1fno-review" {
+	if config.ReviewSkipTags != "no-review\x1ftrivial" {
 		t.Fatalf("review skip tags = %q", config.ReviewSkipTags)
+	}
+	if config.TicketTags != "backend\x1furgent" {
+		t.Fatalf("resolved role ticket tags = %q", config.TicketTags)
 	}
 	if config.ReviewFinalGate != ReviewCompletionSignoff {
 		t.Fatalf("review final gate = %q, want signoff", config.ReviewFinalGate)
+	}
+}
+
+func TestResolvedWorkerCarriesConfiguredRoleNameAndQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"roles":{"backend":{"ticket_queue":"open","nudge_prompt":"work"}},"workers":{"worker":{"role":"backend","actor":"worker"}}}`)
+	config, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "worker"}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Role != RoleCoder || config.RoleName != "backend" || config.TicketQueue != "open" {
+		t.Fatalf("resolved worker policy role=%q name=%q queue=%q, want coder/backend/open", config.Role, config.RoleName, config.TicketQueue)
 	}
 }
 

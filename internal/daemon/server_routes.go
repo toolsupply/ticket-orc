@@ -10,6 +10,7 @@ func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/workers", s.handleWorkers)
+	mux.HandleFunc("/v1/groups", s.handleGroups)
 	mux.HandleFunc("/v1/repositories", s.handleRepositories)
 	mux.HandleFunc("/v1/repositories/", s.handleRepositories)
 	mux.HandleFunc("/v1/events", s.handleEvents)

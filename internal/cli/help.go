@@ -28,7 +28,7 @@ Worker management:
   coder	Run one coder role
   reviewer	Run one reviewer role
   run	Run selected workers as a foreground supervisor
-  doctor	Diagnose and explicitly recover all configured workers
+  doctor	Inspect configuration and local runtime health
   status	Show daemon status
   worker	Control one daemon worker
   group	Control a daemon worker group
@@ -111,18 +111,23 @@ Create a minimal instance in .ticket-orc under the current directory. TICKET_ORC
 selects another directory for this command; relative paths are based on the
 current directory. Use --global to create the current user's ~/.ticket-orc,
 even when TICKET_ORC is set. Existing config files are preserved unless
---force is supplied. The generated .gitignore keeps mutable instance data
-untracked while allowing config.json to be tracked. The generated reviewer
-role closes accepted reviews; hand-written configurations keep the signoff
-default unless they set review_completion explicitly.
+--force is supplied. Force reset refuses a running instance, removes its
+owned runtime state, and creates a fresh config ID; an external local_dir is
+removed only when its ownership marker matches the existing config. The
+generated .gitignore keeps mutable instance data untracked while allowing
+config.json to be tracked. The generated reviewer role closes accepted
+reviews; hand-written configurations keep the signoff default unless they set
+review_completion explicitly.
 
 `
 
 const joinHelp = `
 Usage:
-  ticket-orc join [role] [-c|--config FILE]
+  ticket-orc join [role] [--harness NAME --session ID --transport spool] [--json] [-c|--config FILE]
 
-Register the current Ticket actor and Codex session with this Orc instance.
+Register the current Ticket actor and interactive session with this Orc instance.
+Without endpoint flags, the current Codex session is discovered automatically.
+Supply all endpoint flags together to register an extension-backed session.
 ROLE may be omitted. The role is selected from, in order:
   1. explicit ROLE
   2. TICKET_ORC_ROLE
@@ -133,25 +138,27 @@ ROLE may be omitted. The role is selected from, in order:
 
 const leaveHelp = `
 Usage:
-  ticket-orc leave [-c|--config FILE]
+  ticket-orc leave [--harness NAME --session ID --transport spool --registration-id ID --incarnation-id ID] [--json] [-c|--config FILE]
 
-Remove the registration for the current Ticket repository, actor, and Codex
-session. A missing or replaced registration is harmless.
+Remove the registration for the current Ticket repository, actor, and session.
+Explicit endpoint mode requires the exact registration and incarnation IDs
+returned by join. A stale or replaced registration is harmless.
 
 `
 
 const whoamiHelp = `
 Usage:
-  ticket-orc whoami [-j] [-c|--config FILE]
+  ticket-orc whoami [-j] [--harness NAME --session ID --transport spool] [-c|--config FILE]
 
-Show the current Orc instance, Ticket repository and actor, Codex session, and
-whether this session is registered. This command does not use HTTP.
+Show the current Orc instance, Ticket repository and actor, session, and
+whether this session is registered. Without endpoint flags, Codex is discovered
+automatically. This command does not use HTTP.
 
 `
 
 const nextHelp = `
 Usage:
-  ticket-orc next [-j] [-c|--config FILE]
+  ticket-orc next [-j] [--harness NAME --session ID --transport spool] [-c|--config FILE]
 
 Show the current joined session's active Ticket claim, or inspect Ticket's
 ready frontier without claiming or notifying a worker.
@@ -227,6 +234,9 @@ Show the current session's ready work, active claim, and notification status.
 
 Options:
   --output MODE             compact|quiet|json (json emits structured state)
+  --harness NAME            Select a registered extension-backed session
+  --session ID              Pair with --harness and --transport
+  --transport spool         Select the generic filesystem spool endpoint
   -c, --config FILE          Configuration file (default: TICKET_ORC/config.json, then ./.ticket-orc/config.json, then ~/.ticket-orc/config.json)
   -h, --help                Show this help
 
@@ -289,7 +299,7 @@ the local host.
 
 The top-level local_dir config field optionally selects the exact root for
 Orc-generated runtime data. Relative paths are resolved from the configuration
-file. If omitted, Orc uses .local/<config-id> beside the configuration file.
+file. If omitted, Orc uses .local beside the configuration file.
 
 Worker groups select Orc workers; they do not filter Ticket tickets or tags.
 
@@ -310,14 +320,17 @@ Options:
 const doctorHelp = `
 Usage:
   ticket-orc doctor [--config FILE]
+  ticket-orc doctor --reset-local [--config FILE]
 
-Reload and validate configuration and start every safely recoverable configured
-worker. The doctor pass targets every configured worker and never runs automatically.
-It reports named workers that still need configuration, external target, or
-manual operator action and exits nonzero when any worker is unrecovered.
+Validate the selected configuration and inspect its local runtime without
+starting workers or changing runtime state. Use --reset-local to discard local
+runtime state while preserving config.json and its instance ID. Any currently
+joined steered sessions must run ticket-orc join again after a reset; managed
+workers remain configured.
 
 Options:
   --config FILE     Worker configuration file
+  --reset-local     Remove local runtime state and preserve configuration
   -h, --help        Show this help
 
 `
@@ -328,6 +341,11 @@ Usage:
 
 Validate the complete configuration without claiming tickets, launching a
 harness, contacting Ticket, or changing orchestration state.
+
+Role configuration may set roles.<name>.ticket_tags; every listed tag is
+required. review.skip_tags adds exclusions for review roles. A committed reload
+updates dynamic steering immediately, while running managed workers keep their
+effective selector until restarted through the normal worker lifecycle.
 
 Options:
   --output MODE             compact|quiet|json (default: compact)

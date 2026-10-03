@@ -174,6 +174,18 @@ func TestNestedCommandHelpFormsDescribeCanonicalSyntax(t *testing.T) {
 	}
 }
 
+func TestConfigCheckHelpDescribesRoleTagRouting(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"help", "config", "check"}, &stdout, &stderr, emptyEnv, rejectExecution); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("config check help: code=%d stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{"roles.<name>.ticket_tags", "every listed tag is", "review.skip_tags", "committed reload", "running managed workers"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("config check help omitted %q: %q", want, stdout.String())
+		}
+	}
+}
+
 func TestOptionsHelpPageDocumentsGlobalFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"help", "options"}, &stdout, &stderr, emptyEnv, rejectExecution); code != 0 {
@@ -333,7 +345,8 @@ func TestRoleConfigDefaults(t *testing.T) {
 		SessionPolicy:              SessionPolicyTicket,
 		SessionCleanup:             CleanupDelete,
 		MinimumReuseContextPercent: defaultMinimumReuseContextPercent,
-		StateDir:                   filepath.Join(home, defaultInstanceDirectoryName, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"),
+		StateDir:                   filepath.Join(home, defaultInstanceDirectoryName, ".local"),
+		InstanceID:                 "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa",
 		Output:                     OutputCompact,
 		TicketPrompt:               orc.CoderTicketPromptTemplate,
 	}
@@ -360,7 +373,7 @@ func TestRoleConfigEnvironment(t *testing.T) {
 	}
 	if config.Role != RoleReviewer || config.Actor != "reviewer-1" || config.Model != "gpt-test" ||
 		config.Reasoning != "high" || config.MaxBounces != 9 || config.SessionPolicy != SessionPolicyFresh ||
-		config.SessionCleanup != CleanupArchive || config.StateDir != filepath.Join(home, defaultInstanceDirectoryName, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa") || config.Output != OutputQuiet {
+		config.SessionCleanup != CleanupArchive || config.StateDir != filepath.Join(home, defaultInstanceDirectoryName, ".local") || config.Output != OutputQuiet {
 		t.Fatalf("unexpected config: %#v", config)
 	}
 }
@@ -388,7 +401,7 @@ func TestRoleConfigCLIOverridesEnvironment(t *testing.T) {
 	}
 	if config.Actor != "flag-actor" || config.Model != "flag-model" || config.MaxBounces != 3 ||
 		config.SessionPolicy != SessionPolicyTicket || config.SessionCleanup != CleanupKeep ||
-		config.StateDir != filepath.Join(home, defaultInstanceDirectoryName, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa") || config.Output != OutputJSON || config.Reasoning != "xhigh" {
+		config.StateDir != filepath.Join(home, defaultInstanceDirectoryName, ".local") || config.Output != OutputJSON || config.Reasoning != "xhigh" {
 		t.Fatalf("unexpected config: %#v", config)
 	}
 }
@@ -521,7 +534,7 @@ func TestGCCommandResolvesConfiguration(t *testing.T) {
 	if code != 0 || stderr.Len() != 0 || stdout.String() != "gc complete\n" {
 		t.Fatalf("gc code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
 	}
-	if captured.Worker != "worker" || captured.Actor != "env-actor" || captured.SessionCleanup != CleanupKeep || !captured.CleanupExplicit || captured.StateDir != filepath.Join(root, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa") {
+	if captured.Worker != "worker" || captured.Actor != "env-actor" || captured.SessionCleanup != CleanupKeep || !captured.CleanupExplicit || captured.StateDir != filepath.Join(root, ".local") {
 		t.Fatalf("GC config = %#v", captured)
 	}
 }
@@ -550,7 +563,7 @@ func TestMaintenanceUsesConfigDefaultsAndHigherLayerOverrides(t *testing.T) {
 	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("state code = %d, stderr = %q", code, stderr.String())
 	}
-	if want := filepath.Join(root, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"); stateConfig.StateDir != want {
+	if want := filepath.Join(root, ".local"); stateConfig.StateDir != want {
 		t.Fatalf("state dir = %q, want %q", stateConfig.StateDir, want)
 	}
 
@@ -577,7 +590,7 @@ func TestMaintenanceUsesConfigDefaultsAndHigherLayerOverrides(t *testing.T) {
 	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("gc code = %d, stderr = %q", code, stderr.String())
 	}
-	if gcConfig.Worker != "worker" || gcConfig.Actor != "gc-actor" || gcConfig.SessionCleanup != CleanupKeep || !gcConfig.CleanupExplicit || gcConfig.StateDir != filepath.Join(root, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa") {
+	if gcConfig.Worker != "worker" || gcConfig.Actor != "gc-actor" || gcConfig.SessionCleanup != CleanupKeep || !gcConfig.CleanupExplicit || gcConfig.StateDir != filepath.Join(root, ".local") {
 		t.Fatalf("GC config = %#v", gcConfig)
 	}
 
@@ -601,7 +614,7 @@ func TestMaintenanceUsesConfigDefaultsAndHigherLayerOverrides(t *testing.T) {
 	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("flag gc code = %d, stderr = %q", code, stderr.String())
 	}
-	if flagGC.Worker != "worker" || flagGC.Actor != "gc-actor" || flagGC.SessionCleanup != CleanupDelete || !flagGC.CleanupExplicit || flagGC.StateDir != filepath.Join(root, ".local", "1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa") {
+	if flagGC.Worker != "worker" || flagGC.Actor != "gc-actor" || flagGC.SessionCleanup != CleanupDelete || !flagGC.CleanupExplicit || flagGC.StateDir != filepath.Join(root, ".local") {
 		t.Fatalf("flag GC config = %#v", flagGC)
 	}
 }

@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+const (
+	repositoryTicketDefaultPageSize = 50
+	repositoryTicketMaxPageSize     = 256
+	repositoryTicketMaxSearchBytes  = 256
+)
+
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/repositories")
 	if path == "" || path == "/" {
@@ -232,21 +238,25 @@ func (s *Server) repositoryUpdateOrMutation(w http.ResponseWriter, r *http.Reque
 }
 
 func validRepositoryMutationOperation(operation string) bool {
-	switch operation {
-	case "claim", "release", "open", "hold", "submit", "review", "approve", "close", "reject", "bump":
-		return true
-	default:
-		return false
+	for _, supported := range repositoryMutationOperations() {
+		if operation == supported {
+			return true
+		}
 	}
+	return false
+}
+
+func repositoryMutationOperations() []string {
+	return []string{"claim", "release", "open", "hold", "submit", "review", "approve", "close", "reject", "bump"}
 }
 
 func parseRepositoryTicketQuery(r *http.Request) (RepositoryTicketQuery, error) {
 	query := r.URL.Query()
-	result := RepositoryTicketQuery{Search: strings.TrimSpace(query.Get("q")), Limit: 50}
+	result := RepositoryTicketQuery{Search: strings.TrimSpace(query.Get("q")), Limit: repositoryTicketDefaultPageSize}
 	if result.Search == "" {
 		result.Search = strings.TrimSpace(query.Get("search"))
 	}
-	if len(result.Search) > 256 {
+	if len(result.Search) > repositoryTicketMaxSearchBytes {
 		return RepositoryTicketQuery{}, fmt.Errorf("search expression is too long")
 	}
 	for _, state := range query["state"] {
@@ -289,8 +299,8 @@ func parseRepositoryTicketQuery(r *http.Request) (RepositoryTicketQuery, error) 
 	}
 	if raw := query.Get("limit"); raw != "" {
 		value, parseErr := strconv.Atoi(raw)
-		if parseErr != nil || value < 1 || value > 256 {
-			return RepositoryTicketQuery{}, fmt.Errorf("limit must be between 1 and 256")
+		if parseErr != nil || value < 1 || value > repositoryTicketMaxPageSize {
+			return RepositoryTicketQuery{}, fmt.Errorf("limit must be between 1 and %d", repositoryTicketMaxPageSize)
 		}
 		result.Limit = value
 	}
@@ -349,9 +359,12 @@ func writeRepositoryMutationError(w http.ResponseWriter, err error) {
 		if message == "" {
 			message = "repository mutation failed"
 		}
-		writeJSON(w, status, map[string]any{"error": map[string]any{
-			"code": code, "message": message, "mutation_applied": mutationErr.Applied,
-		}})
+		message = boundedErrorMessage(message)
+		errorBody := map[string]any{"code": code, "message": message}
+		if mutationErr.AppliedKnown {
+			errorBody["mutation_applied"] = mutationErr.Applied
+		}
+		writeJSON(w, status, map[string]any{"error": errorBody})
 		return
 	}
 	var readErr *RepositoryReadError
@@ -368,9 +381,10 @@ func writeRepositoryMutationError(w http.ResponseWriter, err error) {
 		if message == "" {
 			message = "repository mutation failed"
 		}
-		writeJSON(w, status, map[string]any{"error": map[string]any{
-			"code": code, "message": message, "mutation_applied": false,
-		}})
+		// A read error does not establish whether a mutation was applied. Keep
+		// the certainty field absent unless the gateway returned the typed
+		// RepositoryMutationError that carries that information.
+		writeError(w, status, code, message)
 		return
 	}
 	writeError(w, http.StatusBadGateway, "repository_mutation_failed", "repository mutation failed")

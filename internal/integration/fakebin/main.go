@@ -47,7 +47,15 @@ func runClaude() {
 }
 
 func runTicket() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Fprintln(os.Stdout, "ticket 0.2.3 (api 2, storage 3)")
+		return
+	}
 	logPath := os.Getenv("TICKET_ORC_FAKE_TICKET_LOG")
+	if watchArgs := ticketWatchArgs(os.Args[1:]); len(watchArgs) != 0 {
+		runTicketWatch(logPath, watchArgs)
+		return
+	}
 	if len(os.Args) > 1 {
 		args := os.Args[1:]
 		switch {
@@ -127,7 +135,7 @@ func runTicket() {
 		}
 		activeQueue := activeObservationQueue(request.Args)
 		switch {
-		case equalArgs(request.Args, "wait", "--claim"), equalArgs(request.Args, "wait", "review", "--claim"):
+		case ticketClaimQueue(request.Args) != "":
 			if os.Getenv("TICKET_ORC_FAKE_NO_CLAIM") == "1" {
 				_ = encoder.Encode(map[string]any{"error": map[string]any{"code": "queue-empty", "message": "fake queue exhausted"}})
 				continue
@@ -138,7 +146,7 @@ func runTicket() {
 			}
 			claimed = true
 			observedClaimState := claimState
-			if len(request.Args) == 3 && request.Args[1] == "review" && os.Getenv("TICKET_ORC_FAKE_REVIEW_CLAIM_STATE") != "" {
+			if ticketClaimQueue(request.Args) == "review" && os.Getenv("TICKET_ORC_FAKE_REVIEW_CLAIM_STATE") != "" {
 				observedClaimState = os.Getenv("TICKET_ORC_FAKE_REVIEW_CLAIM_STATE")
 			}
 			_ = encoder.Encode(map[string]any{"item": map[string]any{
@@ -195,6 +203,49 @@ func runTicket() {
 	}
 }
 
+func ticketWatchArgs(args []string) []string {
+	for i := range args {
+		if equalArgs(args[i:], "watch", "-j", "--ready") {
+			return args[i:]
+		}
+	}
+	return nil
+}
+
+func runTicketWatch(logPath string, args []string) {
+	appendLine(logPath, strings.Join(args, " "))
+	repositoryID := os.Getenv("TICKET_ORC_FAKE_REPOSITORY_ID")
+	if repositoryID == "" {
+		repository := os.Getenv("TICKET_ORC_FAKE_INFO_PATH")
+		if repository == "" {
+			repository = "/fake/tickets"
+		}
+		repositoryID = fakeRepositoryID(repository)
+	}
+	ticketID := os.Getenv("TICKET_ORC_FAKE_TICKET_ID")
+	encoder := json.NewEncoder(os.Stdout)
+	if err := encoder.Encode(map[string]string{"type": "ready", "repository_id": repositoryID}); err != nil {
+		return
+	}
+	eventPath := os.Getenv("TICKET_ORC_FAKE_WATCH_EVENT_FILE")
+	if eventPath == "" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if _, err := os.Stat(eventPath); err != nil {
+			continue
+		}
+		_ = encoder.Encode(map[string]string{"ticket": ticketID, "event": "edited", "state": "open"})
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+}
+
 func fakeRepositoryID(repository string) string {
 	// Keep fixture identities stable and distinct for repositories that use
 	// different paths, matching Ticket's stable repository ID contract.
@@ -220,10 +271,42 @@ func exactObservationArgs(args []string, command, queue string) bool {
 	if queue == "" {
 		queue = "open"
 	}
-	if command == "ready" {
-		return equalArgs(args, "ready", queue, "--limit", "1", "--fields", "id,title,state,assignee,priority") || equalArgs(args, "ready", queue, "--limit", "1", "--fields", "id") || equalArgs(args, "ready", queue, "--limit", "256", "--fields", "id")
+	if command != "ready" || len(args) < 2 || args[0] != command || args[1] != queue {
+		return false
 	}
-	return false
+	index := 2
+	for index < len(args) && (args[index] == "--tag" || args[index] == "--without-tag") {
+		if index+1 >= len(args) || args[index+1] == "" {
+			return false
+		}
+		index += 2
+	}
+	if len(args)-index != 4 || args[index] != "--limit" || args[index+2] != "--fields" {
+		return false
+	}
+	if args[index+1] != "1" && args[index+1] != "256" {
+		return false
+	}
+	return args[index+3] == "id,title,state,assignee,priority" || args[index+3] == "id"
+}
+
+func ticketClaimQueue(args []string) string {
+	if len(args) < 2 || args[len(args)-1] != "--claim" || (args[0] != "wait" && args[0] != "next") {
+		return ""
+	}
+	queue := "open"
+	index := 1
+	if index < len(args)-1 && args[index] == "review" {
+		queue = "review"
+		index++
+	}
+	for index < len(args)-1 {
+		if (args[index] != "--tag" && args[index] != "--without-tag") || index+1 >= len(args)-1 || args[index+1] == "" {
+			return ""
+		}
+		index += 2
+	}
+	return queue
 }
 
 func activeObservationQueue(args []string) string {
@@ -295,6 +378,10 @@ func runCodex() {
 	call := map[string]any{"actor": os.Getenv("TICKET_ACTOR"), "args": os.Args[1:], "prompt": prompt, "pid": os.Getpid()}
 	data, _ := json.Marshal(call)
 	appendLine(os.Getenv("TICKET_ORC_FAKE_CODEX_LOG"), string(data))
+	if os.Getenv("TICKET_ORC_FAKE_CODEX_FAIL_BEFORE_SESSION") == "1" {
+		fmt.Fprintln(os.Stderr, "example startup failure")
+		os.Exit(7)
+	}
 	fmt.Fprintln(os.Stdout, `{"type":"thread.started","thread_id":"fake-thread"}`)
 	fmt.Fprintln(os.Stdout, `{"type":"turn.completed"}`)
 	if os.Getenv("TICKET_ORC_FAKE_CODEX_FAIL") == "1" {

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,9 +30,33 @@ const (
 	helperProbeExitEnv      = "TICKETCLIENT_HELPER_PROBE_EXIT"
 	helperProbeMalformedEnv = "TICKETCLIENT_HELPER_PROBE_MALFORMED"
 	helperProbeErrorEnv     = "TICKETCLIENT_HELPER_PROBE_ERROR"
+	versionHelperEnv        = "TICKETCLIENT_VERSION_HELPER"
+	versionOutputEnv        = "TICKETCLIENT_VERSION_OUTPUT"
+	versionStderrEnv        = "TICKETCLIENT_VERSION_STDERR"
+	versionExitEnv          = "TICKETCLIENT_VERSION_EXIT"
+	versionCountFileEnv     = "TICKETCLIENT_VERSION_COUNT_FILE"
+	versionRepeatEnv        = "TICKETCLIENT_VERSION_REPEAT"
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv(versionHelperEnv) != "" {
+		if path := os.Getenv(versionCountFileEnv); path != "" {
+			data, _ := os.ReadFile(path)
+			_ = os.WriteFile(path, []byte(strings.TrimSpace(string(data))+"x"), 0o600)
+		}
+		versionOutput := os.Getenv(versionOutputEnv)
+		if repeat, err := strconv.Atoi(os.Getenv(versionRepeatEnv)); err == nil && repeat > 0 {
+			versionOutput = strings.Repeat("x", repeat)
+		}
+		_, _ = io.WriteString(os.Stdout, versionOutput)
+		_, _ = io.WriteString(os.Stderr, os.Getenv(versionStderrEnv))
+		if code := os.Getenv(versionExitEnv); code != "" {
+			if exit, err := strconv.Atoi(code); err == nil {
+				os.Exit(exit)
+			}
+		}
+		os.Exit(0)
+	}
 	if scenario := os.Getenv(helperScenarioEnv); scenario != "" {
 		os.Exit(runTicketHelper(scenario))
 	}
@@ -46,11 +71,11 @@ func TestPersistentClientRunsSequentialCommandsBeforeEOF(t *testing.T) {
 	defer client.Close()
 	ctx := context.Background()
 
-	implementation, err := client.WaitAndClaimImplementation(ctx)
+	implementation, err := client.WaitAndClaimImplementation(ctx, QueueFilters{})
 	if err != nil || implementation.ID != "20260919-10001" {
 		t.Fatalf("WaitAndClaimImplementation = %#v, %v", implementation, err)
 	}
-	review, err := client.WaitAndClaimReview(ctx)
+	review, err := client.WaitAndClaimReview(ctx, QueueFilters{})
 	if err != nil || review.ID != "20260919-10002" {
 		t.Fatalf("WaitAndClaimReview = %#v, %v", review, err)
 	}
@@ -74,10 +99,40 @@ func TestReviewQueueFiltersConfiguredTags(t *testing.T) {
 	t.Setenv(helperScenarioEnv, "review-filter")
 	client := startHelperClient(t, "worker")
 	defer client.Close()
-	ticket, err := client.WaitAndClaimReviewWithoutTags(context.Background(), []string{"trivial", "no-review", "trivial"})
+	ticket, err := client.WaitAndClaimReview(context.Background(), QueueFilters{WithoutTags: []string{"trivial", "no-review", "trivial"}})
 	if err != nil || ticket.ID != testID {
 		t.Fatalf("WaitAndClaimReviewWithoutTags = %#v, %v", ticket, err)
 	}
+}
+
+func TestQueueFiltersReachReadyAndAtomicClaimCommands(t *testing.T) {
+	t.Run("ready uses repeated required and excluded flags", func(t *testing.T) {
+		t.Setenv(helperScenarioEnv, "ready-filters")
+		client := startHelperClient(t, "worker")
+		defer client.Close()
+		_, err := client.ReadyFrontier(context.Background(), "review", QueueFilters{
+			Tags: []string{"urgent", "backend"}, WithoutTags: []string{"skip"},
+		}, 2)
+		if err != nil {
+			t.Fatalf("ReadyFrontier: %v", err)
+		}
+	})
+	t.Run("positive-only wait uses Ticket wait", func(t *testing.T) {
+		t.Setenv(helperScenarioEnv, "wait-tags")
+		client := startHelperClient(t, "worker")
+		defer client.Close()
+		if _, err := client.WaitAndClaimImplementation(context.Background(), QueueFilters{Tags: []string{"urgent", "backend"}}); err != nil {
+			t.Fatalf("WaitAndClaimImplementation: %v", err)
+		}
+	})
+	t.Run("mixed filters use atomic next claim", func(t *testing.T) {
+		t.Setenv(helperScenarioEnv, "next-filters")
+		client := startHelperClient(t, "worker")
+		defer client.Close()
+		if _, err := client.WaitAndClaimReview(context.Background(), QueueFilters{Tags: []string{"security"}, WithoutTags: []string{"trivial"}}); err != nil {
+			t.Fatalf("WaitAndClaimReview: %v", err)
+		}
+	})
 }
 
 func TestPreviewTicketQueueUsesBoundedReadOnlyTicketProjections(t *testing.T) {
@@ -85,11 +140,11 @@ func TestPreviewTicketQueueUsesBoundedReadOnlyTicketProjections(t *testing.T) {
 	client := startHelperClient(t, "worker")
 	defer client.Close()
 	ctx := context.Background()
-	active, err := client.ActiveClaims(ctx, "review", []string{"trivial", "no-review"}, 4)
+	active, err := client.ActiveClaims(ctx, "review", 4)
 	if err != nil || len(active.Items) != 1 || active.Items[0].ID != "20260919-10001" || !active.More {
 		t.Fatalf("ActiveClaims=%#v err=%v", active, err)
 	}
-	ready, err := client.ReadyFrontier(ctx, "review", []string{"trivial", "no-review"}, 3)
+	ready, err := client.ReadyFrontier(ctx, "review", QueueFilters{WithoutTags: []string{"trivial", "no-review"}}, 3)
 	if err != nil || len(ready.Items) != 2 || ready.Items[0].ID != "20260919-10002" || ready.Items[1].ID != "20260919-10003" || !ready.More {
 		t.Fatalf("ReadyFrontier=%#v err=%v", ready, err)
 	}
@@ -101,9 +156,33 @@ func TestReviewQueueFiltersPollsPastEmptyFilteredQueue(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ticket, err := client.WaitAndClaimReviewWithoutTags(ctx, []string{"trivial"})
+	ticket, err := client.WaitAndClaimReview(ctx, QueueFilters{WithoutTags: []string{"trivial"}})
 	if err != nil || ticket.ID != testID {
 		t.Fatalf("WaitAndClaimReviewWithoutTags = %#v, %v", ticket, err)
+	}
+}
+
+func TestFilteredQueueWaitStopsPollingOnCancellation(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "ready")
+	t.Setenv(helperScenarioEnv, "filtered-empty")
+	t.Setenv(helperReadyFileEnv, ready)
+	client := startHelperClient(t, "worker")
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.WaitAndClaimReview(ctx, QueueFilters{WithoutTags: []string{"skip"}})
+		done <- err
+	}()
+	waitForFile(t, ready)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("filtered wait error = %v, want context canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("filtered wait did not stop after cancellation")
 	}
 }
 
@@ -175,10 +254,32 @@ func TestReassignTicketIntegratesWithTicketCLI(t *testing.T) {
 }
 
 func TestTagFiltersRejectUnsafeValues(t *testing.T) {
-	for _, tags := range [][]string{{"Needs-Review"}, {"needs review"}, {""}, {" trivial"}} {
-		if _, err := appendWithoutTagArgs([]string{"wait", "review"}, tags); err == nil {
-			t.Fatalf("appendWithoutTagArgs accepted %#v", tags)
+	for _, tags := range [][]string{{"Needs-Review"}, {"needs review"}, {""}, {" trivial"}, {"to:team-a"}, {strings.Repeat("a", 65)}, make([]string, 65)} {
+		if _, err := CanonicalQueueFilters(QueueFilters{Tags: tags}); err == nil {
+			t.Fatalf("CanonicalQueueFilters accepted %#v", tags)
 		}
+	}
+}
+
+func TestCanonicalQueueFiltersSortsCopiesAndRejectsContradictions(t *testing.T) {
+	input := QueueFilters{Tags: []string{"urgent", "backend"}, WithoutTags: []string{"skip"}}
+	got, err := CanonicalQueueFilters(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := QueueFilters{Tags: []string{"backend", "urgent"}, WithoutTags: []string{"skip"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical filters = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(input, QueueFilters{Tags: []string{"urgent", "backend"}, WithoutTags: []string{"skip"}}) {
+		t.Fatalf("canonicalization mutated input: %#v", input)
+	}
+	empty, err := CanonicalQueueFilters(QueueFilters{Tags: []string{}})
+	if err != nil || !reflect.DeepEqual(empty, QueueFilters{}) {
+		t.Fatalf("empty filters = %#v, %v; want zero selector", empty, err)
+	}
+	if _, err := CanonicalQueueFilters(QueueFilters{Tags: []string{"security"}, WithoutTags: []string{"security"}}); err == nil {
+		t.Fatal("contradictory filters accepted")
 	}
 }
 
@@ -238,7 +339,7 @@ func TestReviewQueueFilterUsesSupportedTicketProtocol(t *testing.T) {
 		t.Fatalf("new Ticket client: %v", err)
 	}
 	defer client.Close()
-	claimed, err := client.WaitAndClaimReviewWithoutTags(context.Background(), []string{"trivial"})
+	claimed, err := client.WaitAndClaimReview(context.Background(), QueueFilters{WithoutTags: []string{"trivial"}})
 	if err != nil {
 		t.Fatalf("filtered review wait: %v", err)
 	}
@@ -698,7 +799,7 @@ func TestCancellationStopsBlockedRequestAndClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.WaitAndClaimImplementation(ctx)
+		_, err := client.WaitAndClaimImplementation(ctx, QueueFilters{})
 		done <- err
 	}()
 	waitForFile(t, ready)
@@ -726,7 +827,7 @@ func TestQueuedRequestCancellationDoesNotInterruptActiveRequest(t *testing.T) {
 	activeCtx, cancelActive := context.WithCancel(context.Background())
 	activeDone := make(chan error, 1)
 	go func() {
-		_, err := client.WaitAndClaimImplementation(activeCtx)
+		_, err := client.WaitAndClaimImplementation(activeCtx, QueueFilters{})
 		activeDone <- err
 	}()
 	waitForFile(t, ready)
@@ -754,7 +855,7 @@ func TestCloseInterruptsOutstandingWait(t *testing.T) {
 	client := startHelperClient(t, "worker")
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.WaitAndClaimImplementation(context.Background())
+		_, err := client.WaitAndClaimImplementation(context.Background(), QueueFilters{})
 		done <- err
 	}()
 	waitForFile(t, ready)
@@ -787,7 +888,7 @@ func TestResponseProtocolAndSuccessValidation(t *testing.T) {
 		{
 			name: "missing claim item", response: `{"item":null}`,
 			call: func(client *Client) error {
-				_, err := client.WaitAndClaimImplementation(context.Background())
+				_, err := client.WaitAndClaimImplementation(context.Background(), QueueFilters{})
 				return err
 			},
 			want: "no claimed item",
@@ -795,7 +896,7 @@ func TestResponseProtocolAndSuccessValidation(t *testing.T) {
 		{
 			name: "wrong claim actor", response: `{"item":{"id":"20260919-12345","state":"open","assignee":"other"}}`,
 			call: func(client *Client) error {
-				_, err := client.WaitAndClaimImplementation(context.Background())
+				_, err := client.WaitAndClaimImplementation(context.Background(), QueueFilters{})
 				return err
 			},
 			want: "belongs to actor",
@@ -895,7 +996,7 @@ func TestWaitAndClaimVerifiesActorQueueConflictAgainstTicketState(t *testing.T) 
 			t.Setenv("TICKETCLIENT_HELPER_CONFLICT_STATE", test.state)
 			client := startHelperClient(t, "worker")
 			defer client.Close()
-			_, err := client.WaitAndClaimReview(context.Background())
+			_, err := client.WaitAndClaimReview(context.Background(), QueueFilters{WithoutTags: []string{"skip"}})
 			conflict := ActorQueueConflict(err, "review")
 			if (conflict != nil) != test.wantConflict {
 				t.Fatalf("conflict=%#v, err=%v", conflict, err)
@@ -1173,22 +1274,43 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 			writeHelperJSON(map[string]any{"id": testID, "changed": true, "state": "open"})
 		}
 	case "review-filter":
-		want := []string{"next", "review", "--without-tag", "trivial", "--without-tag", "no-review", "--claim"}
+		want := []string{"next", "review", "--without-tag", "no-review", "--without-tag", "trivial", "--claim"}
 		if !reflect.DeepEqual(args, want) {
 			writeHelperError("bad_args", fmt.Sprintf("review filter args = %q", args), nil)
 			return -1
 		}
 		writeHelperJSON(map[string]any{"item": map[string]any{"id": testID, "state": "review", "assignee": os.Getenv("TICKET_ACTOR"), "tags": []string{"backend"}}})
+	case "ready-filters":
+		want := []string{"ready", "review", "--tag", "backend", "--tag", "urgent", "--without-tag", "skip", "--limit", "2", "--fields", "id,title,state,assignee,priority"}
+		if !reflect.DeepEqual(args, want) {
+			writeHelperError("bad_args", fmt.Sprintf("ready filters args = %q", args), nil)
+			return -1
+		}
+		writeHelperJSON(map[string]any{"items": []any{}, "more": false})
+	case "wait-tags":
+		want := []string{"wait", "--tag", "backend", "--tag", "urgent", "--claim"}
+		if !reflect.DeepEqual(args, want) {
+			writeHelperError("bad_args", fmt.Sprintf("wait tag args = %q", args), nil)
+			return -1
+		}
+		writeHelperJSON(map[string]any{"item": map[string]any{"id": testID, "state": "open", "assignee": os.Getenv("TICKET_ACTOR")}})
+	case "next-filters":
+		want := []string{"next", "review", "--tag", "security", "--without-tag", "trivial", "--claim"}
+		if !reflect.DeepEqual(args, want) {
+			writeHelperError("bad_args", fmt.Sprintf("next filter args = %q", args), nil)
+			return -1
+		}
+		writeHelperJSON(map[string]any{"item": map[string]any{"id": testID, "state": "review", "assignee": os.Getenv("TICKET_ACTOR")}})
 	case "queue-preview":
 		if count == 1 {
-			want := []string{"list", "--state", "review", "--assignee", "worker", "--without-tag", "trivial", "--without-tag", "no-review", "--limit", "4", "--fields", "id,title,state,assignee,priority"}
+			want := []string{"list", "--state", "review", "--assignee", "worker", "--limit", "4", "--fields", "id,title,state,assignee,priority"}
 			if !reflect.DeepEqual(args, want) {
 				writeHelperError("bad_args", fmt.Sprintf("active preview args = %q", args), nil)
 				return -1
 			}
 			writeHelperJSON(map[string]any{"items": []any{map[string]any{"id": "20260919-10001", "title": "active review", "state": "review", "assignee": "worker"}}, "more": true})
 		} else if count == 2 {
-			want := []string{"ready", "review", "--without-tag", "trivial", "--without-tag", "no-review", "--limit", "3", "--fields", "id,title,state,assignee,priority"}
+			want := []string{"ready", "review", "--without-tag", "no-review", "--without-tag", "trivial", "--limit", "3", "--fields", "id,title,state,assignee,priority"}
 			if !reflect.DeepEqual(args, want) {
 				writeHelperError("bad_args", fmt.Sprintf("ready preview args = %q", args), nil)
 				return -1
@@ -1212,6 +1334,14 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 		} else {
 			writeHelperJSON(map[string]any{"item": map[string]any{"id": testID, "state": "review", "assignee": os.Getenv("TICKET_ACTOR"), "tags": []string{"backend"}}})
 		}
+	case "filtered-empty":
+		want := []string{"next", "review", "--without-tag", "skip", "--claim"}
+		if !reflect.DeepEqual(args, want) {
+			writeHelperError("bad_args", fmt.Sprintf("filtered empty args = %q", args), nil)
+			return -1
+		}
+		_ = os.WriteFile(os.Getenv(helperReadyFileEnv), []byte("ready"), 0o600)
+		writeHelperJSON(map[string]any{"item": nil})
 	case "reassign":
 		want := []string{"reassign", testID, "--input", "-"}
 		if !reflect.DeepEqual(args, want) || stdin == nil || *stdin != `{"assignee":"operator","handoff":"waiting for external API","message":"Ticket-side action required"}` {
@@ -1351,7 +1481,7 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 			}
 			writeHelperJSON(map[string]any{"id": testID, "created": "2026-09-19", "modified": "2026-09-20T12:30:00Z"})
 		case 3:
-			if !reflect.DeepEqual(args, []string{"show", testID, "--full", "--max-bytes", fmt.Sprint(repositoryDetailBodyBudget)}) {
+			if !reflect.DeepEqual(args, []string{"show", testID, "--full", "--max-bytes", fmt.Sprint(RepositoryDetailBodyBudgetBytes)}) {
 				writeHelperError("bad_args", fmt.Sprintf("detail body args = %q", args), nil)
 				return -1
 			}

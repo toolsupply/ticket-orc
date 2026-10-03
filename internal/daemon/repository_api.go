@@ -125,6 +125,8 @@ type RepositoryGateway struct {
 	CreateTicket func(context.Context, string, RepositoryTicketCreateRequest) (RepositoryTicketMutation, error)
 	UpdateTicket func(context.Context, string, string, RepositoryTicketUpdateRequest) (RepositoryTicketMutation, error)
 	MutateTicket func(context.Context, string, string, string, RepositoryTicketMutationRequest) (RepositoryTicketMutation, error)
+	// TicketBodyBudgetBytes is the maximum body size returned by GetTicket.
+	TicketBodyBudgetBytes int
 }
 
 // RepositoryReadError lets a gateway return a stable HTTP error without
@@ -137,14 +139,16 @@ type RepositoryReadError struct {
 }
 
 // RepositoryMutationError is a safe, typed failure for UI Ticket mutations.
-// Applied remains authoritative when Ticket reports an uncertain mutation;
-// callers must reread instead of retrying blindly.
+// AppliedKnown distinguishes known true/false from an unknown outcome. When
+// certainty is unknown, the HTTP error omits mutation_applied so clients do
+// not mistake transport failure for proof that the mutation was rejected.
 type RepositoryMutationError struct {
-	Code    string
-	Status  int
-	Message string
-	Applied bool
-	Cause   error
+	Code         string
+	Status       int
+	Message      string
+	Applied      bool
+	AppliedKnown bool
+	Cause        error
 }
 
 func (e *RepositoryMutationError) Error() string {

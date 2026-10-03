@@ -13,6 +13,7 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
 const (
@@ -64,6 +65,13 @@ func resolveTicketTarget(repository string, ticket TicketFileConfig) (supervisor
 }
 
 func splitReviewSkipTags(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, "\x1f")
+}
+
+func splitTicketTags(value string) []string {
 	if value == "" {
 		return nil
 	}
@@ -268,9 +276,12 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		return supervisor.RoleConfig{}, false, err
 	}
 	var roleDefaults RoleFileConfig
+	roleName := ""
 	if worker != nil {
+		roleName = worker.Role
 		roleDefaults = loaded.Config.Roles[worker.Role]
 	} else {
+		roleName = loaded.Config.DefaultRole
 		roleDefaults = loaded.Config.Roles[loaded.Config.DefaultRole]
 	}
 	if worker == nil && workflowRole(roleDefaults) != role {
@@ -282,6 +293,7 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		for _, name := range roleNames {
 			candidate := loaded.Config.Roles[name]
 			if workflowRole(candidate) == role {
+				roleName = name
 				roleDefaults = candidate
 				break
 			}
@@ -373,6 +385,8 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 	config := supervisor.RoleConfig{
 		WorkerName:                 workerName,
 		Role:                       role,
+		RoleName:                   roleName,
+		TicketQueue:                roleDefaults.TicketQueue,
 		Harness:                    value("harness", "TICKET_ORC_HARNESS", workerString(worker, func(w WorkerFileConfig) string { return w.Harness }), roleDefaults.Harness, loaded.Config.Defaults.Harness, defaultHarness),
 		Actor:                      value("actor", "TICKET_ORC_ACTOR", workerString(worker, func(w WorkerFileConfig) string { return w.Actor }), roleDefaults.Actor, "", string(role)),
 		Model:                      value("model", "TICKET_ORC_MODEL", workerString(worker, func(w WorkerFileConfig) string { return w.Model }), roleDefaults.Model, loaded.Config.Defaults.Model, ""),
@@ -381,17 +395,24 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		SessionCleanup:             supervisor.CleanupPolicy(cleanup),
 		MinimumReuseContextPercent: minimumReuseContextPercentValue,
 		StateDir:                   stateDir,
+		InstanceID:                 loaded.Config.ID,
+		LocalDirConfigured:         loaded.Instance.LocalDirConfigured,
 		WorkingDir:                 workingDir,
 		Repository:                 repository,
 		RepositoryKey:              repositoryKey,
 		Ticket:                     ticketTarget,
 		Output:                     supervisor.OutputMode(value("output", "TICKET_ORC_OUTPUT", workerString(worker, func(w WorkerFileConfig) string { return w.Output }), roleDefaults.Output, loaded.Config.Defaults.Output, defaultOutput)),
 		TicketPrompt:               value("ticket-prompt", "TICKET_ORC_TICKET_PROMPT", workerString(worker, func(w WorkerFileConfig) string { return w.TicketPrompt }), roleDefaults.TicketPrompt, loaded.Config.Defaults.TicketPrompt, builtinPrompt),
-		ReviewSkipTags:             strings.Join(loaded.Config.Review.SkipTags, "\x1f"),
+		ReviewSkipTags:             strings.Join(canonicalReviewSkipTags(loaded.Config.Review.SkipTags), "\x1f"),
 		Codex:                      supervisor.CodexFileConfig{Sandbox: value("codex-sandbox", "TICKET_ORC_CODEX_SANDBOX", workerString(worker, func(w WorkerFileConfig) string { return w.Codex.Sandbox }), roleDefaults.Codex.Sandbox, loaded.Config.Defaults.Codex.Sandbox, "")},
 		Pi:                         supervisor.PiFileConfig{Provider: value("pi-provider", "TICKET_ORC_PI_PROVIDER", workerString(worker, func(w WorkerFileConfig) string { return w.Pi.Provider }), roleDefaults.Pi.Provider, loaded.Config.Defaults.Pi.Provider, "")},
 		Claude:                     supervisor.ClaudeFileConfig{PermissionMode: value("claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE", workerString(worker, func(w WorkerFileConfig) string { return w.Claude.PermissionMode }), roleDefaults.Claude.PermissionMode, loaded.Config.Defaults.Claude.PermissionMode, "")},
 	}
+	filters, err := resolvedRoleQueueFilters(roleDefaults, loaded.Config.Review)
+	if err != nil {
+		return supervisor.RoleConfig{}, false, err
+	}
+	config.TicketTags = strings.Join(filters.Tags, "\x1f")
 	if role == RoleReviewer {
 		config.ReviewCompletion = value("review-completion", "TICKET_ORC_REVIEW_COMPLETION", workerString(worker, func(w WorkerFileConfig) string { return w.ReviewCompletion }), roleDefaults.ReviewCompletion, loaded.Config.Defaults.ReviewCompletion, ReviewCompletionSignoff)
 	} else {
@@ -406,6 +427,20 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		return supervisor.RoleConfig{}, false, err
 	}
 	return config, false, nil
+}
+
+func resolvedRoleQueueFilters(role RoleFileConfig, review ReviewFileConfig) (ticketclient.QueueFilters, error) {
+	filters := ticketclient.QueueFilters{Tags: append([]string(nil), role.TicketTags...)}
+	if role.TicketQueue == "review" {
+		filters.WithoutTags = append([]string(nil), review.SkipTags...)
+	}
+	return ticketclient.CanonicalQueueFilters(filters)
+}
+
+func canonicalReviewSkipTags(tags []string) []string {
+	canonical := append([]string(nil), tags...)
+	sort.Strings(canonical)
+	return canonical
 }
 
 func reviewCompletionForQueue(roles map[string]RoleFileConfig) string {
