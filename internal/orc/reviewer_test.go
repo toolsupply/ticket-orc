@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/state"
@@ -80,6 +81,101 @@ func TestRunReviewerApprovesAndReturnsToQueue(t *testing.T) {
 	}
 	if len(stateStore.sets) != 1 || stateStore.sets[0].Role != "reviewer" {
 		t.Fatalf("retained sessions = %#v", stateStore.sets)
+	}
+}
+
+func TestRunReviewerContinuesAfterPostCompletionContainment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	const ticketA, ticketB = "20261003-56324", "20261003-56325"
+	seedOneStall(t, ctx, store, ticketA, "reviewer-1", "review")
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{{ID: ticketA, State: "review", Assignee: "reviewer-1"}, {ID: ticketB, State: "review", Assignee: "reviewer-1"}},
+		shows: map[string]ticketclient.Ticket{
+			ticketA: {ID: ticketA, State: "review"},
+			ticketB: {ID: ticketB, State: "signoff"},
+		},
+	}
+	containment := &managedContainmentFixture{tickets: tickets}
+	config := reviewerConfig()
+	config.MaxBounces = 6
+	config.ContainmentTickets = containment
+	runs := 0
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}, onRun: func() {
+		runs++
+		if runs == 2 {
+			cancel()
+		}
+	}}
+	err := RunReviewer(ctx, config, tickets, agent, store, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunReviewer error=%v, want cancellation after independent ticket", err)
+	}
+	if len(agent.runs) != 2 || !strings.Contains(agent.runs[0].Prompt, ticketA) || !strings.Contains(agent.runs[1].Prompt, ticketB) {
+		t.Fatalf("reviewer runs=%#v, want contained ticket followed by independent work", agent.runs)
+	}
+	if len(containment.holds) != 1 || containment.holds[0] != ticketA || tickets.shows[ticketA].State != "hold" {
+		t.Fatalf("containment holds=%v ticket A=%#v", containment.holds, tickets.shows[ticketA])
+	}
+	loop, found, err := store.TicketLoop(context.Background(), ticketA)
+	if err != nil || !found || loop.Phase != state.TicketLoopHeld || loop.StallCount != 2 {
+		t.Fatalf("contained reviewer loop=%#v found=%t err=%v", loop, found, err)
+	}
+}
+
+func TestRunReviewerDoesNotReleaseForConcurrentContainmentTrip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	const ticketA, ticketB = "20261003-56330", "20261003-56331"
+	if _, _, err := store.Participate(ctx, ticketA, 6); err != nil {
+		t.Fatal(err)
+	}
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{{ID: ticketA, State: "review", Assignee: "reviewer-1"}, {ID: ticketB, State: "review", Assignee: "reviewer-1"}},
+		shows: map[string]ticketclient.Ticket{
+			ticketA: {ID: ticketA, State: "review", Assignee: "reviewer-1"},
+			ticketB: {ID: ticketB, State: "signoff"},
+		},
+	}
+	containment := &managedContainmentFixture{tickets: tickets}
+	config := reviewerConfig()
+	config.MaxBounces = 6
+	config.ContainmentTickets = containment
+	participation := &participationBarrierStore{Store: store, entered: make(chan struct{}), resume: make(chan struct{})}
+	runs := 0
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}, onRun: func() {
+		runs++
+		if runs == 1 {
+			cancel()
+		}
+	}}
+	done := make(chan error, 1)
+	go func() { done <- RunReviewer(ctx, config, tickets, agent, participation, &fakeCoderCleanup{}) }()
+	select {
+	case <-participation.entered:
+	case <-time.After(time.Second):
+		t.Fatal("reviewer did not reach participation boundary")
+	}
+	if _, err := store.MarkContainmentPending(ctx, ticketA); err != nil {
+		t.Fatal(err)
+	}
+	close(participation.resume)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunReviewer error=%v, want cancellation after independent work", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reviewer did not continue after concurrent containment trip")
+	}
+	if len(tickets.releases) != 0 || len(containment.holds) != 0 || len(agent.runs) != 1 || !strings.Contains(agent.runs[0].Prompt, ticketB) {
+		t.Fatalf("concurrent trip released or ran contained ticket: releases=%v holds=%v runs=%#v", tickets.releases, containment.holds, agent.runs)
+	}
+	loop, found, err := store.TicketLoop(context.Background(), ticketA)
+	if err != nil || !found || loop.Phase != state.TicketLoopContainmentPending {
+		t.Fatalf("concurrent trip loop=%#v found=%t err=%v", loop, found, err)
 	}
 }
 

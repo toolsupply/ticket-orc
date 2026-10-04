@@ -14,7 +14,7 @@ import (
 const (
 	// Version 1 is the first public state schema. Unreleased development
 	// formats are deliberately rejected rather than migrated implicitly.
-	currentVersion          = 1
+	currentVersion          = 2
 	stateFileName           = "state.json"
 	lockFileName            = "lock"
 	maxStateBytes           = 1 << 20
@@ -58,10 +58,35 @@ func (s Session) IsCurrent() bool { return s.SupersededAt == nil || s.Superseded
 
 // Snapshot is a complete in-memory copy of the persisted state.
 type Snapshot struct {
-	Version  int            `json:"version"`
-	Sessions []Session      `json:"sessions"`
-	Bounces  map[string]int `json:"bounces"`
+	Version  int                   `json:"version"`
+	Sessions []Session             `json:"sessions"`
+	Loops    map[string]TicketLoop `json:"ticket_loops"`
+	// Bounces is a derived compatibility view for existing diagnostics. It is
+	// never persisted in schema v2; bounce history lives in Loops.
+	Bounces map[string]int `json:"-"`
 }
+
+// TicketLoop is the durable, repository-scoped circuit state shared by every
+// managed and dynamically steered participant handling one ticket.
+type TicketLoop struct {
+	Repository           string `json:"repository"`
+	Ticket               string `json:"ticket"`
+	StallCount           int    `json:"stall_count"`
+	BounceCount          int    `json:"bounce_count"`
+	EffectiveBounceLimit int    `json:"effective_bounce_limit,omitempty"`
+	Phase                string `json:"phase"`
+	HeldFrom             string `json:"held_from,omitempty"`
+	ClaimState           string `json:"claim_state,omitempty"`
+	ClaimActor           string `json:"claim_actor,omitempty"`
+	AttemptID            uint64 `json:"attempt_id,omitempty"`
+	DispatchPending      bool   `json:"dispatch_pending,omitempty"`
+}
+
+const (
+	TicketLoopActive             = "active"
+	TicketLoopContainmentPending = "containment_pending"
+	TicketLoopHeld               = "held"
+)
 
 // Store coordinates access to one state directory. Store has no in-memory
 // cache; every operation reloads state while holding the cross-process lock.
@@ -135,12 +160,16 @@ func (s *Store) bounceKey(ticket string) string {
 	return s.repository + "\x00" + ticket
 }
 
+func (s *Store) ticketLoopKey(ticket string) string { return ticketLoopKey(s.repository, ticket) }
+
 func splitBounceKey(key string) (string, string, bool) {
 	if index := strings.IndexByte(key, 0); index >= 0 {
 		return key[:index], key[index+1:], true
 	}
 	return "", key, false
 }
+
+func ticketLoopKey(repository, ticket string) string { return repository + "\x00" + ticket }
 
 // Read returns a complete current-format snapshot. A missing state file is an
 // empty current state; malformed or unsupported state is an error.
@@ -168,6 +197,13 @@ func (s *Store) scopeSnapshot(snapshot Snapshot) (Snapshot, error) {
 		return snapshot, nil
 	}
 	snapshot.Sessions = filterByRepository(snapshot.Sessions, s.repository, func(item Session) string { return item.Repository })
+	loops := make(map[string]TicketLoop, len(snapshot.Loops))
+	for key, loop := range snapshot.Loops {
+		if normalizeRepositoryIdentity(loop.Repository) == s.repository {
+			loops[key] = loop
+		}
+	}
+	snapshot.Loops = loops
 
 	bounces := make(map[string]int, len(snapshot.Bounces))
 	for key, count := range snapshot.Bounces {
@@ -178,6 +214,11 @@ func (s *Store) scopeSnapshot(snapshot Snapshot) (Snapshot, error) {
 		// Snapshot validation rejects keys without a repository identity.
 	}
 	snapshot.Bounces = bounces
+	for key, loop := range loops {
+		if loop.BounceCount > 0 {
+			snapshot.Bounces[key] = loop.BounceCount
+		}
+	}
 	return snapshot, nil
 }
 

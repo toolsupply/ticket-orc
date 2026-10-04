@@ -219,14 +219,19 @@ func assertIntegratedSteerCallDelta(t *testing.T, clients map[string]*integrated
 	t.Fatal("scheduler did not finish the expected authoritative Ticket observations")
 }
 
-func settleIntegratedSteerSchedule(t *testing.T, ticks chan<- time.Time) {
+func settleIntegratedSteerSchedule(t *testing.T, registrationTicks, elapsedTicks chan<- time.Time) {
 	t.Helper()
 	for range 2 {
 		select {
-		case ticks <- time.Now():
+		case registrationTicks <- time.Now():
 		case <-time.After(2 * time.Second):
 			t.Fatal("steer scheduler did not reach a deterministic tick barrier")
 		}
+	}
+	select {
+	case elapsedTicks <- time.Now():
+	case <-time.After(2 * time.Second):
+		t.Fatal("steer scheduler did not reach a deterministic tick barrier")
 	}
 }
 
@@ -486,7 +491,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 			t.Fatalf("initial authoritative calls for %s=%#v, want %#v", actor, got, want)
 		}
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks)
+	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
 	if got := snapshotIntegratedSteerCalls(clients); !equalIntegratedSteerCalls(got, initialCalls) {
 		t.Fatalf("unchanged registration observations caused Ticket calls: before=%#v after=%#v", initialCalls, got)
 	}
@@ -536,7 +541,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if changed.Type != "ticket.repository_changed" || changed.RepositoryID != joinTestRepositoryID || changed.Ticket != editedTicketID || changed.Code != "edited" {
 		t.Fatalf("published repository change=%#v", changed)
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks)
+	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
 	assertIntegratedSteerCallDelta(t, clients, beforeAChange,
 		map[string]int32{"a-one": 2, "a-two": 2}, map[string]int32{"a-one": 1, "a-two": 1})
 	if got := <-queued; got != "a-one-thread" {
@@ -593,7 +598,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if _, err := config.control.ResumeDaemon(ctx); err != nil {
 		t.Fatalf("resume daemon: %v", err)
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks)
+	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
 	assertIntegratedSteerCallDelta(t, clients, beforeResume,
 		map[string]int32{"a-one": 2, "a-two": 2, "a-three": 2, "b-one": 2, "b-two": 2},
 		map[string]int32{"a-two": 1, "b-one": 1, "b-two": 1})
@@ -632,7 +637,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 			t.Fatalf("observer recovery events degraded=%t recovered=%t", sawDegraded, sawRecovered)
 		}
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks)
+	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
 	assertIntegratedSteerCallDelta(t, clients, beforeRecovery,
 		map[string]int32{"a-one": 2, "a-two": 2, "a-three": 2},
 		map[string]int32{"a-two": 1})
@@ -651,7 +656,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	assertIntegratedSteerCallDelta(t, clients, beforeLongIdle, map[string]int32{}, map[string]int32{})
 	// Unchanged registration polls after that simulated interval must remain
 	// targeted as well.
-	settleIntegratedSteerSchedule(t, registrationTicks)
+	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
 	assertIntegratedSteerCallDelta(t, clients, beforeLongIdle, map[string]int32{}, map[string]int32{})
 
 	observed = registrationObserver.Observe(ctx)

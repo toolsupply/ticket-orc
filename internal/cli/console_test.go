@@ -1062,20 +1062,18 @@ func TestConsoleWatchRefreshesUnknownRepositoryFromStatus(t *testing.T) {
 	defer cancel()
 	inputReader, inputWriter := io.Pipe()
 	var errorsOut bytes.Buffer
-	watchOutput := &consoleWatchStartWriter{started: watchStarted}
+	repositoryRendered := make(chan struct{})
+	watchOutput := &consoleWatchStartWriter{started: watchStarted, matched: repositoryRendered, match: "New Project"}
 	done := make(chan error, 1)
 	go func() {
 		done <- runConsoleLoopWithEndpointOptions(ctx, daemonCommandOptions{localDir: stateDir}, inputReader, watchOutput, &errorsOut, nil, "", false, nil)
 	}()
 	go func() { _, _ = io.WriteString(inputWriter, "watch\n") }()
-	deadline := time.After(time.Second)
-	for statusCalls.Load() < 2 {
-		select {
-		case <-deadline:
-			t.Fatalf("watch did not refresh status for unknown repository (status calls=%d, event streams=%d)", statusCalls.Load(), eventCalls.Load())
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case <-repositoryRendered:
+		// The refresh response has been consumed and rendered by the console.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("watch did not render refreshed repository (status calls=%d, event streams=%d)", statusCalls.Load(), eventCalls.Load())
 	}
 	cancel()
 	_ = inputWriter.Close()
@@ -1087,8 +1085,19 @@ func TestConsoleWatchRefreshesUnknownRepositoryFromStatus(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("console did not stop after cancellation")
 	}
-	if got := watchOutput.String(); !strings.Contains(got, "New Project") || strings.Contains(got, "tickets") {
-		t.Fatalf("new runtime repository label=%q", got)
+	var eventRow string
+	for _, line := range strings.Split(watchOutput.String(), "\n") {
+		if strings.Contains(line, "ticket modified") {
+			eventRow = line
+			break
+		}
+	}
+	if eventRow == "" {
+		t.Fatalf("watch output did not contain the repository event row: %q", watchOutput.String())
+	}
+	if !strings.Contains(eventRow, consoleEllipsize("New Project", consoleWatchRepositoryCol)) ||
+		strings.Contains(eventRow, "new-project") || strings.Contains(eventRow, consoleEllipsize(repositoryID, consoleWatchRepositoryCol)) {
+		t.Fatalf("event row did not use the refreshed repository name: %q", eventRow)
 	}
 }
 
@@ -1133,10 +1142,13 @@ func (writer *countingConsoleWriter) String() string { return writer.buffer.Stri
 
 type consoleWatchStartWriter struct {
 	bytes.Buffer
-	started  chan struct{}
-	stopped  chan struct{}
-	once     sync.Once
-	stopOnce sync.Once
+	started   chan struct{}
+	stopped   chan struct{}
+	matched   chan struct{}
+	match     string
+	once      sync.Once
+	stopOnce  sync.Once
+	matchOnce sync.Once
 }
 
 func (writer *consoleWatchStartWriter) Write(data []byte) (int, error) {
@@ -1147,7 +1159,11 @@ func (writer *consoleWatchStartWriter) Write(data []byte) (int, error) {
 	if writer.stopped != nil && strings.Contains(text, "watch stopped") {
 		writer.stopOnce.Do(func() { close(writer.stopped) })
 	}
-	return writer.Buffer.Write(data)
+	n, err := writer.Buffer.Write(data)
+	if writer.matched != nil && writer.match != "" && strings.Contains(text, writer.match) {
+		writer.matchOnce.Do(func() { close(writer.matched) })
+	}
+	return n, err
 }
 
 func TestConsoleWatchReturnsToPromptOnInterrupt(t *testing.T) {

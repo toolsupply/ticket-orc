@@ -358,6 +358,16 @@ func TestCloseTicketUsesExplicitID(t *testing.T) {
 	}
 }
 
+func TestHoldTicketUsesOrdinaryWorkflowMutation(t *testing.T) {
+	t.Setenv(helperScenarioEnv, "hold")
+	client := startHelperClient(t, "ticket-orc.1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa")
+	defer client.Close()
+	result, err := client.HoldTicket(context.Background(), testID, MutationOptions{Message: "Orc circuit breaker"})
+	if err != nil || result.ID != testID || result.FromState != "review" || result.State != "hold" {
+		t.Fatalf("HoldTicket = %#v, %v", result, err)
+	}
+}
+
 func TestShowNormalizesLegacyCompletedState(t *testing.T) {
 	t.Setenv(helperScenarioEnv, "legacy-show")
 	client := startHelperClient(t, "worker")
@@ -1359,6 +1369,12 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 			return -1
 		}
 		writeHelperJSON(map[string]any{"id": testID, "changed": true, "state": StateClosed})
+	case "hold":
+		if !reflect.DeepEqual(args, []string{"hold", testID, "--message", "Orc circuit breaker"}) {
+			writeHelperError("bad_args", fmt.Sprintf("hold args = %q", args), nil)
+			return -1
+		}
+		writeHelperJSON(map[string]any{"id": testID, "changed": true, "from_state": "review", "state": "hold"})
 	case "legacy-show":
 		if !reflect.DeepEqual(args, []string{"show", testID}) {
 			writeHelperError("bad_args", fmt.Sprintf("show args = %q", args), nil)

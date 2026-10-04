@@ -70,8 +70,8 @@ func TestRoleExecutableWorkflow(t *testing.T) {
 			if test.role == "reviewer" && !strings.Contains(calls[0].Prompt, "Review only ticket "+integrationTicketID) {
 				t.Fatalf("reviewer prompt = %q", calls[0].Prompt)
 			}
-			if got := countTicketRequest(ticketLog, "show"); got != 1 {
-				t.Fatalf("show requests = %d, want one authoritative reread", got)
+			if got := countTicketRequest(ticketLog, "show"); got != 3 {
+				t.Fatalf("show requests = %d, want lifecycle, readiness, and loop reconciliation observations", got)
 			}
 		})
 	}
@@ -420,7 +420,7 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
-func TestRoleExecutableBounceLimitReleasesWithoutCodex(t *testing.T) {
+func TestRoleExecutableBounceLimitReleasesItsOwnClaimBeforeContainment(t *testing.T) {
 	binary, helperDir := buildFixture(t)
 	stateDir := filepath.Join(t.TempDir(), "state")
 	if _, err := integrationState(stateDir).IncrementBounces(context.Background(), integrationTicketID); err != nil {
@@ -428,24 +428,70 @@ func TestRoleExecutableBounceLimitReleasesWithoutCodex(t *testing.T) {
 	}
 	codexLog := filepath.Join(t.TempDir(), "codex.jsonl")
 	ticketLog := filepath.Join(t.TempDir(), "ticket.log")
+	assigneeFile := filepath.Join(t.TempDir(), "assignee")
+	ticketStateFile := filepath.Join(t.TempDir(), "ticket-state")
 	result := runRoleArgs(t, binary, helperDir, "coder", stateDir, codexLog, ticketLog, map[string]string{
-		"TICKET_ORC_FAKE_TICKET_STATE": "review",
-		"TICKET_ORC_FAKE_CLAIM_STATE":  "open",
-		"TICKET_ORC_FAKE_TICKET_LOG":   ticketLog,
-		"TICKET_ORC_FAKE_CODEX_LOG":    codexLog,
-		"TICKET_ORC_FAKE_TICKET_ID":    integrationTicketID,
+		"TICKET_ORC_FAKE_TICKET_STATE":      "review",
+		"TICKET_ORC_FAKE_CLAIM_STATE":       "open",
+		"TICKET_ORC_FAKE_TICKET_LOG":        ticketLog,
+		"TICKET_ORC_FAKE_ASSIGNEE_FILE":     assigneeFile,
+		"TICKET_ORC_FAKE_TICKET_STATE_FILE": ticketStateFile,
+		"TICKET_ORC_FAKE_CODEX_LOG":         codexLog,
+		"TICKET_ORC_FAKE_TICKET_ID":         integrationTicketID,
 	}, []string{"--max-bounces", "1"})
-	if !strings.Contains(result.stderr, "bounce limit reached") {
-		t.Fatalf("stderr = %q, want bounce limit", result.stderr)
+	if !strings.Contains(result.stderr, "wait for implementation work failed") {
+		t.Fatalf("stderr = %q, want worker to return to queue after containment", result.stderr)
 	}
-	if strings.Contains(result.stderr, "release over-limit claim") {
-		t.Fatalf("stderr = %q, release failed", result.stderr)
-	}
-	if countTicketRequest(ticketLog, "release") != 1 {
-		t.Fatalf("ticket log = %q, want one release", readText(ticketLog))
+	if countTicketRequest(ticketLog, "release") != 1 || countTicketRequest(ticketLog, "hold") != 1 {
+		t.Fatalf("ticket log = %q, want one release of this worker's claim followed by Orc hold", readText(ticketLog))
 	}
 	if got := readText(codexLog); got != "" {
 		t.Fatalf("Codex log = %q, want empty", got)
+	}
+	if got := readText(assigneeFile); got != "" {
+		t.Fatalf("ticket assignee after containment = %q, want unassigned", got)
+	}
+	loop, found, err := integrationState(stateDir).TicketLoop(context.Background(), integrationTicketID)
+	if err != nil || !found || loop.Phase != state.TicketLoopHeld || loop.HeldFrom != "review" {
+		t.Fatalf("ticket loop=%#v found=%t err=%v, want recovered held state", loop, found, err)
+	}
+}
+
+func TestRoleExecutableContainmentUsesOrcActorAndPersistsHold(t *testing.T) {
+	binary, helperDir := buildFixture(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	codexLog := filepath.Join(t.TempDir(), "codex.jsonl")
+	ticketLog := filepath.Join(t.TempDir(), "ticket.log")
+	actorLog := filepath.Join(t.TempDir(), "ticket-actors.log")
+	ticketStateFile := filepath.Join(t.TempDir(), "ticket-state")
+	if _, err := integrationState(stateDir).IncrementBounces(context.Background(), integrationTicketID); err != nil {
+		t.Fatalf("seed bounce count: %v", err)
+	}
+	result := runRoleArgs(t, binary, helperDir, "coder", stateDir, codexLog, ticketLog, map[string]string{
+		"TICKET_ORC_FAKE_TICKET_STATE":      "review",
+		"TICKET_ORC_FAKE_CLAIM_STATE":       "open",
+		"TICKET_ORC_FAKE_ASSIGNEE":          "",
+		"TICKET_ORC_FAKE_TICKET_LOG":        ticketLog,
+		"TICKET_ORC_FAKE_TICKET_ACTOR_LOG":  actorLog,
+		"TICKET_ORC_FAKE_TICKET_STATE_FILE": ticketStateFile,
+		"TICKET_ORC_FAKE_CODEX_LOG":         codexLog,
+		"TICKET_ORC_FAKE_TICKET_ID":         integrationTicketID,
+	}, []string{"--max-bounces", "1"})
+	if !strings.Contains(result.stderr, "wait for implementation work") || strings.Contains(result.stderr, "Codex") {
+		t.Fatalf("stderr = %q, want containment before subsequent queue wait and harness", result.stderr)
+	}
+	if countTicketRequest(ticketLog, "hold") != 1 || countTicketRequest(ticketLog, "release") != 0 {
+		t.Fatalf("Ticket calls = %q, want ordinary hold and no release", readText(ticketLog))
+	}
+	if got := readText(actorLog); !strings.Contains(got, "ticket-orc.1e4f5f6d-3a59-49f6-8c2f-e18186ac45aa hold "+integrationTicketID) {
+		t.Fatalf("Ticket actor calls = %q, want deterministic Orc actor for hold", got)
+	}
+	loop, found, err := integrationState(stateDir).TicketLoop(context.Background(), integrationTicketID)
+	if err != nil || !found || loop.Phase != state.TicketLoopHeld || loop.HeldFrom != "review" || loop.BounceCount != 1 {
+		t.Fatalf("persisted ticket loop=%#v found=%t err=%v", loop, found, err)
+	}
+	if got := readText(codexLog); got != "" {
+		t.Fatalf("Codex log = %q, circuit tripped before harness dispatch", got)
 	}
 }
 
@@ -486,8 +532,8 @@ func TestRoleExecutableHarnessFailureRereadsAndStops(t *testing.T) {
 	if !strings.Contains(result.stderr, "Codex process exited with status 7") && !strings.Contains(result.stderr, "exit status 7") {
 		t.Fatalf("stderr = %q, want harness failure", result.stderr)
 	}
-	if countTicketRequest(ticketLog, "show") != 1 {
-		t.Fatalf("ticket log = %q, want authoritative show", readText(ticketLog))
+	if countTicketRequest(ticketLog, "show") != 2 {
+		t.Fatalf("ticket log = %q, want state and readiness observations", readText(ticketLog))
 	}
 	if len(readCodexCalls(t, codexLog)) != 1 {
 		t.Fatalf("Codex launched more than once: %q", readText(codexLog))

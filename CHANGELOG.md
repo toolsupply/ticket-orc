@@ -2,6 +2,14 @@
 
 All notable user-facing changes to `ticket-orc` are documented here.
 
+## [0.1.2] - 2026-10-04
+
+### Changed
+
+- Fixed error message on detected legacy .local state folder.
+- Improved loop detection, debounche using `ticket` v0.2.4 review -> hold.
+- Improved instance detection by presence of config.json.
+
 ## [0.1.1] - 2026-10-03
 
 ### Added
@@ -23,5 +31,6 @@ All notable user-facing changes to `ticket-orc` are documented here.
 
 - Initial release
 
+[0.1.2]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.2
 [0.1.1]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.1
 [0.1.0]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.0

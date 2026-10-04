@@ -16,6 +16,14 @@ Follow repository `AGENTS.md` and the installed Ticket Tasks Skill. This Skill a
 - Do not change a ticket merely to acknowledge a notification. Make ticket changes only as required by the work being done.
 - Respect cancellation and control instructions. Stop safely when canceled or told to stop; do not continue processing after that instruction.
 
+## Queue selection under Orc control
+
+When Orc signals that work is available, use Ticket's canonical claim operation for the assigned queue.
+
+Do not narrow the claim based on ticket tags, components, topics, or other metadata. Orc owns queue eligibility, filtering, and backpressure.
+
+Ticket tags may still be inspected and modified as ordinary ticket metadata when required by the work. The restriction applies only to using worker-chosen tags to alter Orc-controlled work selection.
+
 ## Implementation work
 
 - Read the ticket objective and acceptance criteria before changing code. Implement the requested behavior, not merely what existing tests happen to cover.

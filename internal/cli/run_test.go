@@ -1511,6 +1511,30 @@ func TestWorkerManagerReloadCommitsCompleteSteerPolicyAndDirtiesRepositories(t *
 	}
 }
 
+func TestDynamicSteerUsesResolvedRoleBounceLimit(t *testing.T) {
+	configured := 6
+	config := FileConfig{ID: "7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa", Roles: map[string]RoleFileConfig{
+		"coder": {TicketQueue: "open", MaxBounces: &configured},
+	}}
+	policies, err := resolveSteerRolePolicies(config, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policies["coder"].MaxBounces; got != 6 {
+		t.Fatalf("resolved role max_bounces = %d, want 6", got)
+	}
+	if got, want := policies["coder"].ContainmentActor, "ticket-orc."+config.ID; got != want {
+		t.Fatalf("containment actor = %q, want %q", got, want)
+	}
+	policies, err = resolveSteerRolePolicies(config, mapEnv(map[string]string{"TICKET_ORC_MAX_BOUNCES": "3"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policies["coder"].MaxBounces; got != 3 {
+		t.Fatalf("environment-resolved role max_bounces = %d, want 3", got)
+	}
+}
+
 type errorAfterErrChecks struct {
 	context.Context
 	calls  atomic.Int32

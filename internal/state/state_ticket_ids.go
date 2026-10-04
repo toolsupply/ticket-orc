@@ -21,6 +21,9 @@ func (snapshot Snapshot) TicketIDs() []string {
 			add(ticket)
 		}
 	}
+	for _, loop := range snapshot.Loops {
+		add(loop.Ticket)
+	}
 	ids := make([]string, 0, len(unique))
 	for id := range unique {
 		ids = append(ids, id)

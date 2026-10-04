@@ -26,13 +26,14 @@ func TestLegacyRuntimeLayoutIsRejectedWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = ensureLoadedRuntime(loaded)
-	if err == nil || !strings.Contains(err.Error(), "unsupported legacy ticket-orc runtime layout") {
-		t.Fatalf("legacy runtime error = %v, want unsupported-layout diagnostic", err)
+	wantError := "unsupported legacy ticket-orc runtime layout detected in " + localRoot +
+		"\n\nTo preserve config.json and reset only local runtime state, run:\n\n  ticket-orc doctor --reset-local" +
+		"\n\nTo replace both configuration and runtime with generated defaults, run:\n\n  ticket-orc init --force"
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("legacy runtime error = %q, want formatted diagnostic %q", err, wantError)
 	}
-	for _, instruction := range []string{"ticket-orc doctor --reset-local", "ticket-orc init --force", "configuration is valid"} {
-		if !strings.Contains(err.Error(), instruction) {
-			t.Fatalf("legacy runtime diagnostic omits %q: %v", instruction, err)
-		}
+	if _, err := inspectDoctorRuntime(loaded); err == nil || err.Error() != wantError {
+		t.Fatalf("doctor legacy runtime error = %q, want formatted diagnostic %q", err, wantError)
 	}
 	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
 		t.Fatalf("legacy runtime changed: data=%q err=%v", data, err)

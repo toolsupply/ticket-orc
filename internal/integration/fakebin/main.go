@@ -48,7 +48,7 @@ func runClaude() {
 
 func runTicket() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Fprintln(os.Stdout, "ticket 0.2.3 (api 2, storage 3)")
+		fmt.Fprintln(os.Stdout, "ticket 0.2.4 (api 2, storage 3)")
 		return
 	}
 	logPath := os.Getenv("TICKET_ORC_FAKE_TICKET_LOG")
@@ -121,6 +121,9 @@ func runTicket() {
 	if queue == "" {
 		queue = "open"
 	}
+	if state == "" {
+		state = queue
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
 	for scanner.Scan() {
@@ -132,6 +135,7 @@ func runTicket() {
 		}
 		if len(request.Args) > 0 {
 			appendLine(logPath, strings.Join(request.Args, " "))
+			appendLine(os.Getenv("TICKET_ORC_FAKE_TICKET_ACTOR_LOG"), os.Getenv("TICKET_ACTOR")+" "+strings.Join(request.Args, " "))
 		}
 		activeQueue := activeObservationQueue(request.Args)
 		switch {
@@ -145,6 +149,9 @@ func runTicket() {
 				continue
 			}
 			claimed = true
+			if assigneePath := os.Getenv("TICKET_ORC_FAKE_ASSIGNEE_FILE"); assigneePath != "" {
+				_ = os.WriteFile(assigneePath, []byte(os.Getenv("TICKET_ACTOR")), 0o600)
+			}
 			observedClaimState := claimState
 			if ticketClaimQueue(request.Args) == "review" && os.Getenv("TICKET_ORC_FAKE_REVIEW_CLAIM_STATE") != "" {
 				observedClaimState = os.Getenv("TICKET_ORC_FAKE_REVIEW_CLAIM_STATE")
@@ -152,7 +159,7 @@ func runTicket() {
 			_ = encoder.Encode(map[string]any{"item": map[string]any{
 				"id": ticketID, "state": observedClaimState, "assignee": os.Getenv("TICKET_ACTOR"),
 			}})
-		case len(request.Args) == 2 && request.Args[0] == "show" && request.Args[1] == ticketID:
+		case len(request.Args) >= 2 && request.Args[0] == "show" && request.Args[1] == ticketID:
 			if os.Getenv("TICKET_ORC_FAKE_TICKET_SHOW_BLOCK") == "1" {
 				for {
 					time.Sleep(time.Hour)
@@ -170,7 +177,30 @@ func runTicket() {
 				}
 				stateObservations++
 			}
-			_ = encoder.Encode(map[string]any{"id": ticketID, "state": observedState, "assignee": os.Getenv("TICKET_ACTOR")})
+			if statePath := os.Getenv("TICKET_ORC_FAKE_TICKET_STATE_FILE"); statePath != "" {
+				if persisted, err := os.ReadFile(statePath); err == nil {
+					observedState = strings.TrimSpace(string(persisted))
+				}
+			}
+			assignee := os.Getenv("TICKET_ACTOR")
+			if override, ok := os.LookupEnv("TICKET_ORC_FAKE_ASSIGNEE"); ok {
+				assignee = override
+			} else if activeObservations > 0 && (strings.TrimSpace(os.Getenv("TICKET_ORC_FAKE_ACTIVE_SEQUENCE")) != "" || os.Getenv("TICKET_ORC_FAKE_ACTIVE_FILE") != "") {
+				if !fakeTicketClaimActive(activeObservations - 1) {
+					assignee = ""
+				}
+			}
+			if assigneePath := os.Getenv("TICKET_ORC_FAKE_ASSIGNEE_FILE"); assigneePath != "" {
+				if persisted, err := os.ReadFile(assigneePath); err == nil {
+					assignee = strings.TrimSpace(string(persisted))
+				}
+			}
+			if len(request.Args) > 2 && request.Args[2] == "--readiness" {
+				ready := assignee == "" && (observedState == "open" || observedState == "review")
+				_ = encoder.Encode(map[string]any{"id": ticketID, "state": observedState, "assignee": assignee, "readiness": map[string]any{"ready": ready}})
+			} else {
+				_ = encoder.Encode(map[string]any{"id": ticketID, "state": observedState, "assignee": assignee})
+			}
 		case exactObservationArgs(request.Args, "ready", os.Getenv("TICKET_ORC_FAKE_QUEUE")):
 			ready := sequenceValue("TICKET_ORC_FAKE_READY_SEQUENCE", readyObservations, os.Getenv("TICKET_ORC_FAKE_READY") == "1")
 			readyObservations++
@@ -180,7 +210,7 @@ func runTicket() {
 				_ = encoder.Encode(map[string]any{"items": []any{}})
 			}
 		case activeQueue != "":
-			active := sequenceValue("TICKET_ORC_FAKE_ACTIVE_SEQUENCE", activeObservations, os.Getenv("TICKET_ORC_FAKE_ACTIVE") == "1")
+			active := fakeTicketClaimActive(activeObservations)
 			activeObservations++
 			if active {
 				_ = encoder.Encode(map[string]any{"items": []any{map[string]any{"id": ticketID, "state": activeQueue, "assignee": os.Getenv("TICKET_ACTOR")}}})
@@ -188,14 +218,29 @@ func runTicket() {
 				_ = encoder.Encode(map[string]any{"items": []any{}})
 			}
 		case ownedObservationArgs(request.Args, os.Getenv("TICKET_ORC_FAKE_QUEUE")):
-			active := sequenceValue("TICKET_ORC_FAKE_ACTIVE_SEQUENCE", activeObservations, os.Getenv("TICKET_ORC_FAKE_ACTIVE") == "1")
+			active := fakeTicketClaimActive(activeObservations)
 			activeObservations++
 			if active {
 				_ = encoder.Encode(map[string]any{"items": []any{map[string]any{"id": ticketID, "state": queue, "assignee": os.Getenv("TICKET_ACTOR")}}, "more": false})
 			} else {
 				_ = encoder.Encode(map[string]any{"items": []any{}, "more": false})
 			}
+		case len(request.Args) >= 2 && request.Args[0] == "hold":
+			fromState := os.Getenv("TICKET_ORC_FAKE_TICKET_STATE")
+			if fromState == "" {
+				fromState = "open"
+			}
+			if statePath := os.Getenv("TICKET_ORC_FAKE_TICKET_STATE_FILE"); statePath != "" {
+				_ = os.WriteFile(statePath, []byte("hold"), 0o600)
+			}
+			if assigneePath := os.Getenv("TICKET_ORC_FAKE_ASSIGNEE_FILE"); assigneePath != "" {
+				_ = os.WriteFile(assigneePath, nil, 0o600)
+			}
+			_ = encoder.Encode(map[string]any{"id": request.Args[1], "changed": true, "from_state": fromState, "state": "hold"})
 		case len(request.Args) == 2 && request.Args[0] == "release":
+			if assigneePath := os.Getenv("TICKET_ORC_FAKE_ASSIGNEE_FILE"); assigneePath != "" {
+				_ = os.WriteFile(assigneePath, nil, 0o600)
+			}
 			_ = encoder.Encode(map[string]any{"id": request.Args[1], "changed": true, "state": "open"})
 		default:
 			_ = encoder.Encode(map[string]any{"error": map[string]any{"code": "unsupported", "message": "unsupported fake ticket command"}})
@@ -265,6 +310,14 @@ func sequenceValue(name string, index int, fallback bool) bool {
 		index = len(values) - 1
 	}
 	return strings.TrimSpace(values[index]) == "1" || strings.EqualFold(strings.TrimSpace(values[index]), "true")
+}
+
+func fakeTicketClaimActive(index int) bool {
+	if path := os.Getenv("TICKET_ORC_FAKE_ACTIVE_FILE"); path != "" {
+		value, err := os.ReadFile(path)
+		return err == nil && strings.TrimSpace(string(value)) == "1"
+	}
+	return sequenceValue("TICKET_ORC_FAKE_ACTIVE_SEQUENCE", index, os.Getenv("TICKET_ORC_FAKE_ACTIVE") == "1")
 }
 
 func exactObservationArgs(args []string, command, queue string) bool {

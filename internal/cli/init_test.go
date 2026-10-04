@@ -956,9 +956,7 @@ func TestResolveInstanceDirectoryAndExplicitConfigDirectory(t *testing.T) {
 	}
 	t.Setenv("HOME", cwd)
 	t.Setenv("USERPROFILE", cwd)
-	if err := os.MkdirAll(filepath.Join(cwd, defaultInstanceDirectoryName), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeConfigFixture(t, filepath.Join(cwd, defaultInstanceDirectoryName, instanceConfigFileName), `{"version":1}`)
 	dir, err := resolveInstanceDir(cwd, emptyEnv)
 	if err != nil || dir != filepath.Join(cwd, defaultInstanceDirectoryName) {
 		t.Fatalf("default instance dir=%q err=%v", dir, err)

@@ -20,6 +20,10 @@ import (
 	"github.com/toolsupply/ticket-orc/internal/contextheadroom"
 )
 
+// Contention tests check lossless serialization rather than the production
+// lock deadline; filesystem sync and replacement can be slow on Windows CI.
+const contentionTestLockTimeout = 30 * time.Second
+
 func newStateTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
@@ -61,13 +65,158 @@ func TestSavedStateUsesInitialPublicSchema(t *testing.T) {
 		t.Fatalf("decode persisted state: %v", err)
 	}
 	var version int
-	if err := json.Unmarshal(wire["version"], &version); err != nil || version != 1 {
-		t.Fatalf("persisted version = %d, err=%v; want initial public version 1", version, err)
+	if err := json.Unmarshal(wire["version"], &version); err != nil || version != currentVersion {
+		t.Fatalf("persisted version = %d, err=%v; want current public version %d", version, err, currentVersion)
+	}
+	if _, exists := wire["ticket_loops"]; !exists {
+		t.Fatal("persisted schema omits ticket_loops")
+	}
+	if _, exists := wire["bounces"]; exists {
+		t.Fatal("persisted schema retains legacy bounces")
 	}
 	for _, removed := range []string{"initializations", "reorientations", "stale_at", "nudge_count"} {
 		if _, exists := wire[removed]; exists {
 			t.Errorf("persisted state contains removed field %q", removed)
 		}
+	}
+}
+
+func TestReleasedStateMigratesSessionsAndBouncesIntoTicketLoops(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	repository := filepath.Join(root, "repo")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := json.Marshal(struct {
+		Version  int            `json:"version"`
+		Sessions []Session      `json:"sessions"`
+		Bounces  map[string]int `json:"bounces"`
+	}{1, []Session{{Repository: repository, Ticket: "ticket-a", Role: "coder", Harness: "codex", ID: "session-a"}}, map[string]int{repository + "\x00ticket-a": 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, stateFileName), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewForRepository(stateDir, repository)
+	snapshot, err := store.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read migrated state: %v", err)
+	}
+	if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].ID != "session-a" {
+		t.Fatalf("migrated sessions = %#v", snapshot.Sessions)
+	}
+	loop, ok := snapshot.Loops[repository+"\x00ticket-a"]
+	if !ok || loop.BounceCount != 3 || loop.StallCount != 0 || loop.EffectiveBounceLimit != 0 || loop.Repository != repository || loop.Ticket != "ticket-a" || loop.Phase != TicketLoopActive {
+		t.Fatalf("migrated loop = %#v, found=%t", loop, ok)
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, stateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated struct {
+		Version int            `json:"version"`
+		Bounces map[string]int `json:"bounces"`
+	}
+	if err := json.Unmarshal(data, &migrated); err != nil || migrated.Version != currentVersion || migrated.Bounces != nil {
+		t.Fatalf("persisted migration = %#v, err=%v", migrated, err)
+	}
+}
+
+func TestTicketLoopParticipantLimitOnlyTightensAndStallsTripAtTwo(t *testing.T) {
+	ctx := context.Background()
+	store := newStateTestStore(t)
+	for index, limit := range []int{6, 3, 10} {
+		loop, tripped, err := store.Participate(ctx, "ticket", limit)
+		if err != nil {
+			t.Fatalf("Participate(%d): %v", limit, err)
+		}
+		want := []int{6, 3, 3}[index]
+		if loop.EffectiveBounceLimit != want {
+			t.Fatalf("effective limit after participant %d = %d, want %d", index, loop.EffectiveBounceLimit, want)
+		}
+		if tripped {
+			t.Fatalf("non-tripping participant %d reported that it tripped the circuit", index)
+		}
+	}
+	if _, err := store.RecordClaim(ctx, "ticket", "coder-a", "open"); err != nil {
+		t.Fatal(err)
+	}
+	first, consumed, err := store.RecordStall(ctx, "ticket", 1)
+	if err != nil || !consumed || first.StallCount != 1 || first.Phase != TicketLoopActive {
+		t.Fatalf("first stall = %#v, %v", first, err)
+	}
+	if _, err := store.RecordClaim(ctx, "ticket", "coder-b", "open"); err != nil {
+		t.Fatal(err)
+	}
+	second, consumed, err := store.RecordStall(ctx, "ticket", 2)
+	if err != nil || !consumed || second.StallCount != 2 || second.Phase != TicketLoopContainmentPending {
+		t.Fatalf("second stall = %#v, %v", second, err)
+	}
+}
+
+func TestTicketLoopParticipationReportsOnlyItsOwnCircuitTrip(t *testing.T) {
+	ctx := context.Background()
+	store := newStateTestStore(t)
+	loop, tripped, err := store.Participate(ctx, "ticket", 6)
+	if err != nil || tripped {
+		t.Fatalf("initial participation loop=%#v tripped=%t err=%v", loop, tripped, err)
+	}
+	loop, err = store.RecordClaim(ctx, "ticket", "reviewer", "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, consumed, err := store.RecordBounce(ctx, "ticket", loop.AttemptID); err != nil || !consumed {
+		t.Fatalf("seed bounce consumed=%t err=%v", consumed, err)
+	}
+	loop, tripped, err = store.Participate(ctx, "ticket", 1)
+	if err != nil || !tripped || loop.Phase != TicketLoopContainmentPending {
+		t.Fatalf("tightening participant loop=%#v tripped=%t err=%v", loop, tripped, err)
+	}
+	loop, tripped, err = store.Participate(ctx, "ticket", 1)
+	if err != nil || tripped || loop.Phase != TicketLoopContainmentPending {
+		t.Fatalf("participant observing existing trip loop=%#v tripped=%t err=%v", loop, tripped, err)
+	}
+}
+
+func TestTicketLoopBounceLimitTripsAtInclusiveBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := newStateTestStore(t)
+	if _, _, err := store.Participate(ctx, "ticket", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordClaim(ctx, "ticket", "reviewer", "review"); err != nil {
+		t.Fatal(err)
+	}
+	loop, consumed, err := store.RecordBounce(ctx, "ticket", 1)
+	if err != nil || !consumed || loop.BounceCount != 1 || loop.Phase != TicketLoopActive || loop.ClaimState != "" {
+		t.Fatalf("first bounce = %#v, %v", loop, err)
+	}
+	if _, err := store.RecordClaim(ctx, "ticket", "reviewer", "review"); err != nil {
+		t.Fatal(err)
+	}
+	loop, consumed, err = store.RecordBounce(ctx, "ticket", 2)
+	if err != nil || !consumed || loop.BounceCount != 2 || loop.Phase != TicketLoopContainmentPending {
+		t.Fatalf("boundary bounce = %#v, %v", loop, err)
+	}
+}
+
+func TestTerminalCleanupRemovesTicketLoop(t *testing.T) {
+	ctx := context.Background()
+	store := newStateTestStore(t)
+	if _, _, err := store.Participate(ctx, "terminal", 6); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkContainmentPending(ctx, "terminal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := store.RemoveTicket(ctx, "terminal"); err != nil || !changed {
+		t.Fatalf("RemoveTicket changed=%t err=%v", changed, err)
+	}
+	if _, found, err := store.TicketLoop(ctx, "terminal"); err != nil || found {
+		t.Fatalf("ticket loop remains found=%t err=%v", found, err)
 	}
 }
 
@@ -143,7 +292,7 @@ func TestMalformedUnnamespacedTicketStateIsRejected(t *testing.T) {
 }
 
 func TestUnsupportedStateVersionFailsClearly(t *testing.T) {
-	for _, version := range []int{0, 2, 3, 4} {
+	for _, version := range []int{0, 3, 4, 5} {
 		t.Run(strconv.Itoa(version), func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "state")
 			if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -325,7 +474,9 @@ func TestMalformedStateIsRejected(t *testing.T) {
 		data string
 	}{
 		{"invalid JSON", "{"},
-		{"unsupported version", `{"version":2,"sessions":[],"bounces":{}}`},
+		{"unsupported version", `{"version":3,"sessions":[],"ticket_loops":{}}`},
+		{"schema v2 missing ticket loops", `{"version":2,"sessions":[]}`},
+		{"schema v2 null ticket loops", `{"version":2,"sessions":[],"ticket_loops":null}`},
 		{"removed initialization field", `{"version":1,"sessions":[],"bounces":{},"initializations":[]}`},
 		{"unknown field", `{"version":1,"sessions":[],"bounces":{},"extra":true}`},
 		{"negative bounce", `{"version":1,"sessions":[],"bounces":{"/repo\u0000ticket":-1}}`},
@@ -485,6 +636,7 @@ func TestConcurrentUpdatesDoNotLoseData(t *testing.T) {
 	const workers = 6
 	const increments = 12
 	store := newStateTestStore(t)
+	store.lockTimeout = contentionTestLockTimeout
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
@@ -600,6 +752,7 @@ func TestStateProcessHelper(t *testing.T) {
 		t.Fatalf("parse iterations: %v", err)
 	}
 	store := newStateTestStoreAt(t, dir)
+	store.lockTimeout = contentionTestLockTimeout
 	ctx := context.Background()
 	switch mode {
 	case "update":

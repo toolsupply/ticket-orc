@@ -131,7 +131,7 @@ func inspectDoctorRuntime(loaded LoadedFileConfig) (bool, error) {
 		return false, fmt.Errorf("inspect local runtime root %s: %w", localRoot, readErr)
 	}
 	if isLegacyRuntimeLayout(localRoot, entries) {
-		return false, fmt.Errorf("unsupported legacy ticket-orc runtime layout detected in %s\n\nThe configuration is valid, but its local runtime uses an older, unsupported layout.\n\nTo preserve config.json and reset only local runtime state, run:\n\n    ticket-orc doctor --reset-local\n\nTo replace both configuration and runtime with generated defaults, run:\n\n    ticket-orc init --force", localRoot)
+		return false, unsupportedLegacyRuntimeLayoutError(localRoot)
 	}
 	if len(entries) == 0 {
 		return false, nil

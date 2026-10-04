@@ -88,7 +88,7 @@ func ensureRuntimeOwnership(localDir, instanceID string, localDirConfigured bool
 				return fmt.Errorf("inspect runtime directory %s: %w", localDir, readErr)
 			}
 			if isLegacyRuntimeLayout(localDir, entries) {
-				return fmt.Errorf("unsupported legacy ticket-orc runtime layout detected in %s\n\nThe configuration is valid, but its local runtime uses an older, unsupported layout.\n\nTo preserve config.json and reset only local runtime state, run:\n\n    ticket-orc doctor --reset-local\n\nTo replace both configuration and runtime with generated defaults, run:\n\n    ticket-orc init --force", localDir)
+				return unsupportedLegacyRuntimeLayoutError(localDir)
 			}
 			if len(entries) != 0 {
 				if _, markerErr := os.Lstat(markerPath); markerErr == nil {
@@ -134,6 +134,10 @@ func ensureRuntimeOwnership(localDir, instanceID string, localDirConfigured bool
 		return fmt.Errorf("Orc runtime belongs to instance %s, but config declares %s\n       runtime: %s\n       restore the original config ID or reset the instance with `ticket-orc init --force`", marker.InstanceID, instanceID, localDir)
 	}
 	return nil
+}
+
+func unsupportedLegacyRuntimeLayoutError(localRoot string) error {
+	return fmt.Errorf("unsupported legacy ticket-orc runtime layout detected in %s\n\nTo preserve config.json and reset only local runtime state, run:\n\n  ticket-orc doctor --reset-local\n\nTo replace both configuration and runtime with generated defaults, run:\n\n  ticket-orc init --force", localRoot)
 }
 
 func isLegacyRuntimeLayout(localDir string, entries []os.DirEntry) bool {

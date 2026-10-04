@@ -14,7 +14,7 @@ import (
 func TestRunTicketVersionFailurePrecedesRuntime(t *testing.T) {
 	runCalled := false
 	var stdout, stderr bytes.Buffer
-	err := errors.New("incompatible Ticket version: ticket-orc requires ticket >= v0.2.3; found v0.2.2")
+	err := errors.New("incompatible Ticket version: ticket-orc requires ticket >= v0.2.4; found v0.2.3")
 	code := runWithExecutors([]string{"run"}, &stdout, &stderr, testInstanceEnv(t), commandExecutors{
 		ticketCompatibility: func() error { return err },
 		run: func(RunConfig, io.Writer, io.Writer) error {

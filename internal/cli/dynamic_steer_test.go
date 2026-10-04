@@ -174,6 +174,27 @@ type sequenceSteerClient struct {
 	readyFilters   []ticketclient.QueueFilters
 }
 
+type loopAwareSteerClient struct {
+	*sequenceSteerClient
+	ticket ticketclient.Ticket
+}
+
+func (c *loopAwareSteerClient) Show(context.Context, string) (ticketclient.Ticket, error) {
+	return c.ticket, nil
+}
+
+func (c *loopAwareSteerClient) ShowReadiness(context.Context, string) (ticketclient.TicketDetail, error) {
+	return ticketclient.TicketDetail{ID: c.ticket.ID, State: c.ticket.State, Assignee: c.ticket.Assignee, Readiness: &ticketclient.TicketReadiness{Ready: c.ticket.Assignee == ""}}, nil
+}
+
+func (c *loopAwareSteerClient) ReadyFrontier(ctx context.Context, queue string, filters ticketclient.QueueFilters, limit int) (ticketclient.ListResult, error) {
+	result, err := c.sequenceSteerClient.ReadyFrontier(ctx, queue, filters, limit)
+	if err == nil && len(result.Items) > 0 {
+		result.Items[0].ID = c.ticket.ID
+	}
+	return result, err
+}
+
 type countingSteerClient struct {
 	activeCalls atomic.Int32
 	readyCalls  atomic.Int32
@@ -227,6 +248,14 @@ func (c *policyReloadBarrierSteerClient) ReadyFrontier(_ context.Context, queue 
 		<-c.release
 	}
 	return testTicketList("20260926-00002", queue), nil
+}
+
+func (c *policyReloadBarrierSteerClient) Show(context.Context, string) (ticketclient.Ticket, error) {
+	return ticketclient.Ticket{ID: "20260926-00002", State: "review"}, nil
+}
+
+func (c *policyReloadBarrierSteerClient) ShowReadiness(context.Context, string) (ticketclient.TicketDetail, error) {
+	return ticketclient.TicketDetail{ID: "20260926-00002", State: "review", Readiness: &ticketclient.TicketReadiness{Ready: true}}, nil
 }
 
 func (c *policyReloadBarrierSteerClient) filterSnapshot() []ticketclient.QueueFilters {
@@ -385,65 +414,6 @@ func TestSteerDirtySetConcurrentRepositoryMarksDoNotBlockOrDisappear(t *testing.
 	snapshot := dirty.Drain()
 	if snapshot.all || len(snapshot.repositories) != marks {
 		t.Fatalf("concurrent dirty snapshot has %d repositories, want %d: %#v", len(snapshot.repositories), marks, snapshot)
-	}
-}
-
-func TestBoundedSteerTicketObservationsReturnTicketIDs(t *testing.T) {
-	client := &sequenceSteerClient{
-		activeByQueue: map[string][]bool{"open": {false}, "review": {true}},
-		ready:         []bool{true},
-	}
-	active, err := boundedActorActive(context.Background(), client)
-	if err != nil || active != "20260926-00001" {
-		t.Fatalf("boundedActorActive()=%q, %v", active, err)
-	}
-	ready, err := boundedReady(context.Background(), client, "open", ticketclient.QueueFilters{})
-	if err != nil || ready != "20260926-00002" {
-		t.Fatalf("boundedReady()=%q, %v", ready, err)
-	}
-}
-
-func TestSteerObservationUsesActorWideBusyAndCompleteRoleFilters(t *testing.T) {
-	policy := steerRolePolicy{TicketQueue: "open", QueueFilters: ticketclient.QueueFilters{Tags: []string{"required"}}, NudgePrompt: "work"}
-	busy := &sequenceSteerClient{activeByQueue: map[string][]bool{"open": {false}, "review": {true}}, ready: []bool{true}}
-	active, err := observeSteerActiveTicket(context.Background(), busy, policy)
-	if err != nil || active == "" {
-		t.Fatalf("cross-queue active claim = %q, err=%v", active, err)
-	}
-	ready, err := observeSteerReadyTicket(context.Background(), busy, policy, string(orc.SteerIdle), active)
-	if err != nil || ready != "" || busy.ri != 0 {
-		t.Fatalf("busy actor ready observation = %q, err=%v; ready calls=%d", ready, err, busy.ri)
-	}
-
-	free := &sequenceSteerClient{activeByQueue: map[string][]bool{"open": {false}, "review": {false}}, ready: []bool{true}}
-	active, err = observeSteerActiveTicket(context.Background(), free, policy)
-	if err != nil || active != "" {
-		t.Fatalf("free actor active observation = %q, err=%v", active, err)
-	}
-	ready, err = observeSteerReadyTicket(context.Background(), free, policy, string(orc.SteerIdle), active)
-	wantFilters := ticketclient.QueueFilters{Tags: []string{"required"}}
-	if err != nil || ready == "" || !reflect.DeepEqual(free.readyQueues, []string{"open"}) || !reflect.DeepEqual(free.readyFilters, []ticketclient.QueueFilters{wantFilters}) {
-		t.Fatalf("free actor ready observation=%q err=%v queues=%v filters=%#v", ready, err, free.readyQueues, free.readyFilters)
-	}
-}
-
-func TestSteerObservationSuppressesNudgeWhenFilteredReadyFrontierIsEmpty(t *testing.T) {
-	policy := steerRolePolicy{
-		TicketQueue: "open", QueueFilters: ticketclient.QueueFilters{Tags: []string{"backend", "urgent"}},
-		NudgePrompt: "backend urgent work",
-	}
-	client := &sequenceSteerClient{
-		activeByQueue: map[string][]bool{"open": {false}, "review": {false}},
-		ready:         []bool{false},
-	}
-	active, err := observeSteerActiveTicket(context.Background(), client, policy)
-	if err != nil || active != "" {
-		t.Fatalf("active claim=%q err=%v", active, err)
-	}
-	ready, err := observeSteerReadyTicket(context.Background(), client, policy, string(orc.SteerIdle), active)
-	wantFilters := []ticketclient.QueueFilters{{Tags: []string{"backend", "urgent"}}}
-	if err != nil || ready != "" || !reflect.DeepEqual(client.readyFilters, wantFilters) {
-		t.Fatalf("filtered ready ticket=%q err=%v filters=%#v, want no eligible work under %#v", ready, err, client.readyFilters, wantFilters)
 	}
 }
 
@@ -1098,32 +1068,61 @@ func (c *terminalObservationSteerClient) Close() error {
 	return nil
 }
 
+type successfulObservationSteerClient struct {
+	activeCalls atomic.Int32
+	readyCalls  atomic.Int32
+}
+
+func (c *successfulObservationSteerClient) ActiveClaims(context.Context, string, int) (ticketclient.ListResult, error) {
+	c.activeCalls.Add(1)
+	return ticketclient.ListResult{}, nil
+}
+
+func (c *successfulObservationSteerClient) ReadyFrontier(context.Context, string, ticketclient.QueueFilters, int) (ticketclient.ListResult, error) {
+	c.readyCalls.Add(1)
+	return ticketclient.ListResult{}, nil
+}
+
+func (c *successfulObservationSteerClient) Close() error { return nil }
+
 func TestDynamicSteerReconnectsAfterTerminalTicketObservationFailure(t *testing.T) {
 	dir := t.TempDir()
-	reg := state.SteerRegistration{RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker", Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread}
-	_, _, _, err := state.NewRegistrationStore(dir).Join(context.Background(), reg)
-	if err != nil {
-		t.Fatal(err)
+	registrations := state.NewRegistrationStore(dir)
+	const secondRepositoryID = "22222222-2222-4222-8222-222222222222"
+	for _, reg := range []state.SteerRegistration{
+		{RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker-a", Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: "worker-a-thread"},
+		{RepositoryID: secondRepositoryID, RepositoryPath: dir, Actor: "worker-b", Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: "worker-b-thread"},
+	} {
+		if _, _, _, err := registrations.Join(context.Background(), reg); err != nil {
+			t.Fatal(err)
+		}
 	}
 	failedClient := &terminalObservationSteerClient{}
-	var clients atomic.Int32
+	var firstRepositoryClients atomic.Int32
+	var secondRepositoryClients atomic.Int32
+	secondRepositoryClient := &successfulObservationSteerClient{}
 	reconnected := make(chan struct{})
 	statuses := &dynamicSteerStatus{}
 	dirty := newSteerDirtySet()
+	registrationTicks := make(chan time.Time)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runDynamicSteerWithDirtySet(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, nil, func(state.SteerRegistration) (steerClient, error) {
-			if clients.Add(1) == 1 {
-				return failedClient, nil
+		runDynamicSteerWithSchedule(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, nil, func(reg state.SteerRegistration) (steerClient, error) {
+			if reg.RepositoryID == joinTestRepositoryID {
+				if firstRepositoryClients.Add(1) == 1 {
+					return failedClient, nil
+				}
+				select {
+				case <-reconnected:
+				default:
+					close(reconnected)
+				}
+				return &successfulObservationSteerClient{}, nil
 			}
-			select {
-			case <-reconnected:
-			default:
-				close(reconnected)
-			}
-			return &sequenceSteerClient{active: []bool{false}, ready: []bool{false}}, nil
+			secondRepositoryClients.Add(1)
+			return secondRepositoryClient, nil
 		}, testSteerRouter(t, func(_ context.Context, _ string, _ state.SteerRegistration, message steertransport.Message) error {
 			if message.Kind != steertransport.MessageSteer {
 				t.Errorf("notification kind=%q, want steer", message.Kind)
@@ -1132,26 +1131,176 @@ func TestDynamicSteerReconnectsAfterTerminalTicketObservationFailure(t *testing.
 				t.Errorf("initial notification omitted bootstrap: %q", message.Text)
 			}
 			return nil
-		}), statuses, nil, dirty)
+		}), statuses, nil, newRegistrationObserver(registrations), nil, dirty, registrationTicks)
 	}()
 	defer func() {
 		cancel()
 		<-done
 	}()
 	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
-		return len(items) == 1 && items[0].State == "none" && items[0].Code == "ticket_observation_failed"
+		return len(items) == 2 && steerStatusForActor(items, "worker-a").Code == "ticket_observation_failed" && steerStatusForActor(items, "worker-b").Code == ""
 	})
-	dirty.MarkAll()
+	if got := secondRepositoryClients.Load(); got != 1 {
+		t.Fatalf("healthy repository Ticket clients=%d, want initial observation only", got)
+	}
+	if got := secondRepositoryClient.activeCalls.Load(); got != 2 {
+		t.Fatalf("healthy repository ActiveClaims calls=%d, want two initial queue checks", got)
+	}
+	if got := secondRepositoryClient.readyCalls.Load(); got != 1 {
+		t.Fatalf("healthy repository ReadyFrontier calls=%d, want one initial check", got)
+	}
+	// The manual registration tick advances the retry clock without producing
+	// a repository event. Only the repository with the failed observation is
+	// reconciled.
+	registrationTicks <- time.Now().Add(time.Hour)
 	select {
 	case <-reconnected:
 	case <-time.After(3 * time.Second):
-		t.Fatal("dirty reconciliation did not recreate the failed Ticket client")
+		t.Fatal("retry deadline did not recreate the failed Ticket client")
 	}
-	if clients.Load() < 2 {
-		t.Fatalf("Ticket client factory called %d time(s), want reconnect after terminal failure", clients.Load())
+	if got := firstRepositoryClients.Load(); got != 2 {
+		t.Fatalf("failed repository Ticket clients=%d, want a replacement client", got)
 	}
 	if !failedClient.closed.Load() {
 		t.Fatal("terminal Ticket client was not closed when discarded")
+	}
+	if got := secondRepositoryClients.Load(); got != 1 {
+		t.Fatalf("unaffected repository Ticket clients=%d, want no retry", got)
+	}
+	if got := secondRepositoryClient.activeCalls.Load(); got != 2 {
+		t.Fatalf("unaffected repository ActiveClaims calls=%d, want no retry", got)
+	}
+	if got := secondRepositoryClient.readyCalls.Load(); got != 1 {
+		t.Fatalf("unaffected repository ReadyFrontier calls=%d, want no retry", got)
+	}
+	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+		return steerStatusForActor(items, "worker-a").Code == "" && steerStatusForActor(items, "worker-b").Code == ""
+	})
+}
+
+func steerStatusForActor(items []daemon.SteerStatus, actor string) daemon.SteerStatus {
+	for _, item := range items {
+		if item.Actor == actor {
+			return item
+		}
+	}
+	return daemon.SteerStatus{}
+}
+
+func TestSteerRetryScheduleUsesBoundedBackoffAndClearsAfterObservation(t *testing.T) {
+	const repositoryID = "11111111-1111-4111-8111-111111111111"
+	registration := state.SteerRegistration{RepositoryID: repositoryID, Actor: "worker", RegistrationID: "incarnation"}
+	key := steerRegistrationKey(registration)
+	work := steerDirtySnapshot{repositories: map[string]struct{}{repositoryID: {}}}
+	schedule := newSteerRetrySchedule()
+	now := time.Date(2026, time.October, 3, 0, 0, 0, 0, time.UTC)
+	wantDelays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second}
+	for index, delay := range wantDelays {
+		schedule.Reconcile(work, []state.SteerRegistration{registration}, map[string]bool{key: true}, nil, now)
+		if got := schedule.Due(now.Add(delay - time.Nanosecond)); !got.empty() {
+			t.Fatalf("retry %d became due early: %#v", index+1, got)
+		}
+		due := schedule.Due(now.Add(delay))
+		if len(due.repositories) != 1 {
+			t.Fatalf("retry %d due repositories=%#v, want only %s", index+1, due.repositories, repositoryID)
+		}
+		now = now.Add(delay)
+	}
+	schedule.Reconcile(work, []state.SteerRegistration{registration}, nil, map[string]bool{key: true}, now)
+	if got := schedule.Due(now.Add(time.Hour)); !got.empty() {
+		t.Fatalf("successful authoritative observation retained retry: %#v", got)
+	}
+}
+
+func TestDynamicSteerPersistentObservationFailureWaitsForBackoff(t *testing.T) {
+	dir := t.TempDir()
+	registration := state.SteerRegistration{RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker", Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread}
+	registrations := state.NewRegistrationStore(dir)
+	if _, _, _, err := registrations.Join(context.Background(), registration); err != nil {
+		t.Fatal(err)
+	}
+	var clients atomic.Int32
+	statuses := &dynamicSteerStatus{}
+	registrationTicks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runDynamicSteerWithSchedule(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, nil,
+			func(state.SteerRegistration) (steerClient, error) {
+				clients.Add(1)
+				return &terminalObservationSteerClient{}, nil
+			}, testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+				t.Error("unexpected wake after failed Ticket observation")
+				return nil
+			}), statuses, nil, newRegistrationObserver(registrations), nil, newSteerDirtySet(), registrationTicks)
+	}()
+	defer func() { cancel(); <-done }()
+	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+		return len(items) == 1 && items[0].Code == "ticket_observation_failed"
+	})
+	if got := clients.Load(); got != 1 {
+		t.Fatalf("initial Ticket clients=%d, want one", got)
+	}
+
+	firstRetry := time.Now().Add(time.Hour)
+	registrationTicks <- firstRetry
+	waitSteerClientFactoryCount(t, &clients, 2)
+	// The second failure is delayed by two seconds, measured from the retry
+	// reconciliation's logical time rather than wall-clock test duration.
+	registrationTicks <- firstRetry.Add(time.Second)
+	if got := clients.Load(); got != 2 {
+		t.Fatalf("Ticket clients before second deadline=%d, want two", got)
+	}
+	registrationTicks <- firstRetry.Add(2 * time.Second)
+	waitSteerClientFactoryCount(t, &clients, 3)
+}
+
+func waitSteerClientFactoryCount(t *testing.T, clients *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := clients.Load(); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Ticket client factory calls=%d, want at least %d", clients.Load(), want)
+}
+
+func TestDynamicSteerRepositoryEventImmediatelyRetriesFailedObservation(t *testing.T) {
+	dir := t.TempDir()
+	registration := state.SteerRegistration{RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker", Role: "coder", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread}
+	registrations := state.NewRegistrationStore(dir)
+	if _, _, _, err := registrations.Join(context.Background(), registration); err != nil {
+		t.Fatal(err)
+	}
+	var clients atomic.Int32
+	statuses := &dynamicSteerStatus{}
+	dirty := newSteerDirtySet()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runDynamicSteerWithDirtySet(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, nil,
+			func(state.SteerRegistration) (steerClient, error) {
+				if clients.Add(1) == 1 {
+					return &terminalObservationSteerClient{}, nil
+				}
+				return &successfulObservationSteerClient{}, nil
+			}, testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error { return nil }),
+			statuses, nil, dirty)
+	}()
+	defer func() { cancel(); <-done }()
+	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+		return len(items) == 1 && items[0].Code == "ticket_observation_failed"
+	})
+	dirty.MarkRepository(joinTestRepositoryID)
+	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+		return len(items) == 1 && items[0].Code == ""
+	})
+	if got := clients.Load(); got != 2 {
+		t.Fatalf("Ticket client factory calls=%d, want immediate event-driven retry", got)
 	}
 }
 
@@ -1439,6 +1588,11 @@ func TestDynamicSteerSuppressionPreservesPendingDeliveryUntilResume(t *testing.T
 		t.Fatal(err)
 	}
 	controlStore := state.NewDaemonControlStore(dir)
+	const ticketID = "20260926-00002"
+	ticketLoops := state.NewForRepository(dir, joinTestRepositoryID)
+	if _, _, err := ticketLoops.Participate(context.Background(), ticketID, 6); err != nil {
+		t.Fatal(err)
+	}
 	paused, err := controlStore.PauseDaemon(context.Background())
 	if err != nil || paused.Mode != state.DaemonPaused {
 		t.Fatalf("persist pause = %#v, %v", paused, err)
@@ -1451,9 +1605,9 @@ func TestDynamicSteerSuppressionPreservesPendingDeliveryUntilResume(t *testing.T
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runDynamicSteerWithGate(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "work"}}, nil,
+		runDynamicSteerWithGate(ctx, dir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "work", MaxBounces: 1, ContainmentActor: "ticket-orc.instance"}}, nil,
 			func(state.SteerRegistration) (steerClient, error) {
-				return &sequenceSteerClient{active: []bool{false}, ready: []bool{true}}, nil
+				return &loopAwareSteerClient{sequenceSteerClient: &sequenceSteerClient{active: []bool{false}, ready: []bool{true}}, ticket: ticketclient.Ticket{ID: ticketID, State: "open"}}, nil
 			},
 			testSteerRouter(t, func(_ context.Context, _ string, _ state.SteerRegistration, message steertransport.Message) error {
 				queued <- message.Text
@@ -1467,6 +1621,10 @@ func TestDynamicSteerSuppressionPreservesPendingDeliveryUntilResume(t *testing.T
 	})
 	if len(queued) != 0 {
 		t.Fatalf("paused daemon queued %q", <-queued)
+	}
+	loop, found, err := ticketLoops.TicketLoop(context.Background(), ticketID)
+	if err != nil || !found || loop.EffectiveBounceLimit != 6 || loop.Phase != state.TicketLoopActive {
+		t.Fatalf("paused registration participated in ticket loop=%#v found=%t err=%v", loop, found, err)
 	}
 	snapshot, err := state.NewSteerRuntimeStore(dir).Snapshot(context.Background())
 	if err != nil || len(snapshot.Deliveries) != 1 {
@@ -1487,6 +1645,63 @@ func TestDynamicSteerSuppressionPreservesPendingDeliveryUntilResume(t *testing.T
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("resume did not deliver pending bootstrap for %s", registration.SessionID)
+	}
+	loop, found, err = ticketLoops.TicketLoop(context.Background(), ticketID)
+	if err != nil || !found || loop.EffectiveBounceLimit != 1 {
+		t.Fatalf("current registration did not participate before delivery: loop=%#v found=%t err=%v", loop, found, err)
+	}
+}
+
+func TestDynamicSteerParticipationThatTripsContainmentSuppressesDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	if _, _, _, err := state.NewRegistrationStore(dir).Join(ctx, state.SteerRegistration{
+		RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker", Role: "coder",
+		Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const ticketID = "20261003-56321"
+	loopStore := state.NewForRepository(dir, joinTestRepositoryID)
+	loop, _, err := loopStore.Participate(ctx, ticketID, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop, err = loopStore.RecordClaim(ctx, ticketID, "previous-worker", "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, consumed, err := loopStore.RecordBounce(ctx, ticketID, loop.AttemptID); err != nil || !consumed {
+		t.Fatalf("seed bounce consumed=%t err=%v", consumed, err)
+	}
+	client := &loopAwareSteerClient{
+		sequenceSteerClient: &sequenceSteerClient{active: []bool{false}, ready: []bool{true}},
+		ticket:              ticketclient.Ticket{ID: ticketID, State: "open", Assignee: "other-worker"},
+	}
+	queued := make(chan struct{}, 1)
+	statuses := &dynamicSteerStatus{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runDynamicSteer(ctx, dir, map[string]steerRolePolicy{"coder": {
+			TicketQueue: "open", NudgePrompt: "work", MaxBounces: 1, ContainmentActor: "ticket-orc.instance",
+		}}, nil, func(state.SteerRegistration) (steerClient, error) { return client, nil },
+			testSteerRouter(t, func(context.Context, string, state.SteerRegistration, steertransport.Message) error {
+				queued <- struct{}{}
+				return nil
+			}), statuses)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+		return len(items) == 1 && items[0].Code == "ticket_containment_pending"
+	})
+	if len(queued) != 0 {
+		t.Fatal("dynamic steer queued work after participation tripped containment")
+	}
+	loop, found, err := loopStore.TicketLoop(context.Background(), ticketID)
+	if err != nil || !found || loop.Phase != state.TicketLoopContainmentPending || loop.EffectiveBounceLimit != 1 {
+		t.Fatalf("dynamic participation loop=%#v found=%t err=%v", loop, found, err)
 	}
 }
 
@@ -1698,9 +1913,13 @@ func TestDynamicSteerSuppressesReadyObservedUnderSupersededPolicy(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	ticketLoops := state.NewForRepository(dir, joinTestRepositoryID)
+	if _, _, err := ticketLoops.Participate(ctx, "20260926-00002", 6); err != nil {
+		t.Fatal(err)
+	}
 	client := &policyReloadBarrierSteerClient{observed: make(chan struct{}), release: make(chan struct{})}
 	policies := newSteerPolicyStore(map[string]steerRolePolicy{
-		"coder": {TicketQueue: "open", QueueFilters: ticketclient.QueueFilters{Tags: []string{"old"}}, NudgePrompt: "old policy"},
+		"coder": {TicketQueue: "open", QueueFilters: ticketclient.QueueFilters{Tags: []string{"old"}}, NudgePrompt: "old policy", MaxBounces: 6, ContainmentActor: "ticket-orc.instance"},
 	})
 	dirty := newSteerDirtySet()
 	queued := make(chan string, 2)
@@ -1734,7 +1953,7 @@ func TestDynamicSteerSuppressesReadyObservedUnderSupersededPolicy(t *testing.T) 
 		t.Fatal("old policy ready query did not start")
 	}
 	policies.Replace(map[string]steerRolePolicy{
-		"coder": {TicketQueue: "review", QueueFilters: ticketclient.QueueFilters{Tags: []string{"new"}, WithoutTags: []string{"blocked"}}, NudgePrompt: "new policy"},
+		"coder": {TicketQueue: "review", QueueFilters: ticketclient.QueueFilters{Tags: []string{"new"}, WithoutTags: []string{"blocked"}}, NudgePrompt: "new policy", MaxBounces: 1, ContainmentActor: "ticket-orc.instance"},
 	})
 	dirty.MarkAll()
 	// The old Ticket query is still blocked. Exercise the same projection used
@@ -1748,6 +1967,10 @@ func TestDynamicSteerSuppressesReadyObservedUnderSupersededPolicy(t *testing.T) 
 	cached := statuses.snapshot()
 	if len(cached) != 1 || cached[0].EffectiveTicketQueue != "open" || !reflect.DeepEqual(cached[0].EffectiveTicketTags, []string{"old"}) {
 		t.Fatalf("status projection mutated the asynchronous cache: %#v", cached)
+	}
+	loop, found, err := ticketLoops.TicketLoop(ctx, "20260926-00002")
+	if err != nil || !found || loop.EffectiveBounceLimit != 6 {
+		t.Fatalf("superseded observation tightened ticket loop=%#v found=%t err=%v", loop, found, err)
 	}
 	frontierKey := queueForecastFrontierKey(queueForecastOwner{RepositoryID: registration.RepositoryID, Queue: "review", filters: ticketclient.QueueFilters{Tags: []string{"new"}, WithoutTags: []string{"blocked"}}})
 	owners, err := queueForecast(ctx, LoadedFileConfig{Instance: InstanceContext{InstanceDir: dir, LocalDir: dir}}, status, func(identity currentTicketIdentity) (localTicketReader, error) {
@@ -1766,6 +1989,10 @@ func TestDynamicSteerSuppressesReadyObservedUnderSupersededPolicy(t *testing.T) 
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("current policy did not reconcile and notify ready work")
+	}
+	loop, found, err = ticketLoops.TicketLoop(ctx, "20260926-00002")
+	if err != nil || !found || loop.EffectiveBounceLimit != 1 {
+		t.Fatalf("current selected registration did not participate at delivery: loop=%#v found=%t err=%v", loop, found, err)
 	}
 	select {
 	case message := <-queued:
@@ -1882,66 +2109,6 @@ func TestDynamicSteerNoOpPolicyReloadDuringReconciliationPreservesDispatch(t *te
 	}
 	if filters := client.filterSnapshot(); len(filters) != 1 {
 		t.Fatalf("no-op reload caused another reconciliation query: %#v", filters)
-	}
-}
-
-func TestDynamicSteerReconcilesMatchingWorkAfterCrossQueueClaimEnds(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	registration, _, _, err := state.NewRegistrationStore(dir).Join(ctx, state.SteerRegistration{
-		RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "worker", Role: "coder",
-		Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	persistence := state.NewSteerRuntimeStore(dir)
-	if err := persistence.Reconcile(ctx, []state.SteerRegistration{registration}); err != nil {
-		t.Fatal(err)
-	}
-	if updated, err := persistence.CompleteDelivery(ctx, registration, string(orc.SteerQueued), false, false); err != nil || !updated {
-		t.Fatalf("seed outstanding delivery updated=%t err=%v", updated, err)
-	}
-	client := &sequenceSteerClient{
-		activeByQueue: map[string][]bool{"open": {true, false}, "review": {false}},
-		ready:         []bool{true},
-	}
-	policy := steerRolePolicy{TicketQueue: "open", QueueFilters: ticketclient.QueueFilters{Tags: []string{"matching"}}, NudgePrompt: "matching work"}
-	policies := newSteerPolicyStore(map[string]steerRolePolicy{"coder": policy})
-	dirty := newSteerDirtySet()
-	queued := make(chan string, 1)
-	statuses := &dynamicSteerStatus{}
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runDynamicSteerWithPolicyStoreGate(runCtx, dir, policies, nil,
-			func(state.SteerRegistration) (steerClient, error) { return client, nil },
-			testSteerRouter(t, func(_ context.Context, _ string, _ state.SteerRegistration, message steertransport.Message) error {
-				queued <- message.Text
-				return nil
-			}), statuses, persistence, newRegistrationObserver(state.NewRegistrationStore(dir)), nil, dirty)
-	}()
-	t.Cleanup(func() { cancel(); <-done })
-	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
-		return len(items) == 1 && items[0].State == string(orc.SteerConsumed) && items[0].Ticket == "20260926-00001"
-	})
-	select {
-	case message := <-queued:
-		t.Fatalf("active claim caused a new-work notification: %q", message)
-	default:
-	}
-	dirty.MarkRepository(registration.RepositoryID)
-	select {
-	case message := <-queued:
-		if !strings.Contains(message, "matching work") || strings.Contains(message, steerClaimRecoveryPrompt) {
-			t.Fatalf("ready notification after claim disappearance=%q", message)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("matching ready work was not dispatched after cross-queue claim disappeared")
-	}
-	if len(client.readyFilters) != 1 || !reflect.DeepEqual(client.readyFilters[0], policy.QueueFilters) {
-		t.Fatalf("ready frontier filters=%#v, want %#v", client.readyFilters, policy.QueueFilters)
 	}
 }
 

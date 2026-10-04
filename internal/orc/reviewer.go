@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/toolsupply/ticket-orc/internal/harness"
+	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -35,6 +36,7 @@ type ReviewerConfig struct {
 	Operator                   io.Writer
 	Diagnostics                io.Writer
 	EventSink                  EventSink
+	ContainmentTickets         TicketLoopHolder
 }
 
 type ReviewerTickets interface {
@@ -104,6 +106,13 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		loopState, hasLoops := orchestrationState.(TicketLoopState)
+		loopReader, hasReader := tickets.(TicketLoopReader)
+		if hasLoops && hasReader {
+			if err := ReconcileTicketLoops(ctx, loopState, loopReader, config.ContainmentTickets); err != nil {
+				return err
+			}
+		}
 		claimed, err := tickets.WaitAndClaimReview(ctx, config.QueueFilters)
 		if err != nil {
 			return &WorkWaitError{Role: "reviewer", Cause: err}
@@ -115,6 +124,32 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		// response. The claimed ticket remains authoritative for later repair.
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if loopState, ok := orchestrationState.(TicketLoopState); ok && config.MaxBounces > 0 {
+			loop, participationTripped, err := loopState.Participate(ctx, claimed.ID, config.MaxBounces)
+			if err != nil {
+				return fmt.Errorf("record reviewer participation for %s: %w", claimed.ID, err)
+			}
+			loop, err = loopState.RecordClaim(ctx, claimed.ID, config.Actor, "review")
+			if err != nil {
+				return fmt.Errorf("record reviewer claim for %s: %w", claimed.ID, err)
+			}
+			if loop.Phase != state.TicketLoopActive {
+				loopReader, ok := tickets.(TicketLoopReader)
+				if !ok {
+					return fmt.Errorf("Ticket reader is unavailable to reconcile tripped ticket %s", claimed.ID)
+				}
+				var reconcileErr error
+				if participationTripped {
+					_, _, reconcileErr = ReconcileClaimedTicketLoop(ctx, loopState, loopReader, config.ContainmentTickets, tickets, config.Actor, claimed.ID)
+				} else {
+					_, _, reconcileErr = ReconcileTicketLoop(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
+				}
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				continue
+			}
 		}
 		logReviewer(config.Diagnostics, "%s: claimed review work", claimed.ID)
 		emitEvent(config.EventSink, Event{Type: "ticket.claim", Worker: config.WorkerName, Role: "reviewer", State: "claimed", Ticket: claimed.ID})
@@ -140,6 +175,20 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, recoveryErr)
 		}
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "reviewer", State: observed.State, Ticket: observed.ID})
+		if loopState, ok := orchestrationState.(TicketLoopState); ok {
+			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
+				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
+					if turnErr != nil {
+						logReviewer(config.Diagnostics, "%s: circuit containment handled the completed ticket after a worker error: %v", claimed.ID, turnErr)
+					}
+					continue
+				}
+			}
+		}
 		lifecycleErr := finishReviewerLifecycle(ctx, config, tickets, cleanup, orchestrationState, observed)
 		if lifecycleErr != nil {
 			return errors.Join(turnErr, lifecycleErr)
@@ -177,9 +226,14 @@ func finishReviewerLifecycle(ctx context.Context, config ReviewerConfig, tickets
 		}
 		logReviewer(config.Diagnostics, "%s: reviewer approved and closed ticket", observed.ID)
 	case "open":
-		count, incrementErr := orchestrationState.IncrementBounces(ctx, observed.ID)
+		count, incrementErr := 0, error(nil)
+		if _, usesTicketLoops := orchestrationState.(TicketLoopState); usesTicketLoops {
+			count, incrementErr = orchestrationState.BounceCount(ctx, observed.ID)
+		} else {
+			count, incrementErr = orchestrationState.IncrementBounces(ctx, observed.ID)
+		}
 		if incrementErr != nil {
-			return fmt.Errorf("increment review bounces for %s: %w", observed.ID, incrementErr)
+			return fmt.Errorf("record review bounces for %s: %w", observed.ID, incrementErr)
 		}
 		logReviewer(config.Diagnostics, "%s: reviewer returned to open (bounce %d)", observed.ID, count)
 	case ticketclient.StateClosed, "rejected":

@@ -316,6 +316,11 @@ func (s *Store) RemoveTicket(ctx context.Context, ticket string) ([]Session, boo
 			delete(data.Bounces, key)
 			changed = true
 		}
+		loopKey := s.ticketLoopKey(ticket)
+		if _, exists := data.Loops[loopKey]; exists {
+			delete(data.Loops, loopKey)
+			changed = true
+		}
 
 		if !changed {
 			return nil
@@ -339,7 +344,9 @@ func (s *Store) BounceCount(ctx context.Context, ticket string) (int, error) {
 		if err != nil {
 			return err
 		}
-		count = data.Bounces[s.bounceKey(ticket)]
+		if loop, ok := data.Loops[s.ticketLoopKey(ticket)]; ok {
+			count = loop.BounceCount
+		}
 		return nil
 	})
 	return count, err
@@ -359,13 +366,391 @@ func (s *Store) IncrementBounces(ctx context.Context, ticket string) (int, error
 		if err != nil {
 			return err
 		}
-		key := s.bounceKey(ticket)
-		if data.Bounces[key] == math.MaxInt {
+		key := s.ticketLoopKey(ticket)
+		loop := data.Loops[key]
+		if loop.BounceCount == math.MaxInt {
 			return fmt.Errorf("bounce count for %s would overflow", ticket)
 		}
-		data.Bounces[key]++
-		count = data.Bounces[key]
+		if loop.Repository == "" {
+			loop = TicketLoop{Repository: s.repository, Ticket: ticket, Phase: TicketLoopActive}
+		}
+		loop.BounceCount++
+		if loop.EffectiveBounceLimit > 0 && loop.BounceCount >= loop.EffectiveBounceLimit {
+			loop.Phase = TicketLoopContainmentPending
+		}
+		data.Loops[key] = loop
+		count = loop.BounceCount
 		return s.saveUnlocked(data)
 	})
 	return count, err
+}
+
+// TicketLoop returns the durable loop record for one ticket in this repository.
+func (s *Store) TicketLoop(ctx context.Context, ticket string) (TicketLoop, bool, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, false, fmt.Errorf("repository namespace required for ticket loop lookup")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, false, err
+	}
+	var result TicketLoop
+	found := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		result, found = data.Loops[s.ticketLoopKey(ticket)]
+		return nil
+	})
+	return result, found, err
+}
+
+// Participate records the strictest max_bounces value seen in this ticket
+// generation. It never loosens a limit already established by another worker.
+// The returned bool is true only when this call changes an active loop to
+// containment_pending.
+func (s *Store) Participate(ctx context.Context, ticket string, maxBounces int) (TicketLoop, bool, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, false, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, false, err
+	}
+	if maxBounces < 1 {
+		return TicketLoop{}, false, fmt.Errorf("ticket loop bounce limit must be positive")
+	}
+	var result TicketLoop
+	tripped := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop := data.Loops[key]
+		if loop.Repository == "" {
+			loop = TicketLoop{Repository: s.repository, Ticket: ticket, Phase: TicketLoopActive}
+		}
+		if loop.Phase == TicketLoopHeld {
+			result = loop
+			return nil
+		}
+		if loop.EffectiveBounceLimit == 0 || maxBounces < loop.EffectiveBounceLimit {
+			loop.EffectiveBounceLimit = maxBounces
+		}
+		if loop.Phase == TicketLoopActive && loop.BounceCount >= loop.EffectiveBounceLimit {
+			loop.Phase = TicketLoopContainmentPending
+			tripped = true
+		}
+		data.Loops[key] = loop
+		result = loop
+		return s.saveUnlocked(data)
+	})
+	return result, tripped, err
+}
+
+// RecordClaim stores positive Ticket claim evidence for the ticket and queue.
+func (s *Store) RecordClaim(ctx context.Context, ticket, actor, queue string) (TicketLoop, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, err
+	}
+	if err := validateSteerName("actor", actor); err != nil {
+		return TicketLoop{}, err
+	}
+	if queue != "open" && queue != "review" {
+		return TicketLoop{}, fmt.Errorf("ticket loop claim queue must be open or review")
+	}
+	var result TicketLoop
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop := data.Loops[key]
+		if loop.Repository == "" {
+			loop = TicketLoop{Repository: s.repository, Ticket: ticket, Phase: TicketLoopActive}
+		}
+		if loop.Phase == TicketLoopHeld || loop.Phase == TicketLoopContainmentPending {
+			result = loop
+			return nil
+		}
+		if loop.AttemptID == ^uint64(0) {
+			return fmt.Errorf("ticket loop attempt ID exhausted for %s", ticket)
+		}
+		loop.AttemptID++
+		loop.ClaimState, loop.ClaimActor = queue, actor
+		loop.DispatchPending = false
+		data.Loops[key] = loop
+		result = loop
+		return s.saveUnlocked(data)
+	})
+	return result, err
+}
+
+// RecordDispatch records an accepted work-bearing dynamic steer for one
+// concrete ticket. It does not count as claim evidence or a stall by itself.
+func (s *Store) RecordDispatch(ctx context.Context, ticket string) (TicketLoop, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, err
+	}
+	var result TicketLoop
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok || loop.Phase != TicketLoopActive {
+			return fmt.Errorf("active ticket loop for %s is required before steer dispatch", ticket)
+		}
+		loop.DispatchPending = true
+		data.Loops[key] = loop
+		result = loop
+		return s.saveUnlocked(data)
+	})
+	return result, err
+}
+
+func (s *Store) ClearDispatch(ctx context.Context, ticket string) error {
+	if !s.namespaced() {
+		return fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	return s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok || !loop.DispatchPending {
+			return nil
+		}
+		loop.DispatchPending = false
+		data.Loops[key] = loop
+		return s.saveUnlocked(data)
+	})
+}
+
+// RecordSteerClaim accepts active-claim evidence only for a ticket Orc
+// previously selected for a work-bearing steer notification.
+func (s *Store) RecordSteerClaim(ctx context.Context, ticket, actor, queue string) (TicketLoop, bool, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, false, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, false, err
+	}
+	if err := validateSteerName("actor", actor); err != nil {
+		return TicketLoop{}, false, err
+	}
+	if queue != "open" && queue != "review" {
+		return TicketLoop{}, false, fmt.Errorf("ticket loop claim queue must be open or review")
+	}
+	var result TicketLoop
+	recorded := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok || !loop.DispatchPending || loop.Phase != TicketLoopActive {
+			result = loop
+			return nil
+		}
+		if loop.AttemptID == ^uint64(0) {
+			return fmt.Errorf("ticket loop attempt ID exhausted for %s", ticket)
+		}
+		loop.AttemptID++
+		loop.ClaimState, loop.ClaimActor, loop.DispatchPending = queue, actor, false
+		data.Loops[key] = loop
+		result, recorded = loop, true
+		return s.saveUnlocked(data)
+	})
+	return result, recorded, err
+}
+
+// RecordStall increments the shared same-state stall count and trips the
+// ticket circuit at the fixed two-stall threshold.
+func (s *Store) RecordStall(ctx context.Context, ticket string, expectedAttempt uint64) (TicketLoop, bool, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, false, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	var result TicketLoop
+	consumed := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok {
+			return fmt.Errorf("ticket loop for %s does not exist", ticket)
+		}
+		if loop.Phase != TicketLoopActive || loop.ClaimState == "" || loop.AttemptID != expectedAttempt {
+			result = loop
+			return nil
+		}
+		if loop.StallCount < math.MaxInt {
+			loop.StallCount++
+		}
+		if loop.StallCount >= 2 {
+			loop.Phase = TicketLoopContainmentPending
+		}
+		loop.ClaimState, loop.ClaimActor = "", ""
+		loop.DispatchPending = false
+		data.Loops[key] = loop
+		result = loop
+		consumed = true
+		return s.saveUnlocked(data)
+	})
+	return result, consumed, err
+}
+
+// RecordBounce increments the generation's review-return count and clears the
+// positively observed review claim in the same durable mutation.
+func (s *Store) RecordBounce(ctx context.Context, ticket string, expectedAttempt uint64) (TicketLoop, bool, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, false, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if err := validateToken("ticket", ticket); err != nil {
+		return TicketLoop{}, false, err
+	}
+	var result TicketLoop
+	consumed := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok {
+			return fmt.Errorf("ticket loop for %s does not exist", ticket)
+		}
+		if loop.Phase != TicketLoopActive || loop.ClaimState == "" || loop.AttemptID != expectedAttempt {
+			result = loop
+			return nil
+		}
+		if loop.BounceCount < math.MaxInt {
+			loop.BounceCount++
+		}
+		if loop.EffectiveBounceLimit > 0 && loop.BounceCount >= loop.EffectiveBounceLimit {
+			loop.Phase = TicketLoopContainmentPending
+		}
+		loop.ClaimState, loop.ClaimActor = "", ""
+		loop.DispatchPending = false
+		data.Loops[key] = loop
+		result = loop
+		consumed = true
+		return s.saveUnlocked(data)
+	})
+	return result, consumed, err
+}
+
+// ClearClaim removes an attempt observation after authoritative reconciliation
+// determines that it did not end as a same-state ready stall.
+func (s *Store) ClearClaim(ctx context.Context, ticket string, expectedAttempt uint64) (bool, error) {
+	if !s.namespaced() {
+		return false, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	cleared := false
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok || loop.ClaimState == "" || loop.AttemptID != expectedAttempt {
+			return nil
+		}
+		loop.ClaimState, loop.ClaimActor = "", ""
+		data.Loops[key] = loop
+		cleared = true
+		return s.saveUnlocked(data)
+	})
+	return cleared, err
+}
+
+// MarkContainmentPending durably trips the circuit before any Ticket mutation.
+func (s *Store) MarkContainmentPending(ctx context.Context, ticket string) (TicketLoop, error) {
+	if !s.namespaced() {
+		return TicketLoop{}, fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	var result TicketLoop
+	err := s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok {
+			return fmt.Errorf("ticket loop for %s does not exist", ticket)
+		}
+		loop.Phase = TicketLoopContainmentPending
+		data.Loops[key] = loop
+		result = loop
+		return s.saveUnlocked(data)
+	})
+	return result, err
+}
+
+// MarkHeld persists Ticket's actual from_state after a successful ordinary
+// hold, or records an externally observed hold for an active loop.
+func (s *Store) MarkHeld(ctx context.Context, ticket, fromState string) error {
+	if !s.namespaced() {
+		return fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	if fromState != "" && fromState != "open" && fromState != "review" {
+		return fmt.Errorf("ticket hold from_state must be open or review")
+	}
+	return s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		loop, ok := data.Loops[key]
+		if !ok || (loop.Phase != TicketLoopActive && loop.Phase != TicketLoopContainmentPending) {
+			return fmt.Errorf("ticket loop for %s is not active or pending containment", ticket)
+		}
+		loop.Phase, loop.HeldFrom = TicketLoopHeld, fromState
+		loop.ClaimState, loop.ClaimActor = "", ""
+		loop.DispatchPending = false
+		data.Loops[key] = loop
+		return s.saveUnlocked(data)
+	})
+}
+
+// ResetTicketLoop begins a new generation after an authoritative observation
+// proves a previously held ticket has left Ticket's hold state.
+func (s *Store) ResetTicketLoop(ctx context.Context, ticket string) error {
+	if !s.namespaced() {
+		return fmt.Errorf("repository namespace required for ticket loop mutation")
+	}
+	return s.withLock(ctx, func() error {
+		data, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		key := s.ticketLoopKey(ticket)
+		if _, ok := data.Loops[key]; !ok {
+			return nil
+		}
+		delete(data.Loops, key)
+		return s.saveUnlocked(data)
+	})
 }

@@ -42,6 +42,7 @@ type CoderConfig struct {
 	Operator                   io.Writer
 	Diagnostics                io.Writer
 	EventSink                  EventSink
+	ContainmentTickets         TicketLoopHolder
 }
 
 type CoderTickets interface {
@@ -131,6 +132,13 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		loopState, hasLoops := orchestrationState.(TicketLoopState)
+		loopReader, hasReader := tickets.(TicketLoopReader)
+		if hasLoops && hasReader {
+			if err := ReconcileTicketLoops(ctx, loopState, loopReader, config.ContainmentTickets); err != nil {
+				return err
+			}
+		}
 		claimed, err := tickets.WaitAndClaimImplementation(ctx, config.QueueFilters)
 		if err != nil {
 			return &WorkWaitError{Role: "coder", Cause: err}
@@ -149,7 +157,33 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		if err != nil {
 			return fmt.Errorf("read bounce count for %s: %w", claimed.ID, err)
 		}
-		if bounces >= config.MaxBounces {
+		if loopState, ok := orchestrationState.(TicketLoopState); ok {
+			loop, participationTripped, err := loopState.Participate(ctx, claimed.ID, config.MaxBounces)
+			if err != nil {
+				return fmt.Errorf("record coder participation for %s: %w", claimed.ID, err)
+			}
+			loop, err = loopState.RecordClaim(ctx, claimed.ID, config.Actor, "open")
+			if err != nil {
+				return fmt.Errorf("record coder claim for %s: %w", claimed.ID, err)
+			}
+			bounces = loop.BounceCount
+			if loop.Phase != state.TicketLoopActive {
+				loopReader, ok := tickets.(TicketLoopReader)
+				if !ok {
+					return fmt.Errorf("Ticket reader is unavailable to reconcile tripped ticket %s", claimed.ID)
+				}
+				var reconcileErr error
+				if participationTripped {
+					_, _, reconcileErr = ReconcileClaimedTicketLoop(ctx, loopState, loopReader, config.ContainmentTickets, tickets, config.Actor, claimed.ID)
+				} else {
+					_, _, reconcileErr = ReconcileTicketLoop(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
+				}
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				continue
+			}
+		} else if bounces >= config.MaxBounces {
 			if _, releaseErr := tickets.Release(ctx, claimed.ID); releaseErr != nil {
 				return errors.Join(
 					&BounceLimitError{Ticket: claimed.ID, Count: bounces, Limit: config.MaxBounces},
@@ -183,6 +217,20 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		}
 		observed.State = ticketclient.NormalizeLifecycleState(observed.State)
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "coder", State: observed.State, Ticket: observed.ID})
+		if loopState, ok := orchestrationState.(TicketLoopState); ok {
+			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
+				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
+					if turnErr != nil {
+						logCoder(config.Diagnostics, "%s: circuit containment handled the completed ticket after a worker error: %v", claimed.ID, turnErr)
+					}
+					continue
+				}
+			}
+		}
 		lifecycleErr := finishCoderLifecycle(ctx, config, tickets, cleanup, observed, turnErr)
 		if lifecycleErr != nil {
 			return errors.Join(turnErr, lifecycleErr)

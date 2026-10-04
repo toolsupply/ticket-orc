@@ -31,6 +31,8 @@ type steerRolePolicy struct {
 	QueueFilters     ticketclient.QueueFilters
 	NudgePrompt      string
 	ReviewCompletion string
+	MaxBounces       int
+	ContainmentActor string
 }
 
 type steerPolicySnapshot struct {
@@ -292,6 +294,95 @@ type steerClient interface {
 type steerDirtySnapshot struct {
 	all          bool
 	repositories map[string]struct{}
+}
+
+// steerRepositoryRetry tracks only registrations whose authoritative Ticket
+// observations have not recovered. The registration loop uses these deadlines
+// to re-dirty failed repositories without polling healthy repositories.
+type steerRepositoryRetry struct {
+	failures      int
+	due           time.Time
+	registrations map[string]struct{}
+}
+
+type steerRetrySchedule struct {
+	repositories map[string]*steerRepositoryRetry
+}
+
+func newSteerRetrySchedule() *steerRetrySchedule {
+	return &steerRetrySchedule{repositories: make(map[string]*steerRepositoryRetry)}
+}
+
+func (schedule *steerRetrySchedule) Due(now time.Time) steerDirtySnapshot {
+	due := steerDirtySnapshot{repositories: make(map[string]struct{})}
+	if schedule == nil {
+		return due
+	}
+	for repositoryID, retry := range schedule.repositories {
+		if !retry.due.After(now) {
+			due.repositories[repositoryID] = struct{}{}
+		}
+	}
+	return due
+}
+
+func (schedule *steerRetrySchedule) Reconcile(work steerDirtySnapshot, registrations []state.SteerRegistration, failed, observed map[string]bool, now time.Time) {
+	if schedule == nil || work.empty() {
+		return
+	}
+	workRepositories := work.repositories
+	if work.all {
+		workRepositories = make(map[string]struct{}, len(registrations)+len(schedule.repositories))
+		for _, registration := range registrations {
+			workRepositories[registration.RepositoryID] = struct{}{}
+		}
+		for repositoryID := range schedule.repositories {
+			workRepositories[repositoryID] = struct{}{}
+		}
+	}
+	for repositoryID := range workRepositories {
+		retry := schedule.repositories[repositoryID]
+		current := make(map[string]struct{})
+		for _, registration := range registrations {
+			if registration.RepositoryID == repositoryID {
+				current[steerRegistrationKey(registration)] = struct{}{}
+			}
+		}
+		if retry == nil {
+			retry = &steerRepositoryRetry{registrations: make(map[string]struct{})}
+			schedule.repositories[repositoryID] = retry
+		}
+		for key := range retry.registrations {
+			if _, found := current[key]; !found {
+				delete(retry.registrations, key)
+			}
+		}
+		for key := range current {
+			if failed[key] {
+				retry.registrations[key] = struct{}{}
+			} else if observed[key] {
+				delete(retry.registrations, key)
+			}
+		}
+		if len(retry.registrations) == 0 {
+			delete(schedule.repositories, repositoryID)
+			continue
+		}
+		retry.failures++
+		delay := steerRetryDelay(retry.failures)
+		retry.due = now.Add(delay)
+	}
+}
+
+func steerRetryDelay(failures int) time.Duration {
+	delay := time.Second
+	for count := 1; count < failures && delay < 15*time.Second; count++ {
+		delay *= 2
+	}
+	if delay > 15*time.Second {
+		return 15 * time.Second
+	}
+	return delay
 }
 
 func (snapshot steerDirtySnapshot) empty() bool {
@@ -608,6 +699,7 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 	spoolReconciled := false
 	lastRegistrations := []state.SteerRegistration{}
 	statusCache := map[string]daemon.SteerStatus{}
+	retries := newSteerRetrySchedule()
 	observeRegistrations := func() (bool, steerDirtySnapshot) {
 		readCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 		observation := observer.Observe(readCtx)
@@ -650,7 +742,7 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 		lastRegistrations = append(lastRegistrations[:0], observation.Registrations...)
 		return true, changed
 	}
-	tick := func(work steerDirtySnapshot) {
+	tick := func(work steerDirtySnapshot, now time.Time) {
 		if !haveObservation || work.empty() {
 			return
 		}
@@ -690,6 +782,8 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 			}
 		}
 		currentStatus := make([]daemon.SteerStatus, 0, len(observation.Registrations))
+		failedTicketObservations := make(map[string]bool)
+		successfulTicketObservations := make(map[string]bool)
 		for _, reg := range observation.Registrations {
 			regKey := steerRegistrationKey(reg)
 			policy, ok := policySnapshot.roles[reg.Role]
@@ -749,6 +843,7 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 			if client == nil {
 				client, err = clients(reg)
 				if err != nil {
+					failedTicketObservations[regKey] = true
 					status.State = stateName
 					status.Code = "ticket_client_failed"
 					applySteerWriteFailure(&status, reg, writeFailures, lastPersistedStates)
@@ -757,11 +852,22 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 				}
 				connections[key] = client
 			}
+			var loopStore *state.Store
+			var loopReader orc.TicketLoopReader
+			var loopHolder orc.TicketLoopHolder
+			if policy.MaxBounces > 0 && policy.ContainmentActor != "" {
+				if reader, ok := client.(orc.TicketLoopReader); ok {
+					loopStore = state.NewForRepository(stateDir, reg.RepositoryID)
+					loopReader = reader
+					loopHolder = containmentTicketClient{actor: policy.ContainmentActor, workingDir: reg.RepositoryPath, target: ticketclient.Target{Repository: reg.RepositoryPath}}
+				}
+			}
 			activeTicket, observeErr := observeSteerActiveTicket(ctx, client, policy)
 			if observeErr != nil {
 				if steerClientUnusable(observeErr) {
 					discardSteerClient(connections, key)
 				}
+				failedTicketObservations[regKey] = true
 				status.State = stateName
 				status.Code = "ticket_observation_failed"
 				applySteerWriteFailure(&status, reg, writeFailures, lastPersistedStates)
@@ -770,6 +876,43 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 			}
 			status.Ticket = activeTicket
 			active := activeTicket != ""
+			if loopStore != nil {
+				if err := orc.ReconcileTicketLoops(ctx, loopStore, loopReader, loopHolder); err != nil {
+					status.State = stateName
+					status.Code = "ticket_loop_reconciliation_failed"
+					currentStatus = append(currentStatus, status)
+					continue
+				}
+			}
+			if active && loopStore != nil {
+				activeInfo, readErr := loopReader.Show(ctx, activeTicket)
+				if readErr != nil {
+					failedTicketObservations[regKey] = true
+					status.State = stateName
+					status.Code = "ticket_observation_failed"
+					currentStatus = append(currentStatus, status)
+					continue
+				}
+				activeInfo.State = ticketclient.NormalizeLifecycleState(activeInfo.State)
+				if activeInfo.State == "open" || activeInfo.State == "review" {
+					loop, exists, loopErr := loopStore.TicketLoop(ctx, activeTicket)
+					if loopErr == nil && exists && loop.DispatchPending {
+						loop, _, loopErr = loopStore.RecordSteerClaim(ctx, activeTicket, reg.Actor, activeInfo.State)
+					}
+					if loopErr != nil {
+						status.State = stateName
+						status.Code = "ticket_loop_state_failed"
+						currentStatus = append(currentStatus, status)
+						continue
+					}
+					if exists && loop.Phase != state.TicketLoopActive {
+						status.State = stateName
+						status.Code = "ticket_containment_pending"
+						currentStatus = append(currentStatus, status)
+						continue
+					}
+				}
+			}
 			if !active && recoveryPending {
 				current := false
 				allowed, policyCurrent, persistErr := withSteerPolicyDispatch(gate, policies, policySnapshot.generation, func() error {
@@ -810,12 +953,14 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 				if steerClientUnusable(observeErr) {
 					discardSteerClient(connections, key)
 				}
+				failedTicketObservations[regKey] = true
 				status.State = stateName
 				status.Code = "ticket_observation_failed"
 				applySteerWriteFailure(&status, reg, writeFailures, lastPersistedStates)
 				currentStatus = append(currentStatus, status)
 				continue
 			}
+			successfulTicketObservations[regKey] = true
 			plan := planSteerNotification(policy, stateName, activeTicket, readyTicket, recoveryPending, bootstrapPending)
 			action := plan.action
 			status.State = string(action.Next)
@@ -841,7 +986,28 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 						result = steerDeliveryResult{state: stateName, code: "registration_replaced"}
 						return nil
 					}
+					if plan.workBearing && loopStore != nil && plan.ticket != "" {
+						loop, _, loopErr := loopStore.Participate(ctx, plan.ticket, policy.MaxBounces)
+						if loopErr != nil {
+							return loopErr
+						}
+						if loop.Phase != state.TicketLoopActive {
+							if _, _, reconcileErr := orc.ReconcileTicketLoop(ctx, loopStore, loopReader, loopHolder, plan.ticket); reconcileErr != nil {
+								return reconcileErr
+							}
+							result = steerDeliveryResult{state: stateName, code: "ticket_containment_pending"}
+							return nil
+						}
+						if _, loopErr := loopStore.RecordDispatch(ctx, plan.ticket); loopErr != nil {
+							return loopErr
+						}
+					}
 					result = sendSteerNotification(ctx, stateDir, reg, plan, router, persistence, statuses, writeFailures, lastPersistedStates)
+					if plan.workBearing && loopStore != nil && plan.ticket != "" && result.state != plan.completionState && result.code != "queue_uncertain" {
+						if clearErr := loopStore.ClearDispatch(ctx, plan.ticket); clearErr != nil {
+							return clearErr
+						}
+					}
 					return nil
 				})
 				if sendErr != nil {
@@ -894,6 +1060,11 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 			}
 			currentStatus = append(currentStatus, status)
 		}
+		reconciledAt := time.Now()
+		if now.After(reconciledAt) {
+			reconciledAt = now
+		}
+		retries.Reconcile(work, observation.Registrations, failedTicketObservations, successfulTicketObservations, reconciledAt)
 		for key, client := range connections {
 			if !activeKeys[key] {
 				_ = client.Close()
@@ -910,16 +1081,23 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 	}()
 	pending := dirty.Drain()
 	if observed, changes := observeRegistrations(); observed {
-		tick(mergeSteerDirtySnapshots(pending, changes))
+		tick(mergeSteerDirtySnapshots(pending, changes), time.Now())
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-registrationTicks:
+		case tickAt := <-registrationTicks:
+			now := time.Now()
+			if tickAt.After(now) {
+				now = tickAt
+			}
 			pending := dirty.Drain()
+			// Registration polling stays cheap; only repositories with due Ticket
+			// observation failures are added to this reconciliation.
+			pending = mergeSteerDirtySnapshots(pending, retries.Due(now))
 			if observed, changes := observeRegistrations(); observed {
-				tick(mergeSteerDirtySnapshots(pending, changes))
+				tick(mergeSteerDirtySnapshots(pending, changes), now)
 			}
 		case <-elapsedTicks:
 			// Time passing alone is not authoritative Ticket evidence and must
@@ -927,7 +1105,7 @@ func runDynamicSteerWithPolicyStore(ctx context.Context, stateDir string, polici
 		case <-dirty.Wake():
 			pending := dirty.Drain()
 			if observed, changes := observeRegistrations(); observed {
-				tick(mergeSteerDirtySnapshots(pending, changes))
+				tick(mergeSteerDirtySnapshots(pending, changes), time.Now())
 			}
 		}
 	}

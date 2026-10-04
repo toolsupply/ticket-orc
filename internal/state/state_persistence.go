@@ -77,6 +77,16 @@ func (s *Store) loadUnlocked() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("decode state file %s: %w", path, err)
 	}
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &header); err == nil && header.Version == 1 {
+		// Persist the deliberate v1 -> v2 conversion while the caller already
+		// holds the state lock. Existing sessions and repository keys survive.
+		if err := s.saveUnlocked(snapshot); err != nil {
+			return Snapshot{}, fmt.Errorf("migrate state file %s: %w", path, err)
+		}
+	}
 	return snapshot, nil
 }
 
@@ -122,9 +132,10 @@ func readBoundedStateFile(path string) ([]byte, error) {
 var openStateFile = os.Open
 
 type stateWire struct {
-	Version  int            `json:"version"`
-	Sessions []Session      `json:"sessions"`
-	Bounces  map[string]int `json:"bounces"`
+	Version  int                   `json:"version"`
+	Sessions []Session             `json:"sessions"`
+	Bounces  map[string]int        `json:"bounces,omitempty"`
+	Loops    map[string]TicketLoop `json:"ticket_loops,omitempty"`
 }
 
 func decodeState(data []byte) (Snapshot, error) {
@@ -134,7 +145,7 @@ func decodeState(data []byte) (Snapshot, error) {
 	if err := json.Unmarshal(data, &header); err != nil {
 		return Snapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
-	if header.Version != currentVersion {
+	if header.Version != 1 && header.Version != currentVersion {
 		return Snapshot{}, fmt.Errorf("%w: unsupported state version %d; expected %d", ErrMalformed, header.Version, currentVersion)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -146,13 +157,43 @@ func decodeState(data []byte) (Snapshot, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return Snapshot{}, err
 	}
-	snapshot := Snapshot{Version: currentVersion, Sessions: wire.Sessions, Bounces: wire.Bounces}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return Snapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	if header.Version == 1 && fields["ticket_loops"] != nil {
+		return Snapshot{}, fmt.Errorf("%w: released state version 1 must not contain ticket_loops", ErrMalformed)
+	}
+	if header.Version == currentVersion && fields["bounces"] != nil {
+		return Snapshot{}, fmt.Errorf("%w: schema v2 must not contain legacy bounce records", ErrMalformed)
+	}
+	if header.Version == currentVersion && fields["ticket_loops"] == nil {
+		return Snapshot{}, fmt.Errorf("%w: schema v2 must contain ticket_loops", ErrMalformed)
+	}
+	if header.Version == currentVersion && bytes.Equal(bytes.TrimSpace(fields["ticket_loops"]), []byte("null")) {
+		return Snapshot{}, fmt.Errorf("%w: schema v2 ticket_loops must be an object", ErrMalformed)
+	}
+	snapshot := Snapshot{Version: currentVersion, Sessions: wire.Sessions, Loops: wire.Loops, Bounces: map[string]int{}}
 	if snapshot.Sessions == nil {
 		snapshot.Sessions = []Session{}
 	}
-	if snapshot.Bounces == nil {
-		snapshot.Bounces = map[string]int{}
+	if snapshot.Loops == nil {
+		snapshot.Loops = map[string]TicketLoop{}
 	}
+	if header.Version == 1 {
+		for key, count := range wire.Bounces {
+			repository, ticket, namespaced := splitBounceKey(key)
+			if !namespaced {
+				return Snapshot{}, fmt.Errorf("%w: bounce key must include a repository namespace", ErrMalformed)
+			}
+			loop := TicketLoop{Repository: repository, Ticket: ticket, BounceCount: count, Phase: TicketLoopActive}
+			if _, exists := snapshot.Loops[key]; exists {
+				return Snapshot{}, fmt.Errorf("%w: duplicate ticket loop during migration", ErrMalformed)
+			}
+			snapshot.Loops[key] = loop
+		}
+	}
+	refreshBounceView(&snapshot)
 	if err := validateSnapshot(snapshot); err != nil {
 		return Snapshot{}, err
 	}
@@ -177,6 +218,9 @@ func (s *Store) saveUnlocked(snapshot Snapshot) error {
 	}
 	if snapshot.Bounces == nil {
 		snapshot.Bounces = map[string]int{}
+	}
+	if snapshot.Loops == nil {
+		snapshot.Loops = map[string]TicketLoop{}
 	}
 	sort.Slice(snapshot.Sessions, func(i, j int) bool {
 		left, right := snapshot.Sessions[i], snapshot.Sessions[j]
@@ -206,5 +250,14 @@ func (s *Store) saveUnlocked(snapshot Snapshot) error {
 }
 
 func emptySnapshot() Snapshot {
-	return Snapshot{Version: currentVersion, Sessions: []Session{}, Bounces: map[string]int{}}
+	return Snapshot{Version: currentVersion, Sessions: []Session{}, Loops: map[string]TicketLoop{}, Bounces: map[string]int{}}
+}
+
+func refreshBounceView(snapshot *Snapshot) {
+	snapshot.Bounces = make(map[string]int, len(snapshot.Loops))
+	for key, loop := range snapshot.Loops {
+		if loop.BounceCount > 0 {
+			snapshot.Bounces[key] = loop.BounceCount
+		}
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
@@ -252,7 +253,18 @@ func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[strin
 		if err != nil {
 			return nil, err
 		}
-		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion}
+		maxBounces := defaultMaxBounces
+		if role.MaxBounces != nil {
+			maxBounces = strconv.Itoa(*role.MaxBounces)
+		}
+		if value, ok := lookupEnv("TICKET_ORC_MAX_BOUNCES"); ok {
+			maxBounces = value
+		}
+		limit, err := strconv.Atoi(maxBounces)
+		if err != nil || limit < 1 {
+			return nil, configValidation("max_bounces.invalid", "max_bounces", "max bounces must be a positive integer", "set a positive integer")
+		}
+		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
 	}
 	return steerRoles, nil
 }

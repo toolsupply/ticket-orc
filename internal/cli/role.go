@@ -77,6 +77,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 	if store == nil {
 		return orc.NewFailureContextError(orc.FailureContext{Origin: "ticket", Operation: "repository identity", Phase: "Ticket client startup"}, fmt.Errorf("startup phase Ticket client startup: resolve Ticket repository identity failed"))
 	}
+	containmentTickets := containmentTicketClient{actor: orc.ContainmentActor(config.InstanceID), workingDir: workingDir, target: ticketTarget(config)}
 	cleaner, err := orc.NewCleaner(
 		store,
 		tickets,
@@ -113,6 +114,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 			Operator:             os.Stdout,
 			Diagnostics:          os.Stderr,
 			EventSink:            eventSink,
+			ContainmentTickets:   containmentTickets,
 		}, tickets, agent, store, cleaner)
 		if err != nil {
 			err = orc.NewFailureContextError(orc.FailureContext{Origin: "reviewer", Operation: "worker execution", Phase: "worker execution"}, err)
@@ -142,6 +144,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		Operator:                   os.Stdout,
 		Diagnostics:                os.Stderr,
 		EventSink:                  eventSink,
+		ContainmentTickets:         containmentTickets,
 	}, tickets, agent, store, cleaner)
 	if err != nil {
 		err = orc.NewFailureContextError(orc.FailureContext{Origin: "coder", Operation: "worker execution", Phase: "worker execution"}, err)

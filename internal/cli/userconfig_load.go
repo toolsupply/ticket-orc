@@ -189,7 +189,7 @@ func resolveInstanceDir(cwd string, lookupEnv envLookup) (string, error) {
 		}
 	}
 	localDir := filepath.Join(cwd, defaultInstanceDirectoryName)
-	localExists, err := existingInstanceDirectory(localDir)
+	localExists, err := configuredInstanceDirectoryExists(localDir)
 	if err != nil {
 		return "", fmt.Errorf("inspect project Orc instance %s: %w", localDir, err)
 	}
@@ -205,7 +205,7 @@ func resolveInstanceDir(cwd string, lookupEnv envLookup) (string, error) {
 		return "", fmt.Errorf("no Orc instance found: run ticket-orc init in a project, run ticket-orc init --global, or set TICKET_ORC to an instance directory; the user home directory is unavailable")
 	}
 	globalDir := filepath.Join(home, defaultInstanceDirectoryName)
-	globalExists, err := existingInstanceDirectory(globalDir)
+	globalExists, err := configuredInstanceDirectoryExists(globalDir)
 	if err != nil {
 		return "", fmt.Errorf("inspect global Orc instance %s: %w", globalDir, err)
 	}
@@ -219,7 +219,9 @@ func resolveInstanceDir(cwd string, lookupEnv envLookup) (string, error) {
 	return filepath.Clean(instanceDir), nil
 }
 
-func existingInstanceDirectory(path string) (bool, error) {
+// configuredInstanceDirectoryExists reports whether path is a real instance
+// directory with a canonical config.json regular file.
+func configuredInstanceDirectoryExists(path string) (bool, error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -229,6 +231,17 @@ func existingInstanceDirectory(path string) (bool, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return false, fmt.Errorf("instance path is not a real directory")
+	}
+	configPath := filepath.Join(path, instanceConfigFileName)
+	configInfo, err := os.Lstat(configPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if configInfo.Mode()&os.ModeSymlink != 0 || !configInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("instance config is not a regular file: %s", configPath)
 	}
 	return true, nil
 }

@@ -412,7 +412,7 @@ func (m *RepositoryWatchManager) TicketChanged(key string, event RepositoryWatch
 
 func (m *RepositoryWatchManager) ticketChangedFrom(observer *repositoryWatchObserver, attempt uint64, event RepositoryWatchEvent) {
 	m.mu.Lock()
-	if observer == nil || m.observers[observer.key] != observer || observer.attempt != attempt || !observer.ready {
+	if observer == nil || m.observers[observer.key] != observer || observer.attempt != attempt {
 		m.mu.Unlock()
 		return
 	}

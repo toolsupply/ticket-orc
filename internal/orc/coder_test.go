@@ -97,6 +97,14 @@ func (f *fakeCoderTickets) Show(_ context.Context, id string) (ticketclient.Tick
 	return ticket, nil
 }
 
+func (f *fakeCoderTickets) ShowReadiness(ctx context.Context, id string) (ticketclient.TicketDetail, error) {
+	ticket, err := f.Show(ctx, id)
+	if err != nil {
+		return ticketclient.TicketDetail{}, err
+	}
+	return ticketclient.TicketDetail{ID: id, State: ticket.State, Assignee: ticket.Assignee, Readiness: &ticketclient.TicketReadiness{Ready: ticket.Assignee == ""}}, nil
+}
+
 func (f *fakeCoderTickets) Release(_ context.Context, id string) (ticketclient.Transition, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -382,6 +390,276 @@ func TestRunCoderClaimsRunsRereadsAndReturnsToQueue(t *testing.T) {
 	}
 	if len(stateStore.sets) != 1 || stateStore.sets[0].ID != "thread-1" {
 		t.Fatalf("retained sessions = %#v", stateStore.sets)
+	}
+}
+
+type ticketLoopRaceFixture struct {
+	mu      sync.Mutex
+	tickets map[string]ticketclient.Ticket
+	holds   []string
+}
+
+type managedContainmentFixture struct {
+	tickets *fakeCoderTickets
+	holds   []string
+}
+
+type participationBarrierStore struct {
+	*state.Store
+	entered chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (s *participationBarrierStore) Participate(ctx context.Context, ticket string, limit int) (state.TicketLoop, bool, error) {
+	s.once.Do(func() { close(s.entered) })
+	select {
+	case <-s.resume:
+	case <-ctx.Done():
+		return state.TicketLoop{}, false, ctx.Err()
+	}
+	return s.Store.Participate(ctx, ticket, limit)
+}
+
+func (f *managedContainmentFixture) Show(ctx context.Context, id string) (ticketclient.Ticket, error) {
+	return f.tickets.Show(ctx, id)
+}
+
+func (f *managedContainmentFixture) ShowReadiness(ctx context.Context, id string) (ticketclient.TicketDetail, error) {
+	return f.tickets.ShowReadiness(ctx, id)
+}
+
+func (f *managedContainmentFixture) HoldTicket(_ context.Context, id string, _ ticketclient.MutationOptions) (ticketclient.MutationResult, error) {
+	f.tickets.mu.Lock()
+	defer f.tickets.mu.Unlock()
+	ticket, ok := f.tickets.shows[id]
+	if !ok || ticket.Assignee != "" || (ticket.State != "open" && ticket.State != "review") {
+		return ticketclient.MutationResult{}, errors.New("ticket is not eligible for containment")
+	}
+	from := ticket.State
+	f.holds = append(f.holds, id)
+	ticket.State = "hold"
+	f.tickets.shows[id] = ticket
+	return ticketclient.MutationResult{ID: id, Changed: true, FromState: from, State: "hold"}, nil
+}
+
+func seedOneStall(t *testing.T, ctx context.Context, store *state.Store, ticket, actor, queue string) {
+	t.Helper()
+	loop, _, err := store.Participate(ctx, ticket, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop, err = store.RecordClaim(ctx, ticket, actor, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, consumed, err := store.RecordStall(ctx, ticket, loop.AttemptID); err != nil || !consumed {
+		t.Fatalf("seed first stall consumed=%t err=%v", consumed, err)
+	}
+}
+
+func TestRunCoderContinuesAfterPostCompletionContainment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	const ticketA, ticketB = "20261003-56322", "20261003-56323"
+	seedOneStall(t, ctx, store, ticketA, "coder-1", "open")
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: ticketA, State: "open", Assignee: "coder-1"}, {ID: ticketB, State: "open", Assignee: "coder-1"}},
+		shows: map[string]ticketclient.Ticket{
+			ticketA: {ID: ticketA, State: "open"},
+			ticketB: {ID: ticketB, State: "review"},
+		},
+	}
+	containment := &managedContainmentFixture{tickets: tickets}
+	config := coderConfig()
+	config.ContainmentTickets = containment
+	runs := 0
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}, onRun: func() {
+		runs++
+		if runs == 2 {
+			cancel()
+		}
+	}}
+	err := RunCoder(ctx, config, tickets, agent, store, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunCoder error=%v, want cancellation after independent ticket", err)
+	}
+	if len(agent.runs) != 2 || !strings.Contains(agent.runs[0].Prompt, ticketA) || !strings.Contains(agent.runs[1].Prompt, ticketB) {
+		t.Fatalf("coder runs=%#v, want contained ticket followed by independent work", agent.runs)
+	}
+	if len(containment.holds) != 1 || containment.holds[0] != ticketA || tickets.shows[ticketA].State != "hold" {
+		t.Fatalf("containment holds=%v ticket A=%#v", containment.holds, tickets.shows[ticketA])
+	}
+	loop, found, err := store.TicketLoop(context.Background(), ticketA)
+	if err != nil || !found || loop.Phase != state.TicketLoopHeld || loop.StallCount != 2 {
+		t.Fatalf("contained coder loop=%#v found=%t err=%v", loop, found, err)
+	}
+}
+
+func TestRunCoderDoesNotReleaseClaimForAlreadyPendingContainment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	const ticketA, ticketB = "20261003-56326", "20261003-56327"
+	if _, _, err := store.Participate(ctx, ticketA, 6); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkContainmentPending(ctx, ticketA); err != nil {
+		t.Fatal(err)
+	}
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: ticketA, State: "open", Assignee: "coder-1"}, {ID: ticketB, State: "open", Assignee: "coder-1"}},
+		shows: map[string]ticketclient.Ticket{
+			ticketA: {ID: ticketA, State: "open", Assignee: "coder-1"},
+			ticketB: {ID: ticketB, State: "review"},
+		},
+	}
+	containment := &managedContainmentFixture{tickets: tickets}
+	config := coderConfig()
+	config.ContainmentTickets = containment
+	runs := 0
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}, onRun: func() {
+		runs++
+		if runs == 1 {
+			cancel()
+		}
+	}}
+	err := RunCoder(ctx, config, tickets, agent, store, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunCoder error=%v, want cancellation after unrelated ticket", err)
+	}
+	if len(tickets.releases) != 0 || len(containment.holds) != 0 || len(agent.runs) != 1 || !strings.Contains(agent.runs[0].Prompt, ticketB) {
+		t.Fatalf("already-pending ticket released/processed: releases=%v holds=%v runs=%#v", tickets.releases, containment.holds, agent.runs)
+	}
+	loop, found, err := store.TicketLoop(context.Background(), ticketA)
+	if err != nil || !found || loop.Phase != state.TicketLoopContainmentPending {
+		t.Fatalf("already-pending loop=%#v found=%t err=%v", loop, found, err)
+	}
+}
+
+func TestRunCoderDoesNotReleaseForConcurrentContainmentTrip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	const ticketA, ticketB = "20261003-56328", "20261003-56329"
+	if _, _, err := store.Participate(ctx, ticketA, 6); err != nil {
+		t.Fatal(err)
+	}
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: ticketA, State: "open", Assignee: "coder-1"}, {ID: ticketB, State: "open", Assignee: "coder-1"}},
+		shows: map[string]ticketclient.Ticket{
+			ticketA: {ID: ticketA, State: "open", Assignee: "coder-1"},
+			ticketB: {ID: ticketB, State: "review"},
+		},
+	}
+	containment := &managedContainmentFixture{tickets: tickets}
+	config := coderConfig()
+	config.ContainmentTickets = containment
+	participation := &participationBarrierStore{Store: store, entered: make(chan struct{}), resume: make(chan struct{})}
+	runs := 0
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}, onRun: func() {
+		runs++
+		if runs == 1 {
+			cancel()
+		}
+	}}
+	done := make(chan error, 1)
+	go func() { done <- RunCoder(ctx, config, tickets, agent, participation, &fakeCoderCleanup{}) }()
+	select {
+	case <-participation.entered:
+	case <-time.After(time.Second):
+		t.Fatal("coder did not reach participation boundary")
+	}
+	if _, err := store.MarkContainmentPending(ctx, ticketA); err != nil {
+		t.Fatal(err)
+	}
+	close(participation.resume)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunCoder error=%v, want cancellation after independent work", err)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatal("coder did not continue after concurrent containment trip")
+	}
+	if len(tickets.releases) != 0 || len(containment.holds) != 0 || len(agent.runs) != 1 || !strings.Contains(agent.runs[0].Prompt, ticketB) {
+		t.Fatalf("concurrent trip released or ran contained ticket: releases=%v holds=%v runs=%#v", tickets.releases, containment.holds, agent.runs)
+	}
+	loop, found, err := store.TicketLoop(context.Background(), ticketA)
+	if err != nil || !found || loop.Phase != state.TicketLoopContainmentPending {
+		t.Fatalf("concurrent trip loop=%#v found=%t err=%v", loop, found, err)
+	}
+}
+
+func (f *ticketLoopRaceFixture) Show(_ context.Context, id string) (ticketclient.Ticket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ticket, ok := f.tickets[id]
+	if !ok {
+		return ticketclient.Ticket{}, errors.New("ticket not found")
+	}
+	return ticket, nil
+}
+
+func (f *ticketLoopRaceFixture) ShowReadiness(ctx context.Context, id string) (ticketclient.TicketDetail, error) {
+	ticket, err := f.Show(ctx, id)
+	if err != nil {
+		return ticketclient.TicketDetail{}, err
+	}
+	return ticketclient.TicketDetail{ID: id, State: ticket.State, Assignee: ticket.Assignee, Readiness: &ticketclient.TicketReadiness{Ready: ticket.Assignee == ""}}, nil
+}
+
+func (f *ticketLoopRaceFixture) HoldTicket(_ context.Context, id string, _ ticketclient.MutationOptions) (ticketclient.MutationResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.holds = append(f.holds, id)
+	if id == "20260919-30010" {
+		ticket := f.tickets[id]
+		ticket.Assignee = "other-worker"
+		f.tickets[id] = ticket
+		return ticketclient.MutationResult{}, &ticketclient.CommandError{Code: "already_claimed"}
+	}
+	return ticketclient.MutationResult{}, errors.New("unexpected hold")
+}
+
+func TestRunCoderContinuesAfterContainmentOwnershipRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := state.NewForRepository(t.TempDir(), "/repo")
+	if _, _, err := store.Participate(ctx, "20260919-30010", 6); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkContainmentPending(ctx, "20260919-30010"); err != nil {
+		t.Fatal(err)
+	}
+	loopTickets := &ticketLoopRaceFixture{tickets: map[string]ticketclient.Ticket{
+		"20260919-30010": {ID: "20260919-30010", State: "open"},
+		"20260919-30011": {ID: "20260919-30011", State: "review", Assignee: "coder-1"},
+	}}
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: "20260919-30011", State: "open", Assignee: "coder-1"}},
+		shows: map[string]ticketclient.Ticket{
+			"20260919-30010": {ID: "20260919-30010", State: "open"},
+			"20260919-30011": {ID: "20260919-30011", State: "review", Assignee: "coder-1"},
+		},
+	}
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "ticket-b-session", StreamEndedNormally: true}, onRun: cancel}
+	config := coderConfig()
+	config.ContainmentTickets = loopTickets
+	err := RunCoder(ctx, config, tickets, agent, store, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunCoder error = %v, want cancellation after processing ticket B", err)
+	}
+	if len(agent.runs) != 1 || !strings.Contains(agent.runs[0].Prompt, "20260919-30011") {
+		t.Fatalf("harness runs = %#v, want work on ticket B after ticket A hold race", agent.runs)
+	}
+	if len(loopTickets.holds) != 1 || loopTickets.holds[0] != "20260919-30010" || loopTickets.tickets["20260919-30010"].Assignee != "other-worker" {
+		t.Fatalf("containment race holds=%v ticket A=%#v", loopTickets.holds, loopTickets.tickets["20260919-30010"])
+	}
+	loop, found, err := store.TicketLoop(context.Background(), "20260919-30010")
+	if err != nil || !found || loop.Phase != state.TicketLoopContainmentPending {
+		t.Fatalf("ticket A pending loop=%#v found=%t err=%v", loop, found, err)
 	}
 }
 

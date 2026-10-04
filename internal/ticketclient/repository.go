@@ -202,6 +202,29 @@ func (c *Client) Show(ctx context.Context, id string) (Ticket, error) {
 // projection for one explicit full ID. Status timestamps and the bounded full
 // display body are read through their separate typed public operations.
 func (c *Client) ShowDetail(ctx context.Context, id string) (TicketDetail, error) {
+	detail, err := c.ShowReadiness(ctx, id)
+	if err != nil {
+		return TicketDetail{}, err
+	}
+	status, err := c.ShowStatus(ctx, id)
+	if err != nil {
+		return TicketDetail{}, err
+	}
+	body, err := c.ShowFullBody(ctx, id)
+	if err != nil {
+		return TicketDetail{}, err
+	}
+	detail.Created = status.Created
+	detail.Modified = status.Modified
+	detail.Body = body.Body
+	detail.BodyTruncated = body.Truncated
+	detail.Truncated = detail.Truncated || body.Truncated
+	return detail, nil
+}
+
+// ShowReadiness reads the authoritative lifecycle, ownership, and readiness
+// projection needed for dispatch safety without fetching display-only data.
+func (c *Client) ShowReadiness(ctx context.Context, id string) (TicketDetail, error) {
 	if err := validateFullID(id); err != nil {
 		return TicketDetail{}, err
 	}
@@ -219,19 +242,6 @@ func (c *Client) ShowDetail(ctx context.Context, id string) (TicketDetail, error
 	if detail.Readiness == nil {
 		return TicketDetail{}, fmt.Errorf("%w: show response has no readiness", ErrProtocol)
 	}
-	status, err := c.ShowStatus(ctx, id)
-	if err != nil {
-		return TicketDetail{}, err
-	}
-	body, err := c.ShowFullBody(ctx, id)
-	if err != nil {
-		return TicketDetail{}, err
-	}
-	detail.Created = status.Created
-	detail.Modified = status.Modified
-	detail.Body = body.Body
-	detail.BodyTruncated = body.Truncated
-	detail.Truncated = detail.Truncated || body.Truncated
 	return detail, nil
 }
 

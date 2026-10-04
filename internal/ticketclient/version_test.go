@@ -30,13 +30,13 @@ func TestRequireMinimumVersionWithExecutable(t *testing.T) {
 		output  string
 		wantErr string
 	}{
-		{name: "below minimum", output: "ticket 0.2.2 (api 2, storage 3)\n", wantErr: "incompatible Ticket version: ticket-orc requires ticket >= v0.2.3; found v0.2.2"},
-		{name: "minimum", output: "ticket 0.2.3 (api 2, storage 3)\n"},
-		{name: "newer patch", output: "ticket v0.2.4 (api 2, storage 3)\n"},
+		{name: "below minimum", output: "ticket 0.2.3 (api 2, storage 3)\n", wantErr: "incompatible Ticket version: ticket-orc requires ticket >= v0.2.4; found v0.2.3"},
+		{name: "minimum", output: "ticket 0.2.4 (api 2, storage 3)\n"},
+		{name: "newer patch", output: "ticket v0.2.5 (api 2, storage 3)\n"},
 		{name: "newer minor", output: "ticket 0.3.0 (api 2, storage 3)\n"},
 		{name: "newer major", output: "ticket 1.0.0 (api 2, storage 3)\n"},
-		{name: "build metadata", output: "ticket 0.2.3+release.1 (api 2, storage 3)\n"},
-		{name: "prerelease", output: "ticket 0.2.3-rc.1 (api 2, storage 3)\n", wantErr: "incompatible Ticket version: ticket-orc requires ticket >= v0.2.3; found v0.2.3-rc.1"},
+		{name: "build metadata", output: "ticket 0.2.4+release.1 (api 2, storage 3)\n"},
+		{name: "prerelease", output: "ticket 0.2.4-rc.1 (api 2, storage 3)\n", wantErr: "incompatible Ticket version: ticket-orc requires ticket >= v0.2.4; found v0.2.4-rc.1"},
 		{name: "malformed", output: "Ticket version is 0.2.4\n", wantErr: "could not determine Ticket version"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -77,7 +77,7 @@ func TestTicketVersionProbeFailuresAreBoundedAndSafe(t *testing.T) {
 }
 
 func TestMinimumVersionCheckCachesPerExecutablePath(t *testing.T) {
-	executable := configureVersionHelper(t, "ticket 0.2.3 (api 2, storage 3)\n", "", "")
+	executable := configureVersionHelper(t, "ticket 0.2.4 (api 2, storage 3)\n", "", "")
 	countFile := filepath.Join(t.TempDir(), "calls")
 	t.Setenv(versionCountFileEnv, countFile)
 	absExecutable, err := filepath.Abs(executable)
@@ -96,7 +96,7 @@ func TestMinimumVersionCheckCachesPerExecutablePath(t *testing.T) {
 }
 
 func TestTicketVersionProbeHonorsContext(t *testing.T) {
-	executable := configureVersionHelper(t, "ticket 0.2.3 (api 2, storage 3)\n", "", "")
+	executable := configureVersionHelper(t, "ticket 0.2.4 (api 2, storage 3)\n", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 	_, err := TicketVersionWithExecutable(ctx, executable)

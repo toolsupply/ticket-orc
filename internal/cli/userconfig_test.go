@@ -118,7 +118,7 @@ func TestResolveInstanceDirectoryPrefersProjectAndPinsSelectedFailures(t *testin
 	}
 }
 
-func TestResolveInstanceDirectoryUsesGlobalOnlyWhenLocalIsAbsent(t *testing.T) {
+func TestResolveInstanceDirectoryUsesGlobalWhenNoConfiguredLocalInstance(t *testing.T) {
 	cwd := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -128,6 +128,129 @@ func TestResolveInstanceDirectoryUsesGlobalOnlyWhenLocalIsAbsent(t *testing.T) {
 	loaded, err := LoadFileConfig(cwd, "", false)
 	if err != nil || loaded.Instance.InstanceDir != globalDir {
 		t.Fatalf("selected instance=%#v err=%v, want global %s", loaded.Instance, err, globalDir)
+	}
+}
+
+func TestJoinConfigDiscoveryIgnoresLocalRuntimeArtifactsWithoutConfig(t *testing.T) {
+	cwd := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Chdir(cwd)
+
+	localDir := filepath.Join(cwd, defaultInstanceDirectoryName)
+	for _, name := range []string{"run", "workers"} {
+		if err := os.MkdirAll(filepath.Join(localDir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	globalDir := filepath.Join(home, defaultInstanceDirectoryName)
+	globalConfig := filepath.Join(globalDir, instanceConfigFileName)
+	writeConfigFixture(t, globalConfig, `{"version":1,"id":"2e4f5f6d-3a59-49f6-8c2f-e18186ac45aa"}`)
+
+	loaded, err := loadSteerConfig(emptyEnv)
+	if err != nil {
+		t.Fatalf("join config discovery: %v", err)
+	}
+	if loaded.Instance.InstanceDir != globalDir || loaded.Instance.ConfigPath != globalConfig {
+		t.Fatalf("join selected instance=%#v, want home instance %s", loaded.Instance, globalDir)
+	}
+}
+
+func TestExplicitInstanceDiscoveryDoesNotFallBackToHome(t *testing.T) {
+	cwd := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Chdir(cwd)
+	globalConfig := filepath.Join(home, defaultInstanceDirectoryName, instanceConfigFileName)
+	writeConfigFixture(t, globalConfig, `{"version":1}`)
+
+	explicitInstance := filepath.Join(cwd, "selected-instance")
+	if err := os.Mkdir(explicitInstance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	explicitConfig := filepath.Join(cwd, "selected-config", instanceConfigFileName)
+	for _, test := range []struct {
+		name           string
+		lookup         envLookup
+		path           string
+		instanceSelect bool
+		invalid        bool
+	}{
+		{name: "TICKET_ORC missing", lookup: mapEnv(map[string]string{"TICKET_ORC": explicitInstance}), path: filepath.Join(explicitInstance, instanceConfigFileName), instanceSelect: true},
+		{name: "TICKET_ORC invalid", lookup: mapEnv(map[string]string{"TICKET_ORC": explicitInstance}), path: filepath.Join(explicitInstance, instanceConfigFileName), instanceSelect: true, invalid: true},
+		{name: "explicit config missing", lookup: emptyEnv, path: explicitConfig},
+		{name: "explicit config invalid", lookup: emptyEnv, path: explicitConfig, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.invalid {
+				if err := os.MkdirAll(filepath.Dir(test.path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(test.path, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var err error
+			if test.instanceSelect {
+				_, err = loadSteerConfig(test.lookup)
+			} else {
+				_, err = loadSteerConfigPath(test.path, test.lookup)
+			}
+			wantError := "config file not found"
+			if test.invalid {
+				wantError = "rejected"
+			}
+			if err == nil || !strings.Contains(err.Error(), test.path) || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("explicit selection error = %v, want %q for %s", err, wantError, test.path)
+			}
+		})
+	}
+}
+
+func TestInstanceDiscoveryRejectsNonRegularLocalConfig(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		makeEntry func(t *testing.T, configPath, globalConfig string)
+	}{
+		{
+			name: "directory",
+			makeEntry: func(t *testing.T, configPath, _ string) {
+				if err := os.Mkdir(configPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			makeEntry: func(t *testing.T, configPath, globalConfig string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("symlink creation may require elevated Windows privileges")
+				}
+				if err := os.Symlink(globalConfig, configPath); err != nil {
+					t.Skipf("symlink creation unavailable: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Chdir(cwd)
+			globalConfig := filepath.Join(home, defaultInstanceDirectoryName, instanceConfigFileName)
+			writeConfigFixture(t, globalConfig, `{"version":1}`)
+			localConfig := filepath.Join(cwd, defaultInstanceDirectoryName, instanceConfigFileName)
+			if err := os.MkdirAll(filepath.Dir(localConfig), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			test.makeEntry(t, localConfig, globalConfig)
+			if _, err := loadSteerConfig(emptyEnv); err == nil || !strings.Contains(err.Error(), "instance config is not a regular file: "+localConfig) {
+				t.Fatalf("non-regular local config error = %v, want safe rejection for %s", err, localConfig)
+			}
+		})
 	}
 }
 

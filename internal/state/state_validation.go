@@ -42,19 +42,44 @@ func validateSnapshot(snapshot Snapshot) error {
 			return fmt.Errorf("%w: session history exceeds limit", ErrMalformed)
 		}
 	}
-	for ticket, count := range snapshot.Bounces {
-		repository, ticketID, namespaced := splitBounceKey(ticket)
-		if !namespaced {
-			return fmt.Errorf("%w: bounce key must include a repository namespace", ErrMalformed)
+	for key, loop := range snapshot.Loops {
+		if key != ticketLoopKey(loop.Repository, loop.Ticket) {
+			return fmt.Errorf("%w: ticket loop key mismatch", ErrMalformed)
 		}
-		if err := validateRepositoryIdentity("bounce", repository); err != nil {
+		if err := validateRepositoryIdentity("ticket loop", loop.Repository); err != nil {
 			return fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
-		if err := validateToken("bounce ticket", ticketID); err != nil {
+		if err := validateToken("ticket loop ticket", loop.Ticket); err != nil {
 			return fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
-		if count < 0 {
-			return fmt.Errorf("%w: negative bounce count for %s", ErrMalformed, ticket)
+		if loop.StallCount < 0 || loop.BounceCount < 0 || loop.EffectiveBounceLimit < 0 {
+			return fmt.Errorf("%w: negative ticket loop count or limit for %s", ErrMalformed, key)
+		}
+		if loop.Phase != TicketLoopActive && loop.Phase != TicketLoopContainmentPending && loop.Phase != TicketLoopHeld {
+			return fmt.Errorf("%w: invalid ticket loop phase %q", ErrMalformed, loop.Phase)
+		}
+		if loop.Phase == TicketLoopActive && loop.EffectiveBounceLimit > 0 && loop.BounceCount >= loop.EffectiveBounceLimit {
+			return fmt.Errorf("%w: active ticket loop has exceeded its bounce limit", ErrMalformed)
+		}
+		if loop.HeldFrom != "" && loop.HeldFrom != "open" && loop.HeldFrom != "review" {
+			return fmt.Errorf("%w: invalid ticket loop held_from %q", ErrMalformed, loop.HeldFrom)
+		}
+		if loop.ClaimState != "" && loop.ClaimState != "open" && loop.ClaimState != "review" {
+			return fmt.Errorf("%w: invalid ticket loop claim_state %q", ErrMalformed, loop.ClaimState)
+		}
+		if (loop.ClaimState == "") != (loop.ClaimActor == "") {
+			return fmt.Errorf("%w: incomplete ticket loop claim observation", ErrMalformed)
+		}
+		if loop.Phase == TicketLoopHeld && (loop.ClaimState != "" || loop.DispatchPending) {
+			return fmt.Errorf("%w: held ticket loop has active attempt state", ErrMalformed)
+		}
+		if loop.DispatchPending && loop.ClaimState != "" {
+			return fmt.Errorf("%w: ticket loop has both a pending dispatch and active claim", ErrMalformed)
+		}
+		if loop.ClaimActor != "" {
+			if err := validateSteerName("actor", loop.ClaimActor); err != nil {
+				return fmt.Errorf("%w: invalid ticket loop claim actor", ErrMalformed)
+			}
 		}
 	}
 	return nil
