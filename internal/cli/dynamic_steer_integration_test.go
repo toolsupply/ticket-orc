@@ -26,13 +26,15 @@ type integratedSteerClient struct {
 	ready       string
 	activeCalls atomic.Int32
 	readyCalls  atomic.Int32
+	changed     chan<- struct{}
 }
 
 func (c *integratedSteerClient) ActiveClaims(_ context.Context, queue string, _ int) (ticketclient.ListResult, error) {
-	c.activeCalls.Add(1)
 	c.mu.RLock()
 	ticket := c.active
 	c.mu.RUnlock()
+	c.activeCalls.Add(1)
+	c.signalObservation()
 	if ticket != "" {
 		return testTicketList(ticket, queue), nil
 	}
@@ -40,14 +42,25 @@ func (c *integratedSteerClient) ActiveClaims(_ context.Context, queue string, _ 
 }
 
 func (c *integratedSteerClient) ReadyFrontier(_ context.Context, queue string, _ ticketclient.QueueFilters, _ int) (ticketclient.ListResult, error) {
-	c.readyCalls.Add(1)
 	c.mu.RLock()
 	ticket := c.ready
 	c.mu.RUnlock()
+	c.readyCalls.Add(1)
+	c.signalObservation()
 	if ticket != "" {
 		return testTicketList(ticket, queue), nil
 	}
 	return ticketclient.ListResult{}, nil
+}
+
+func (c *integratedSteerClient) signalObservation() {
+	if c.changed == nil {
+		return
+	}
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
 }
 
 func (c *integratedSteerClient) setReady(ticket string) {
@@ -157,20 +170,6 @@ type integratedSteerCalls struct {
 	ready  int32
 }
 
-type manualSteerElapsedTimer struct {
-	now   time.Time
-	ticks chan time.Time
-}
-
-func newManualSteerElapsedTimer(start time.Time) *manualSteerElapsedTimer {
-	return &manualSteerElapsedTimer{now: start, ticks: make(chan time.Time)}
-}
-
-func (timer *manualSteerElapsedTimer) Advance(duration time.Duration) {
-	timer.now = timer.now.Add(duration)
-	timer.ticks <- timer.now
-}
-
 func snapshotIntegratedSteerCalls(clients map[string]*integratedSteerClient) map[string]integratedSteerCalls {
 	snapshot := make(map[string]integratedSteerCalls, len(clients))
 	for actor, client := range clients {
@@ -179,47 +178,39 @@ func snapshotIntegratedSteerCalls(clients map[string]*integratedSteerClient) map
 	return snapshot
 }
 
-func assertIntegratedSteerCallDelta(t *testing.T, clients map[string]*integratedSteerClient, before map[string]integratedSteerCalls, activeDelta, readyDelta map[string]int32) {
+func assertIntegratedSteerCallDelta(t *testing.T, clients map[string]*integratedSteerClient, before map[string]integratedSteerCalls, activeDelta, readyDelta map[string]int32, changed <-chan struct{}) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		complete := true
-		for actor, client := range clients {
-			prior := before[actor]
-			wantActive := prior.active + activeDelta[actor]
-			wantReady := prior.ready + readyDelta[actor]
-			if client.activeCalls.Load() < wantActive || client.readyCalls.Load() < wantReady {
-				complete = false
-				break
-			}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for !integratedSteerCallMinimumReached(clients, before, activeDelta, readyDelta) {
+		select {
+		case <-changed:
+		case <-deadline.C:
+			t.Fatalf("scheduler did not finish expected Ticket observations: before=%#v active_delta=%#v ready_delta=%#v after=%#v", before, activeDelta, readyDelta, snapshotIntegratedSteerCalls(clients))
 		}
-		if complete {
-			for actor, client := range clients {
-				prior := before[actor]
-				if got, want := client.activeCalls.Load()-prior.active, activeDelta[actor]; got != want {
-					t.Fatalf("actor %s ActiveClaims delta=%d, want exactly %d", actor, got, want)
-				}
-				if got, want := client.readyCalls.Load()-prior.ready, readyDelta[actor]; got != want {
-					t.Fatalf("actor %s ReadyFrontier delta=%d, want exactly %d", actor, got, want)
-				}
-			}
-			return
-		}
-		time.Sleep(time.Millisecond)
 	}
 	for actor, client := range clients {
 		prior := before[actor]
 		if got, want := client.activeCalls.Load()-prior.active, activeDelta[actor]; got != want {
-			t.Errorf("actor %s ActiveClaims delta=%d, want %d", actor, got, want)
+			t.Fatalf("actor %s ActiveClaims delta=%d, want exactly %d", actor, got, want)
 		}
 		if got, want := client.readyCalls.Load()-prior.ready, readyDelta[actor]; got != want {
-			t.Errorf("actor %s ReadyFrontier delta=%d, want %d", actor, got, want)
+			t.Fatalf("actor %s ReadyFrontier delta=%d, want exactly %d", actor, got, want)
 		}
 	}
-	t.Fatal("scheduler did not finish the expected authoritative Ticket observations")
 }
 
-func settleIntegratedSteerSchedule(t *testing.T, registrationTicks, elapsedTicks chan<- time.Time) {
+func integratedSteerCallMinimumReached(clients map[string]*integratedSteerClient, before map[string]integratedSteerCalls, activeDelta, readyDelta map[string]int32) bool {
+	for actor, client := range clients {
+		prior := before[actor]
+		if client.activeCalls.Load() < prior.active+activeDelta[actor] || client.readyCalls.Load() < prior.ready+readyDelta[actor] {
+			return false
+		}
+	}
+	return true
+}
+
+func settleIntegratedSteerSchedule(t *testing.T, registrationTicks chan<- time.Time, passCompleted <-chan struct{}) {
 	t.Helper()
 	for range 2 {
 		select {
@@ -227,11 +218,20 @@ func settleIntegratedSteerSchedule(t *testing.T, registrationTicks, elapsedTicks
 		case <-time.After(2 * time.Second):
 			t.Fatal("steer scheduler did not reach a deterministic tick barrier")
 		}
+		select {
+		case <-passCompleted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("steer scheduler did not complete the registration reconciliation")
+		}
 	}
-	select {
-	case elapsedTicks <- time.Now():
-	case <-time.After(2 * time.Second):
-		t.Fatal("steer scheduler did not reach a deterministic tick barrier")
+}
+
+func waitIntegratedSteerInitialStatus(t *testing.T, statuses *dynamicSteerStatus) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := statuses.waitFirst(ctx); err != nil {
+		t.Fatalf("scheduler did not publish initial steer status: %v", err)
 	}
 }
 
@@ -260,7 +260,8 @@ func TestRepositoryReadyForcesPostStartupTargetedSteerReconciliation(t *testing.
 	}
 	runtimeStore := state.NewSteerRuntimeStore(stateDir)
 	seedIdleSteerDeliveries(t, runtimeStore, registrations)
-	clients := map[string]*integratedSteerClient{"a-one": {}, "b-one": {}}
+	callsChanged := make(chan struct{}, 1)
+	clients := map[string]*integratedSteerClient{"a-one": {changed: callsChanged}, "b-one": {changed: callsChanged}}
 	watchStarted := make(chan struct{})
 	releaseReady := make(chan struct{})
 	watchRuntime := NewRuntimeState(nil)
@@ -292,23 +293,34 @@ func TestRepositoryReadyForcesPostStartupTargetedSteerReconciliation(t *testing.
 	statuses := &dynamicSteerStatus{}
 	queued := make(chan string, 4)
 	registrationTicks := make(chan time.Time)
+	passCompleted := make(chan struct{}, 1)
 	schedulerDone := make(chan struct{})
 	go func() {
 		defer close(schedulerDone)
-		runDynamicSteerWithSchedule(ctx, stateDir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, runtime,
+		runDynamicSteerWithScheduleCompletion(ctx, stateDir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, runtime,
 			func(registration state.SteerRegistration) (steerClient, error) {
 				return clients[registration.Actor], nil
 			},
 			testSteerRouter(t, func(_ context.Context, _ string, registration state.SteerRegistration, _ steertransport.Message) error {
 				queued <- registration.SessionID
 				return nil
-			}), statuses, runtimeStore, newRegistrationObserver(store), gate, dirty, registrationTicks)
+			}), statuses, runtimeStore, newRegistrationObserver(store), gate, dirty, registrationTicks, passCompleted)
 	}()
-	t.Cleanup(func() { cancel(); <-schedulerDone })
-	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool { return len(items) == 2 })
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-schedulerDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("dynamic steer scheduler did not stop during test cleanup")
+		}
+	})
+	waitIntegratedSteerInitialStatus(t, statuses)
+	if items := statuses.snapshot(); len(items) != 2 {
+		t.Fatalf("initial steer statuses=%#v, want two", items)
+	}
 	initial := snapshotIntegratedSteerCalls(clients)
 	assertIntegratedSteerCallDelta(t, clients, map[string]integratedSteerCalls{},
-		map[string]int32{"a-one": 2, "b-one": 2}, map[string]int32{"a-one": 1, "b-one": 1})
+		map[string]int32{"a-one": 2, "b-one": 2}, map[string]int32{"a-one": 1, "b-one": 1}, callsChanged)
 	if initial["a-one"].active != 2 || initial["b-one"].active != 2 || initial["a-one"].ready != 1 || initial["b-one"].ready != 1 {
 		t.Fatalf("initial authoritative reconciliation calls=%#v", initial)
 	}
@@ -319,7 +331,7 @@ func TestRepositoryReadyForcesPostStartupTargetedSteerReconciliation(t *testing.
 	clients["a-one"].setReady("20260930-11237")
 	close(releaseReady)
 	assertIntegratedSteerCallDelta(t, clients, initial,
-		map[string]int32{"a-one": 2}, map[string]int32{"a-one": 1})
+		map[string]int32{"a-one": 2}, map[string]int32{"a-one": 1}, callsChanged)
 	select {
 	case session := <-queued:
 		if session != "a-one-thread" {
@@ -393,11 +405,13 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	runtimeStore := state.NewSteerRuntimeStore(stateDir)
 	seedIdleSteerDeliveries(t, runtimeStore, initialRegistrations)
 
+	callsChanged := make(chan struct{}, 1)
 	clients := map[string]*integratedSteerClient{
-		"a-one": {}, "a-two": {}, "b-one": {}, "b-two": {},
+		"a-one": {changed: callsChanged}, "a-two": {changed: callsChanged}, "b-one": {changed: callsChanged}, "b-two": {changed: callsChanged},
 	}
 	watchRuntime := NewRuntimeState(nil)
 	var watcherMu sync.Mutex
+	watcherStarted := make(chan struct{}, 1)
 	watcherStarts := make(map[string][]*integratedRepositoryWatchProcess)
 	watchFixtures := make(map[string]*ticketWatchMetadataFixture)
 	watch := newRepositoryWatchManagerWithStarter(ctx, watchRuntime, nil, nil,
@@ -417,6 +431,10 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 				watchFixtures[repository.Key] = fixture
 			}
 			watcherMu.Unlock()
+			select {
+			case watcherStarted <- struct{}{}:
+			default:
+			}
 			return process, nil
 		})
 	defer watch.StopObservers()
@@ -447,14 +465,19 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	emitEvent := func(event supervisor.RuntimeEvent) { published <- event }
 	wireSupervisorRuntimeEvents(config, manager, emitEvent)
 	wireSupervisorControlCallbacks(&config, manager, emitEvent, nil, &sync.Once{})
+	watchReady := make(chan string, 2)
+	watch.SetReadySink(func(repositoryID string) {
+		config.steerDirty.MarkRepository(repositoryID)
+		watchReady <- repositoryID
+	})
 	watch.StartObservers()
 	waitIntegratedObserverStarts(t, &watcherMu, watcherStarts, map[string]int{
 		dynamicRepositoryKey(joinTestRepositoryID):  1,
 		dynamicRepositoryKey(joinOtherRepositoryID): 1,
-	})
+	}, watcherStarted)
 
 	registrationTicks := make(chan time.Time)
-	idleTimer := newManualSteerElapsedTimer(time.Date(2026, time.September, 29, 13, 0, 0, 0, time.UTC))
+	passCompleted := make(chan struct{}, 1)
 	statuses := &dynamicSteerStatus{}
 	aThreeReconciled := make(chan struct{}, 1)
 	statuses.setPublisher(func(event daemon.Event) {
@@ -469,7 +492,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	schedulerDone := make(chan struct{})
 	go func() {
 		defer close(schedulerDone)
-		runDynamicSteerWithElapsedSchedule(ctx, stateDir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, runtimeState,
+		runDynamicSteerWithScheduleCompletion(ctx, stateDir, map[string]steerRolePolicy{"coder": {TicketQueue: "open", NudgePrompt: "wake"}}, runtimeState,
 			func(registration state.SteerRegistration) (steerClient, error) {
 				return clients[registration.Actor], nil
 			},
@@ -477,10 +500,20 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 				queued <- registration.SessionID
 				return nil
 			}),
-			statuses, runtimeStore, newRegistrationObserver(registrations), gate, config.steerDirty, registrationTicks, idleTimer.ticks)
+			statuses, runtimeStore, newRegistrationObserver(registrations), gate, config.steerDirty, registrationTicks, passCompleted)
 	}()
-	t.Cleanup(func() { cancel(); <-schedulerDone })
-	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool { return len(items) == 4 })
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-schedulerDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("dynamic steer scheduler did not stop during test cleanup")
+		}
+	})
+	waitIntegratedSteerInitialStatus(t, statuses)
+	if items := statuses.snapshot(); len(items) != 4 {
+		t.Fatalf("initial steer statuses=%#v, want four", items)
+	}
 	initialCalls := snapshotIntegratedSteerCalls(clients)
 	wantInitial := map[string]integratedSteerCalls{
 		"a-one": {active: 2, ready: 1}, "a-two": {active: 2, ready: 1},
@@ -491,9 +524,25 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 			t.Fatalf("initial authoritative calls for %s=%#v, want %#v", actor, got, want)
 		}
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
-	if got := snapshotIntegratedSteerCalls(clients); !equalIntegratedSteerCalls(got, initialCalls) {
-		t.Fatalf("unchanged registration observations caused Ticket calls: before=%#v after=%#v", initialCalls, got)
+	readyRepositories := make(map[string]bool, 2)
+	for range 2 {
+		select {
+		case repositoryID := <-watchReady:
+			readyRepositories[repositoryID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("repository observers did not report READY")
+		}
+	}
+	if len(readyRepositories) != 2 || !readyRepositories[joinTestRepositoryID] || !readyRepositories[joinOtherRepositoryID] {
+		t.Fatalf("repository READY notifications=%#v", readyRepositories)
+	}
+	// Consume any reconciliation triggered by observer readiness before
+	// measuring whether unchanged registration ticks cause further Ticket calls.
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
+	settledCalls := snapshotIntegratedSteerCalls(clients)
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
+	if got := snapshotIntegratedSteerCalls(clients); !equalIntegratedSteerCalls(got, settledCalls) {
+		t.Fatalf("unchanged registration observations caused Ticket calls: before=%#v after=%#v", settledCalls, got)
 	}
 	observed = registrationObserver.Observe(ctx)
 	applyDynamicRepositoryObservationWithCache(ctx, manager, probe, observed, identityCache, cacheStart.Add(2*time.Second))
@@ -541,9 +590,9 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if changed.Type != "ticket.repository_changed" || changed.RepositoryID != joinTestRepositoryID || changed.Ticket != editedTicketID || changed.Code != "edited" {
 		t.Fatalf("published repository change=%#v", changed)
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	assertIntegratedSteerCallDelta(t, clients, beforeAChange,
-		map[string]int32{"a-one": 2, "a-two": 2}, map[string]int32{"a-one": 1, "a-two": 1})
+		map[string]int32{"a-one": 2, "a-two": 2}, map[string]int32{"a-one": 1, "a-two": 1}, callsChanged)
 	if got := <-queued; got != "a-one-thread" {
 		t.Fatalf("repository change queued thread %q, want a-one from authoritative ready frontier", got)
 	}
@@ -557,7 +606,7 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	clients["a-three"] = &integratedSteerClient{}
+	clients["a-three"] = &integratedSteerClient{changed: callsChanged}
 	clients["a-three"].setReady("20260929-22222")
 	allRegistrations := append(append([]state.SteerRegistration(nil), initialRegistrations...), newRegistration)
 	observed = registrationObserver.Observe(ctx)
@@ -576,13 +625,18 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 		t.Fatal("scheduler did not observe the new registration")
 	}
 	select {
+	case <-passCompleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not complete the new-registration reconciliation")
+	}
+	select {
 	case <-aThreeReconciled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("scheduler did not publish completed status for actor a-three")
 	}
 	assertIntegratedSteerCallDelta(t, clients, beforeJoin,
 		map[string]int32{"a-one": 2, "a-two": 2, "a-three": 2},
-		map[string]int32{"a-two": 1, "a-three": 1})
+		map[string]int32{"a-two": 1, "a-three": 1}, callsChanged)
 	if got := <-queued; got != "a-three-thread" {
 		t.Fatalf("new registration queued thread %q, want its authoritative ready frontier", got)
 	}
@@ -598,10 +652,10 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if _, err := config.control.ResumeDaemon(ctx); err != nil {
 		t.Fatalf("resume daemon: %v", err)
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	assertIntegratedSteerCallDelta(t, clients, beforeResume,
 		map[string]int32{"a-one": 2, "a-two": 2, "a-three": 2, "b-one": 2, "b-two": 2},
-		map[string]int32{"a-two": 1, "b-one": 1, "b-two": 1})
+		map[string]int32{"a-two": 1, "b-one": 1, "b-two": 1}, callsChanged)
 	if got := <-queued; got != "b-one-thread" {
 		t.Fatalf("daemon resume queued thread %q, want b-one from its current Ticket frontier", got)
 	}
@@ -637,10 +691,10 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 			t.Fatalf("observer recovery events degraded=%t recovered=%t", sawDegraded, sawRecovered)
 		}
 	}
-	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	assertIntegratedSteerCallDelta(t, clients, beforeRecovery,
 		map[string]int32{"a-one": 2, "a-two": 2, "a-three": 2},
-		map[string]int32{"a-two": 1})
+		map[string]int32{"a-two": 1}, callsChanged)
 	if got := <-queued; got != "a-two-thread" {
 		t.Fatalf("observer recovery queued thread %q, want a-two from its current Ticket frontier", got)
 	}
@@ -649,15 +703,10 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	}
 
 	beforeLongIdle := snapshotIntegratedSteerCalls(clients)
-	// Advance an independent elapsed-time timer beyond the old full-work sweep
-	// interval. This reaches the scheduler's elapsed-time case without waiting
-	// in wall-clock time or generating a registration/repository trigger.
-	idleTimer.Advance(31 * time.Second)
-	assertIntegratedSteerCallDelta(t, clients, beforeLongIdle, map[string]int32{}, map[string]int32{})
-	// Unchanged registration polls after that simulated interval must remain
-	// targeted as well.
-	settleIntegratedSteerSchedule(t, registrationTicks, idleTimer.ticks)
-	assertIntegratedSteerCallDelta(t, clients, beforeLongIdle, map[string]int32{}, map[string]int32{})
+	// Unchanged registration polls remain cheap even after the recovery work
+	// above; healthy repositories are not swept on a generic elapsed timer.
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
+	assertIntegratedSteerCallDelta(t, clients, beforeLongIdle, map[string]int32{}, map[string]int32{}, callsChanged)
 
 	observed = registrationObserver.Observe(ctx)
 	applyDynamicRepositoryObservationWithCache(ctx, manager, probe, observed, identityCache, cacheStart.Add(dynamicRepositoryReverifyInterval))
@@ -685,10 +734,11 @@ func seedIdleSteerRegistration(t *testing.T, runtime *state.SteerRuntimeStore, r
 	}
 }
 
-func waitIntegratedObserverStarts(t *testing.T, mu *sync.Mutex, starts map[string][]*integratedRepositoryWatchProcess, want map[string]int) {
+func waitIntegratedObserverStarts(t *testing.T, mu *sync.Mutex, starts map[string][]*integratedRepositoryWatchProcess, want map[string]int, changed <-chan struct{}) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
 		mu.Lock()
 		ready := true
 		for key, count := range want {
@@ -701,9 +751,18 @@ func waitIntegratedObserverStarts(t *testing.T, mu *sync.Mutex, starts map[strin
 		if ready {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-changed:
+		case <-deadline.C:
+			mu.Lock()
+			counts := make(map[string]int, len(starts))
+			for key, processes := range starts {
+				counts[key] = len(processes)
+			}
+			mu.Unlock()
+			t.Fatalf("repository observer starts=%#v, want at least %#v", counts, want)
+		}
 	}
-	t.Fatalf("repository observer starts=%#v, want at least %#v", starts, want)
 }
 
 func equalIntegratedSteerCalls(left, right map[string]integratedSteerCalls) bool {

@@ -25,29 +25,30 @@ var ErrRequestTooLarge = errors.New("request body too large")
 // WorkerStatus is the public, deliberately small worker representation used
 // by the status endpoint. It contains no prompts, credentials, or environment.
 type WorkerStatus struct {
-	Name                    string         `json:"name"`
-	Role                    string         `json:"role,omitempty"`
-	EffectiveRoleName       string         `json:"effective_role_name,omitempty"`
-	EffectiveTicketQueue    string         `json:"effective_ticket_queue,omitempty"`
-	Harness                 string         `json:"harness,omitempty"`
-	TicketActor             string         `json:"ticket_actor,omitempty"`
-	TicketActivityAt        time.Time      `json:"ticket_activity_at,omitempty"`
-	TicketActivity          string         `json:"ticket_activity,omitempty"`
-	TicketActivityTicket    string         `json:"ticket_activity_ticket,omitempty"`
-	TicketActivitySource    string         `json:"ticket_activity_source,omitempty"`
-	State                   string         `json:"state"`
-	Reason                  string         `json:"reason,omitempty"`
-	Failure                 *WorkerFailure `json:"failure,omitempty"`
-	TicketFrontierState     string         `json:"ticket_frontier_state,omitempty"`
-	EffectiveTicketTags     []string       `json:"effective_ticket_tags,omitempty"`
-	EffectiveReviewSkipTags []string       `json:"effective_review_skip_tags,omitempty"`
-	RepositoryID            string         `json:"repository_id,omitempty"`
-	RepositoryName          string         `json:"repository_name,omitempty"`
-	RepositoryKey           string         `json:"repository_key,omitempty"`
-	RepositoryPath          string         `json:"repository_path,omitempty"`
-	TicketConfig            string         `json:"ticket_config,omitempty"`
-	TicketScope             string         `json:"ticket_scope,omitempty"`
-	Groups                  []string       `json:"groups,omitempty"`
+	Name                       string         `json:"name"`
+	Role                       string         `json:"role,omitempty"`
+	EffectiveRoleName          string         `json:"effective_role_name,omitempty"`
+	EffectiveTicketQueue       string         `json:"effective_ticket_queue,omitempty"`
+	Harness                    string         `json:"harness,omitempty"`
+	TicketActor                string         `json:"ticket_actor,omitempty"`
+	TicketActivityAt           time.Time      `json:"ticket_activity_at,omitempty"`
+	TicketActivity             string         `json:"ticket_activity,omitempty"`
+	TicketActivityTicket       string         `json:"ticket_activity_ticket,omitempty"`
+	TicketActivitySource       string         `json:"ticket_activity_source,omitempty"`
+	State                      string         `json:"state"`
+	Reason                     string         `json:"reason,omitempty"`
+	Failure                    *WorkerFailure `json:"failure,omitempty"`
+	TicketFrontierState        string         `json:"ticket_frontier_state,omitempty"`
+	EffectiveTicketTags        []string       `json:"effective_ticket_tags,omitempty"`
+	EffectiveTicketWithoutTags []string       `json:"effective_ticket_without_tags,omitempty"`
+	EffectiveReviewSkipTags    []string       `json:"effective_review_skip_tags,omitempty"`
+	RepositoryID               string         `json:"repository_id,omitempty"`
+	RepositoryName             string         `json:"repository_name,omitempty"`
+	RepositoryKey              string         `json:"repository_key,omitempty"`
+	RepositoryPath             string         `json:"repository_path,omitempty"`
+	TicketConfig               string         `json:"ticket_config,omitempty"`
+	TicketScope                string         `json:"ticket_scope,omitempty"`
+	Groups                     []string       `json:"groups,omitempty"`
 }
 
 // GroupStatus is the bounded public projection of one managed group.
@@ -74,16 +75,17 @@ type Status struct {
 // SteerStatus reports one dynamic external session without exposing its home
 // directory or prompt.
 type SteerStatus struct {
-	RepositoryID            string   `json:"repository_id"`
-	RepositoryName          string   `json:"repository_name,omitempty"`
-	Role                    string   `json:"role"`
-	Actor                   string   `json:"actor"`
-	Harness                 string   `json:"harness,omitempty"`
-	Session                 string   `json:"session,omitempty"`
-	EffectiveTicketQueue    string   `json:"effective_ticket_queue,omitempty"`
-	EffectiveTicketTags     []string `json:"effective_ticket_tags,omitempty"`
-	EffectiveReviewSkipTags []string `json:"effective_review_skip_tags,omitempty"`
-	State                   string   `json:"state"`
+	RepositoryID               string   `json:"repository_id"`
+	RepositoryName             string   `json:"repository_name,omitempty"`
+	Role                       string   `json:"role"`
+	Actor                      string   `json:"actor"`
+	Harness                    string   `json:"harness,omitempty"`
+	Session                    string   `json:"session,omitempty"`
+	EffectiveTicketQueue       string   `json:"effective_ticket_queue,omitempty"`
+	EffectiveTicketTags        []string `json:"effective_ticket_tags,omitempty"`
+	EffectiveTicketWithoutTags []string `json:"effective_ticket_without_tags,omitempty"`
+	EffectiveReviewSkipTags    []string `json:"effective_review_skip_tags,omitempty"`
+	State                      string   `json:"state"`
 	// Ticket identifies the active claim when one was observed.
 	Ticket          string `json:"ticket,omitempty"`
 	Code            string `json:"code,omitempty"`

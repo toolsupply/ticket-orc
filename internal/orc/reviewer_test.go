@@ -52,6 +52,62 @@ func TestReviewerUsesManagedSessionEligibilityPath(t *testing.T) {
 	}
 }
 
+func TestRunReviewerTurnPreservesConfiguredRoleAndRetainedSessionKey(t *testing.T) {
+	const ticketID = "20261006-50026"
+	stateStore := newFakeCoderState()
+	owner := "worker-review"
+	stateStore.sessions[coderSessionKey(ticketID, "reviewer", "codex", owner)] = state.Session{
+		Ticket: ticketID, Role: "reviewer", Harness: "codex", Owner: owner, ID: "existing-review-session",
+	}
+	config := reviewerConfig()
+	config.WorkerName = owner
+	config.RoleName = "security-review"
+	config.TicketQueue = "review"
+	config.ReviewCompletion = "signoff"
+	agent := &fakeCoderHarness{resumeRes: harness.RunResult{SessionID: "existing-review-session"}}
+	if _, err := runReviewerTurn(context.Background(), config, ticketID, agent, stateStore); err != nil {
+		t.Fatalf("runReviewerTurn: %v", err)
+	}
+	if len(agent.runs) != 1 || agent.runs[0].Role != "security-review" || len(agent.resumes) != 1 || agent.resumes[0] != "existing-review-session" {
+		t.Fatalf("harness request/session = %#v / %v", agent.runs, agent.resumes)
+	}
+	if agent.runs[0].Prompt != ReviewerPrompt(ticketID) {
+		t.Fatalf("renaming configured role changed prompt meaning: %q", agent.runs[0].Prompt)
+	}
+	if len(stateStore.sets) != 1 || stateStore.sets[0].Role != "reviewer" || stateStore.sets[0].ID != "existing-review-session" {
+		t.Fatalf("retained session key changed with configured role: %#v", stateStore.sets)
+	}
+}
+
+func TestRunReviewerEventsUseConfiguredRoleName(t *testing.T) {
+	const ticketID = "20261006-50027"
+	tickets := &fakeCoderTickets{
+		reviewClaims: []ticketclient.Ticket{{ID: ticketID, State: "review", Assignee: "reviewer-1"}},
+		shows:        map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "signoff"}},
+	}
+	stateStore := newFakeCoderState()
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}}
+	ctx, cancel := context.WithCancel(context.Background())
+	tickets.onShow = cancel
+	var events []Event
+	config := reviewerConfig()
+	config.RoleName = "security-review"
+	config.TicketQueue = "review"
+	config.EventSink = func(event Event) { events = append(events, event) }
+	err := RunReviewer(ctx, config, tickets, agent, stateStore, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunReviewer error=%v, want queue cancellation", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %#v, want ready, claim, and lifecycle", events)
+	}
+	for _, event := range events {
+		if event.Role != "security-review" {
+			t.Errorf("event %s role=%q, want configured role security-review", event.Type, event.Role)
+		}
+	}
+}
+
 func TestRunReviewerApprovesAndReturnsToQueue(t *testing.T) {
 	ticketID := "20260919-40001"
 	tickets := &fakeCoderTickets{

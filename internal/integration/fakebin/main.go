@@ -48,7 +48,7 @@ func runClaude() {
 
 func runTicket() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Fprintln(os.Stdout, "ticket 0.2.4 (api 2, storage 3)")
+		fmt.Fprintln(os.Stdout, "ticket 0.2.5 (api 2, storage 3)")
 		return
 	}
 	logPath := os.Getenv("TICKET_ORC_FAKE_TICKET_LOG")
@@ -441,6 +441,9 @@ func runCodex() {
 		os.Exit(7)
 	}
 	if os.Getenv("TICKET_ORC_FAKE_CODEX_BLOCK") == "1" {
+		if path := os.Getenv("TICKET_ORC_FAKE_CODEX_BLOCKED_FILE"); path != "" {
+			_ = os.WriteFile(path, []byte("blocked\n"), 0o600)
+		}
 		for {
 			time.Sleep(time.Hour)
 		}

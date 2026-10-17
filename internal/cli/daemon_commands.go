@@ -291,7 +291,11 @@ func renderDaemonCompactStatus(stdout io.Writer, status daemon.Status) {
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "daemon mode=%s version=%s protocol=%d pid=%d url=%s started=%s\n", status.Mode, status.Version, status.Protocol, status.PID, status.URL, status.StartedAt.Local().Format(time.RFC3339))
 	for _, worker := range status.Workers {
-		fmt.Fprintf(stdout, "worker %s state=%s role=%s harness=%s", worker.Name, worker.State, worker.Role, worker.Harness)
+		roleName := worker.EffectiveRoleName
+		if roleName == "" {
+			roleName = worker.Role
+		}
+		fmt.Fprintf(stdout, "worker %s state=%s role=%s harness=%s", worker.Name, worker.State, roleName, worker.Harness)
 		if worker.TicketActor != "" {
 			fmt.Fprintf(stdout, " actor=%s", worker.TicketActor)
 		}

@@ -45,7 +45,7 @@ func TestDynamicSteerStartupPrunesOrphanSpoolEndpoints(t *testing.T) {
 		cancel()
 		<-done
 	})
-	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
+	waitFirstSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
 		return len(items) == 1 && items[0].Code == "unknown_role"
 	})
 	cancel()

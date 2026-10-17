@@ -21,6 +21,8 @@ const (
 // CoderConfig contains policy and process settings for one coder loop.
 type CoderConfig struct {
 	WorkerName                 string
+	RoleName                   string
+	TicketQueue                string
 	Actor                      string
 	Harness                    string
 	Model                      string
@@ -78,6 +80,15 @@ func (e *BounceLimitError) Error() string {
 // state, harness, or lifecycle error occurs. A successful review or
 // terminal cleanup returns to Ticket work without spawning an extra harness turn.
 func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) error {
+	if config.RoleName == "" {
+		config.RoleName = "coder"
+	}
+	if config.TicketQueue == "" {
+		config.TicketQueue = "open"
+	}
+	if config.TicketQueue != "open" {
+		return fmt.Errorf("coder executor requires the open queue, got %q", config.TicketQueue)
+	}
 	if ctx == nil {
 		return fmt.Errorf("coder context must not be nil")
 	}
@@ -126,7 +137,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		}
 		config.WorkingDir = workingDir
 	}
-	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: "coder", State: "ready", Phase: "startup"})
+	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: config.RoleName, State: "ready", Phase: "startup"})
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -194,7 +205,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		}
 
 		logCoder(config.Diagnostics, "%s: claimed implementation work (review bounces: %d/%d)", claimed.ID, bounces, config.MaxBounces)
-		emitEvent(config.EventSink, Event{Type: "ticket.claim", Worker: config.WorkerName, Role: "coder", State: "claimed", Ticket: claimed.ID})
+		emitEvent(config.EventSink, Event{Type: "ticket.claim", Worker: config.WorkerName, Role: config.RoleName, State: "claimed", Ticket: claimed.ID})
 		turn, prepareErr := runCoderTurn(ctx, config, claimed.ID, agent, orchestrationState)
 		if prepareErr != nil {
 			return fmt.Errorf("prepare coder turn for %s: %w", claimed.ID, prepareErr)
@@ -216,7 +227,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 			return fmt.Errorf("coder turn for %s: %w", claimed.ID, recoveryErr)
 		}
 		observed.State = ticketclient.NormalizeLifecycleState(observed.State)
-		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "coder", State: observed.State, Ticket: observed.ID})
+		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: config.RoleName, State: observed.State, Ticket: observed.ID})
 		if loopState, ok := orchestrationState.(TicketLoopState); ok {
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
@@ -339,11 +350,15 @@ type coderTurnResult struct {
 }
 
 func runCoderTurn(ctx context.Context, config CoderConfig, ticketID string, agent harness.Harness, orchestrationState TicketState) (coderTurnResult, error) {
+	roleName := config.RoleName
+	if roleName == "" {
+		roleName = "coder"
+	}
 	prompt := resolvedCoderPrompt(config.TicketPrompt, ticketID)
 	request := harness.RunRequest{
 		WorkerName:           config.WorkerName,
 		WorkingDir:           config.WorkingDir,
-		Role:                 "coder",
+		Role:                 roleName,
 		Actor:                config.Actor,
 		TicketID:             ticketID,
 		Prompt:               prompt,

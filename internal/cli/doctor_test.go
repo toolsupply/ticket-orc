@@ -209,11 +209,55 @@ func TestWorkerManagerDoctorReconcilesAnotherChildExitDuringVerification(t *test
 			t.Fatal(err)
 		}
 	}
+	doctorCtx, cancelDoctor := context.WithCancel(context.Background())
+	ctx := &supervisorTestContext{Context: doctorCtx, doneCalls: make(chan struct{}, 4)}
+	type doctorCompletion struct {
+		result supervisor.DoctorResult
+		err    error
+	}
+	done := make(chan doctorCompletion, 1)
+	finished := make(chan struct{})
+	var releaseSecondChild sync.Once
+	releaseSecondChildWait := func() {
+		releaseSecondChild.Do(func() { close(children["two"].waited) })
+	}
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		close(children["two"].waited)
+		defer close(finished)
+		result, err := manager.doctor(ctx)
+		done <- doctorCompletion{result: result, err: err}
 	}()
-	result, err := manager.doctor(context.Background())
+	t.Cleanup(func() {
+		releaseSecondChildWait()
+		cancelDoctor()
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Error("doctor goroutine did not stop during cleanup")
+		}
+	})
+	// The first verification observes worker one ready; the second has entered
+	// worker two's readiness wait. Keep operation A there while operation B
+	// publishes worker two's exit.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ctx.doneCalls:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("doctor did not reach startup verification %d", i+1)
+		}
+	}
+	select {
+	case completion := <-done:
+		t.Fatalf("doctor completed before worker two exited: %#v", completion)
+	default:
+	}
+	releaseSecondChildWait()
+	var completion doctorCompletion
+	select {
+	case completion = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("doctor did not complete after worker two exited")
+	}
+	result, err := completion.result, completion.err
 	if err != nil || len(result.Workers) != 2 {
 		t.Fatalf("doctor result=%#v err=%v", result, err)
 	}

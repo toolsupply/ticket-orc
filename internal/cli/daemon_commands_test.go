@@ -34,13 +34,16 @@ func TestDaemonErrorNeedsStatusUsesStructuredResult(t *testing.T) {
 
 func TestDaemonCompactStatusHasBlankBoundaries(t *testing.T) {
 	var output bytes.Buffer
-	status := daemon.Status{Version: "dev", Protocol: 1, Mode: "paused"}
+	status := daemon.Status{Version: "dev", Protocol: 1, Mode: "paused", Workers: []daemon.WorkerStatus{{Name: "backend-worker", Role: "coder", EffectiveRoleName: "backend", EffectiveTicketQueue: "open", TicketActor: "coder"}}}
 	renderDaemonCompactStatus(&output, status)
 	if got := output.String(); !strings.HasPrefix(got, "\n") || !strings.HasSuffix(got, "\n\n") {
 		t.Fatalf("daemon status output must start and end with a blank line: %q", got)
 	}
 	if !strings.Contains(output.String(), "daemon mode=paused") {
 		t.Fatalf("compact status omitted daemon mode: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "worker backend-worker") || !strings.Contains(output.String(), "role=backend") || strings.Contains(output.String(), "role=coder") {
+		t.Fatalf("compact status did not report configured role: %q", output.String())
 	}
 	encoded, err := json.Marshal(status)
 	if err != nil || !strings.Contains(string(encoded), `"mode":"paused"`) {

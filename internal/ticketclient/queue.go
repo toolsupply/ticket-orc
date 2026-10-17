@@ -2,6 +2,7 @@ package ticketclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -296,6 +297,94 @@ func (c *Client) ListUnassigned(ctx context.Context, queue string) ([]Ticket, er
 		}
 	}
 	return response.Items, nil
+}
+
+const (
+	maxSignoffFrontierLimit = 20
+)
+
+// SignoffFrontier returns a bounded authoritative observation of unassigned
+// signoff tickets matching the required and excluded tags. Ticket applies all
+// filters before limit and offset. Unlike ListUnassigned's recovery completeness
+// check, More is valid and reports
+// further matches. Empty assignees may be omitted by Ticket's public list
+// projection; --unassigned owns that predicate and any returned assignee must
+// be empty.
+func (c *Client) SignoffFrontier(ctx context.Context, filters QueueFilters, limit, offset int) (ListResult, error) {
+	if limit < 1 || limit > maxSignoffFrontierLimit {
+		return ListResult{}, fmt.Errorf("ticket signoff frontier limit must be between 1 and %d", maxSignoffFrontierLimit)
+	}
+	if offset < 0 {
+		return ListResult{}, fmt.Errorf("ticket signoff frontier offset must not be negative")
+	}
+	filters, err := CanonicalQueueFilters(filters)
+	if err != nil {
+		return ListResult{}, err
+	}
+	args := appendTagArgs([]string{"list", "--state", "signoff", "--unassigned"}, filters.Tags)
+	args = appendWithoutTagArgs(args, filters.WithoutTags)
+	args = append(args, "--limit", fmt.Sprint(limit), "--offset", fmt.Sprint(offset), "--fields", "id,state,assignee")
+	var response struct {
+		Items json.RawMessage `json:"items"`
+		More  *bool           `json:"more"`
+	}
+	if err := c.invoke(ctx, args, &response); err != nil {
+		return ListResult{}, err
+	}
+	if len(response.Items) == 0 || response.More == nil {
+		return ListResult{}, fmt.Errorf("%w: signoff frontier response is missing items or more", ErrProtocol)
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(response.Items, &rawItems); err != nil || rawItems == nil {
+		return ListResult{}, fmt.Errorf("%w: signoff frontier items must be an array", ErrProtocol)
+	}
+	if len(rawItems) > limit {
+		return ListResult{}, fmt.Errorf("%w: signoff frontier exceeds requested limit", ErrProtocol)
+	}
+	result := ListResult{Items: make([]Ticket, 0, len(rawItems)), More: *response.More}
+	seen := make(map[string]struct{}, len(rawItems))
+	for _, raw := range rawItems {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+			return ListResult{}, fmt.Errorf("%w: signoff frontier item must be an object", ErrProtocol)
+		}
+		for _, name := range []string{"id", "state"} {
+			value, ok := fields[name]
+			if !ok || len(value) == 0 {
+				return ListResult{}, fmt.Errorf("%w: signoff frontier item is missing %q", ErrProtocol, name)
+			}
+			var text *string
+			if err := json.Unmarshal(value, &text); err != nil || text == nil {
+				return ListResult{}, fmt.Errorf("%w: signoff frontier item field %q must be a string", ErrProtocol, name)
+			}
+		}
+		if value, ok := fields["assignee"]; ok {
+			var assignee *string
+			if err := json.Unmarshal(value, &assignee); err != nil || assignee == nil {
+				return ListResult{}, fmt.Errorf("%w: signoff frontier item field %q must be a string", ErrProtocol, "assignee")
+			}
+			if *assignee != "" {
+				return ListResult{}, fmt.Errorf("%w: signoff frontier item is assigned to %q", ErrProtocol, *assignee)
+			}
+		}
+		var item Ticket
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return ListResult{}, fmt.Errorf("%w: decode signoff frontier item: %v", ErrProtocol, err)
+		}
+		item = item.NormalizeState()
+		if err := validateFullID(item.ID); err != nil {
+			return ListResult{}, fmt.Errorf("%w: signoff frontier item: %v", ErrProtocol, err)
+		}
+		if _, ok := seen[item.ID]; ok {
+			return ListResult{}, fmt.Errorf("%w: duplicate signoff frontier item %q", ErrProtocol, item.ID)
+		}
+		seen[item.ID] = struct{}{}
+		if item.State != "signoff" || item.Assignee != "" {
+			return ListResult{}, fmt.Errorf("%w: signoff frontier item %q is not unassigned signoff work", ErrProtocol, item.ID)
+		}
+		result.Items = append(result.Items, item)
+	}
+	return result, nil
 }
 
 func (c *Client) waitAndClaim(ctx context.Context, expectedState string, args []string) (Ticket, error) {

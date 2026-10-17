@@ -865,6 +865,61 @@ func TestRunCoderTurnPromptDoesNotNarrateTicketRouting(t *testing.T) {
 	}
 }
 
+func TestRunCoderTurnPreservesConfiguredRoleAndRetainedSessionKey(t *testing.T) {
+	const ticketID = "20261006-50024"
+	stateStore := newFakeCoderState()
+	owner := "worker-a"
+	stateStore.sessions[coderSessionKey(ticketID, "coder", "codex", owner)] = state.Session{
+		Ticket: ticketID, Role: "coder", Harness: "codex", Owner: owner, ID: "existing-session",
+	}
+	config := coderConfig()
+	config.WorkerName = owner
+	config.RoleName = "backend"
+	config.TicketQueue = "open"
+	agent := &fakeCoderHarness{resumeRes: harness.RunResult{SessionID: "existing-session"}}
+	if _, err := runCoderTurn(context.Background(), config, ticketID, agent, stateStore); err != nil {
+		t.Fatalf("runCoderTurn: %v", err)
+	}
+	if len(agent.runs) != 1 || agent.runs[0].Role != "backend" || len(agent.resumes) != 1 || agent.resumes[0] != "existing-session" {
+		t.Fatalf("harness request/session = %#v / %v", agent.runs, agent.resumes)
+	}
+	if agent.runs[0].Prompt != CoderPrompt(ticketID) {
+		t.Fatalf("renaming configured role changed prompt meaning: %q", agent.runs[0].Prompt)
+	}
+	if len(stateStore.sets) != 1 || stateStore.sets[0].Role != "coder" || stateStore.sets[0].ID != "existing-session" {
+		t.Fatalf("retained session key changed with configured role: %#v", stateStore.sets)
+	}
+}
+
+func TestRunCoderEventsUseConfiguredRoleName(t *testing.T) {
+	const ticketID = "20261006-50025"
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: ticketID, State: "open", Assignee: "coder-1"}},
+		shows:  map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "coder-1"}},
+	}
+	stateStore := newFakeCoderState()
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread", StreamEndedNormally: true}}
+	ctx, cancel := context.WithCancel(context.Background())
+	tickets.onShow = cancel
+	var events []Event
+	config := coderConfig()
+	config.RoleName = "backend"
+	config.TicketQueue = "open"
+	config.EventSink = func(event Event) { events = append(events, event) }
+	err := RunCoder(ctx, config, tickets, agent, stateStore, &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunCoder error=%v, want queue cancellation", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %#v, want ready, claim, and lifecycle", events)
+	}
+	for _, event := range events {
+		if event.Role != "backend" {
+			t.Errorf("event %s role=%q, want configured role backend", event.Type, event.Role)
+		}
+	}
+}
+
 func TestRunCoderBounceLimitReleasesWithoutHarness(t *testing.T) {
 	ticketID := "20260919-30004"
 	tickets := &fakeCoderTickets{claims: []ticketclient.Ticket{{ID: ticketID, State: "open"}}, shows: map[string]ticketclient.Ticket{}}
@@ -1109,6 +1164,24 @@ func TestRunCoderSkipTagPreservesExplicitSignoffGate(t *testing.T) {
 	err := RunCoder(ctx, config, tickets, agent, newFakeCoderState(), &fakeCoderCleanup{})
 	if !errors.Is(err, context.Canceled) || len(tickets.closes) != 0 || !reflect.DeepEqual(tickets.approves, []string{ticketID}) || tickets.shows[ticketID].State != "signoff" {
 		t.Fatalf("RunCoder = %v, approves=%#v closes=%#v state=%q; want signoff approval without close", err, tickets.approves, tickets.closes, tickets.shows[ticketID].State)
+	}
+}
+
+func TestRunCoderGenericExclusionDoesNotChangeReviewLifecycle(t *testing.T) {
+	ticketID := "20260923-42956"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tickets := &fakeCoderTickets{
+		claims: []ticketclient.Ticket{{ID: ticketID, State: "open", Assignee: "coder-1"}},
+		shows:  map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "review", Assignee: "coder-1", Tags: []string{"generic-exclusion"}}},
+		onShow: cancel,
+	}
+	config := coderConfig()
+	config.QueueFilters = ticketclient.QueueFilters{WithoutTags: []string{"generic-exclusion"}}
+	agent := &fakeCoderHarness{runRes: harness.RunResult{SessionID: "thread"}}
+	err := RunCoder(ctx, config, tickets, agent, newFakeCoderState(), &fakeCoderCleanup{})
+	if !errors.Is(err, context.Canceled) || len(tickets.closes) != 0 || len(tickets.approves) != 0 {
+		t.Fatalf("RunCoder = %v, closes=%#v approves=%#v; generic selection exclusion must not alter review lifecycle", err, tickets.closes, tickets.approves)
 	}
 }
 

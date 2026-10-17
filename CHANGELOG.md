@@ -2,6 +2,16 @@
 
 All notable user-facing changes to `ticket-orc` are documented here.
 
+## [0.1.3] - 2026-10-17
+
+### Added
+
+- Added architect role, try via `ticket-orc init --global --architect`.
+
+### Changed
+
+- Steered codex nudge prompts now handle one ticket at the time.
+
 ## [0.1.2] - 2026-10-04
 
 ### Changed
@@ -31,6 +41,7 @@ All notable user-facing changes to `ticket-orc` are documented here.
 
 - Initial release
 
+[0.1.3]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.3
 [0.1.2]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.2
 [0.1.1]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.1
 [0.1.0]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.0

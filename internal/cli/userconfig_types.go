@@ -7,8 +7,9 @@ const maxIdentifierBytes = 64
 const defaultInstanceDirectoryName = ".ticket-orc"
 const instanceConfigFileName = "config.json"
 
-const coderNudgePrompt = "[ticket-orc] Coding work is available. Process all actionable Ticket work for your current actor until none remains. Before submitting each ticket, review your changes against the objective and acceptance criteria and run the relevant checks. Fix obvious issues before handing it to review. Set a goal before starting."
-const reviewerNudgePrompt = "[ticket-orc] Review work is available. Perform a substantive review of all actionable Ticket work for your current actor until none remains. Assume the coder has already run the routine/basic test suite; do not rerun the same tests by default. Focus on specification compliance, correctness, edge cases, integration behavior, error handling, and code quality. Run targeted tests only when they help investigate a specific concern. Set a goal before starting."
+const coderNudgePrompt = "[ticket-orc] Coding work is available. Use Ticket's authoritative selection and claim flow to select at most one actionable Ticket item for this Orc-steered turn. Before submitting it, review your changes against the objective and acceptance criteria and run the relevant checks. Fix obvious issues before handing it to review, then stop and return. Do not claim another ticket in this turn. If no item is selected, return immediately without changes. Set a goal before starting."
+const reviewerNudgePrompt = "[ticket-orc] Review work is available. Perform a substantive independent review for specification compliance against the ticket objective and acceptance criteria. Check correctness, edge cases, integration, error handling, and maintainability. Assume the coder has run routine/basic tests; run targeted tests only to investigate specific concerns. Set a goal before starting."
+const architectNudgePrompt = "Make the final acceptance decision for work approved by the reviewer."
 
 // FileConfig is the versioned on-disk configuration. It remains separate
 // from resolved worker/runtime configuration used by execution.
@@ -62,6 +63,7 @@ type DefaultsFileConfig struct {
 type RoleFileConfig struct {
 	TicketQueue                string                      `json:"ticket_queue"`
 	TicketTags                 []string                    `json:"ticket_tags"`
+	TicketWithoutTags          []string                    `json:"ticket_without_tags"`
 	NudgePrompt                string                      `json:"nudge_prompt"`
 	Groups                     []string                    `json:"groups"`
 	RequiredSkills             []string                    `json:"required_skills"`

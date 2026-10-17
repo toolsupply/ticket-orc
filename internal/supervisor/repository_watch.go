@@ -70,6 +70,10 @@ type repositoryWatchObserver struct {
 	lastRestart time.Time
 }
 
+type repositoryWatchDebounceTimer struct {
+	timer *time.Timer
+}
+
 // RepositoryWatchManager owns repository observer lifecycle, debounce state,
 // and health transitions. Process creation remains an injected boundary so
 // the application package does not own CLI child-process rendering or argv.
@@ -86,7 +90,7 @@ type RepositoryWatchManager struct {
 	repositories    RepositoryRegistry
 	replaceRevision uint64
 	pending         map[string]RepositoryWatchEvent
-	timers          map[string]*time.Timer
+	timers          map[string]*repositoryWatchDebounceTimer
 	started         bool
 	stopped         bool
 }
@@ -95,7 +99,7 @@ func NewRepositoryWatchManager(ctx context.Context, runtime repositoryStatusRunt
 	manager := &RepositoryWatchManager{
 		ctx: ctx, runtime: runtime, probe: probe, start: start,
 		observers: make(map[string]*repositoryWatchObserver), repositories: CloneRepositoryRegistry(repositories),
-		pending: make(map[string]RepositoryWatchEvent), timers: make(map[string]*time.Timer),
+		pending: make(map[string]RepositoryWatchEvent), timers: make(map[string]*repositoryWatchDebounceTimer),
 	}
 	for key, repository := range repositories {
 		manager.setStatusLocked(key, repository, RepositoryStatus{Key: key, State: "starting"})
@@ -193,7 +197,7 @@ func (m *RepositoryWatchManager) replace(ctx context.Context, revision uint64, r
 		candidate, remains := repositories[key]
 		if existed && (!remains || !sameConfiguredRepository(previous, candidate)) {
 			if timer := m.timers[key]; timer != nil {
-				timer.Stop()
+				timer.timer.Stop()
 				delete(m.timers, key)
 			}
 			delete(m.pending, key)
@@ -431,13 +435,19 @@ func (m *RepositoryWatchManager) ticketChangedLocked(key string, event Repositor
 	}
 	m.pending[key] = event
 	if timer := m.timers[key]; timer != nil {
-		timer.Stop()
+		timer.timer.Stop()
 	}
-	m.timers[key] = time.AfterFunc(RepositoryWatchDebounce, func() { m.flushChanged(key) })
+	timer := &repositoryWatchDebounceTimer{}
+	m.timers[key] = timer
+	timer.timer = time.AfterFunc(RepositoryWatchDebounce, func() { m.flushChanged(key, timer) })
 }
 
-func (m *RepositoryWatchManager) flushChanged(key string) {
+func (m *RepositoryWatchManager) flushChanged(key string, timer *repositoryWatchDebounceTimer) {
 	m.mu.Lock()
+	if m.timers[key] != timer {
+		m.mu.Unlock()
+		return
+	}
 	event, ok := m.pending[key]
 	repository, repositoryFound := m.repositories[key]
 	delete(m.pending, key)
@@ -574,7 +584,7 @@ func (m *RepositoryWatchManager) StopObservers() {
 	}
 	m.stopped = true
 	for key, timer := range m.timers {
-		timer.Stop()
+		timer.timer.Stop()
 		delete(m.timers, key)
 		delete(m.pending, key)
 	}

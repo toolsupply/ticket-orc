@@ -1,0 +1,23 @@
+name: Concurrency Stability
+
+on:
+  schedule:
+    - cron: '29 7 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  repeated-tests:
+    name: repeated shuffled tests (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: repeat concurrency-sensitive packages
+        run: go test -shuffle=on -count=20 ./internal/cli ./internal/supervisor ./internal/state

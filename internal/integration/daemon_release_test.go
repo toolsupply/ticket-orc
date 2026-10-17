@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 func writeDaemonReleaseConfig(t *testing.T, configPath, localDir string, includeWorker, includeGroups bool) {
@@ -56,6 +58,40 @@ func writeDaemonReleaseConfig(t *testing.T, configPath, localDir string, include
 	}
 }
 
+type processWaiter struct {
+	done chan struct{}
+	err  error
+}
+
+func waitForProcess(cmd *exec.Cmd) *processWaiter {
+	waiter := &processWaiter{done: make(chan struct{})}
+	go func() {
+		waiter.err = cmd.Wait()
+		close(waiter.done)
+	}()
+	return waiter
+}
+
+func (waiter *processWaiter) wait(timeout time.Duration) (error, bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-waiter.done:
+		return waiter.err, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+func (waiter *processWaiter) exited() bool {
+	select {
+	case <-waiter.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // Managed workers remain controllable through the authenticated daemon API.
 func TestRunAuthenticatedDaemonControlAndEvents(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -71,37 +107,54 @@ func TestRunAuthenticatedDaemonControlAndEvents(t *testing.T) {
 	stateDir := filepath.Join(root, "state")
 	writeDaemonReleaseConfig(t, configPath, stateDir, true, true)
 	codexLog := filepath.Join(root, "codex.jsonl")
+	codexBlocked := filepath.Join(root, "codex.blocked")
 	ticketLog := filepath.Join(root, "ticket.log")
 	cmd := exec.Command(binary, "run", "--config", configPath, "--worker", "worker")
 	var runStdout, runStderr synchronizedBuffer
 	cmd.Stdout, cmd.Stderr = &runStdout, &runStderr
 	cmd.Env = testEnv(helperDir, map[string]string{
-		"TICKET_ORC_FAKE_TICKET_ID":    integrationTicketID,
-		"TICKET_ORC_FAKE_TICKET_STATE": "open",
-		"TICKET_ORC_FAKE_CLAIM_STATE":  "open",
-		"TICKET_ORC_FAKE_QUEUE":        "open",
-		"TICKET_ORC_FAKE_READY":        "0",
-		"TICKET_ORC_FAKE_ACTIVE":       "0",
-		"TICKET_ORC_FAKE_CODEX_LOG":    codexLog,
-		"TICKET_ORC_FAKE_TICKET_LOG":   ticketLog,
+		"TICKET_ORC_FAKE_TICKET_ID":          integrationTicketID,
+		"TICKET_ORC_FAKE_TICKET_STATE":       "open",
+		"TICKET_ORC_FAKE_CLAIM_STATE":        "open",
+		"TICKET_ORC_FAKE_QUEUE":              "open",
+		"TICKET_ORC_FAKE_READY":              "0",
+		"TICKET_ORC_FAKE_ACTIVE":             "0",
+		"TICKET_ORC_FAKE_CODEX_BLOCK":        "1",
+		"TICKET_ORC_FAKE_CODEX_BLOCKED_FILE": codexBlocked,
+		"TICKET_ORC_FAKE_CODEX_LOG":          codexLog,
+		"TICKET_ORC_FAKE_TICKET_LOG":         ticketLog,
 	}, map[string]string{"TICKET_ORC_ACTOR": "integration-coder"})
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
+	waiter := waitForProcess(cmd)
+	t.Cleanup(func() {
+		if waiter.exited() {
+			return
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+		if _, done := waiter.wait(6 * time.Second); done {
+			return
+		}
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	}()
+		if _, done := waiter.wait(time.Second); !done {
+			t.Error("daemon process did not exit after forced cleanup")
+		}
+	})
 	endpoint := waitForDaemonEndpoint(t, stateDir, runStderr.String)
 	client := &http.Client{Timeout: 5 * time.Second}
-	status := daemon.Status{}
-	statusResponse := authenticatedRequest(t, client, endpoint, http.MethodGet, "/v1/status", "")
-	if statusResponse.StatusCode != http.StatusOK || json.NewDecoder(statusResponse.Body).Decode(&status) != nil || len(status.Workers) != 1 || status.Workers[0].Name != "worker" {
-		t.Fatalf("status=%#v response=%d", status, statusResponse.StatusCode)
-	}
-	_ = statusResponse.Body.Close()
 
-	eventsResponse := authenticatedRequest(t, client, endpoint, http.MethodGet, "/v1/events", "")
+	eventsContext, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	eventsRequest, err := http.NewRequestWithContext(eventsContext, http.MethodGet, endpoint.CapabilityURL()+"/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsResponse, err := client.Do(eventsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventsResponse.Body.Close()
 	if eventsResponse.StatusCode != http.StatusOK || !strings.HasPrefix(eventsResponse.Header.Get("Content-Type"), "text/event-stream") {
 		t.Fatalf("events response=%d content-type=%q", eventsResponse.StatusCode, eventsResponse.Header.Get("Content-Type"))
 	}
@@ -129,24 +182,54 @@ func TestRunAuthenticatedDaemonControlAndEvents(t *testing.T) {
 	if _, err := fmt.Sscanf(idLine, "id: %d\n", &syncID); err != nil || syncEvent.Type != "stream.sync" || syncEvent.Seq != syncID {
 		t.Fatalf("sync frame id=%q event=%#v err=%v", idLine, syncEvent, err)
 	}
-	if _, err := postDaemon(t, client, endpoint, "/v1/workers/worker/pause", ""); err != nil {
-		t.Fatal(err)
+	// Keep the fake Codex turn active and wait for its explicit blocked marker.
+	// This test exercises pausing a live worker; endpoint publication and
+	// stream.sync can both happen before the worker reaches its turn.
+	testutil.Await(t, 5*time.Second, "fake Codex turn to block", func() bool {
+		_, err := os.Stat(codexBlocked)
+		return err == nil
+	}, func() string {
+		return "codex log tail=" + readDiagnosticFileTail(codexLog, 2048) + " daemon stderr tail=" + boundedDiagnosticText(runStderr.String(), 2048)
+	})
+	status := daemon.Status{}
+	statusResponse := authenticatedRequest(t, client, endpoint, http.MethodGet, "/v1/status", "")
+	statusErr := json.NewDecoder(statusResponse.Body).Decode(&status)
+	_ = statusResponse.Body.Close()
+	if statusResponse.StatusCode != http.StatusOK || statusErr != nil || len(status.Workers) != 1 || status.Workers[0].Name != "worker" || status.Workers[0].State != "running" {
+		t.Fatalf("status=%#v response=%d decode_err=%v daemon stdout (tail): %s daemon stderr (tail): %s",
+			status, statusResponse.StatusCode, statusErr,
+			boundedDiagnosticText(runStdout.String(), 2048), boundedDiagnosticText(runStderr.String(), 2048),
+		)
 	}
-	if !readEventContaining(t, reader, "worker.control") {
+	if _, err := postDaemon(t, client, endpoint, "/v1/workers/worker/pause", ""); err != nil {
+		t.Fatalf("pause request failed: %v\ndaemon stdout (tail): %s\ndaemon stderr (tail): %s\nfake Ticket log (tail): %s\nfake Codex log (tail): %s",
+			err,
+			boundedDiagnosticText(runStdout.String(), 2048),
+			boundedDiagnosticText(runStderr.String(), 2048),
+			readDiagnosticFileTail(ticketLog, 2048),
+			readDiagnosticFileTail(codexLog, 2048),
+		)
+	}
+	if !readEventContaining(t, reader, "worker.control", cancelEvents) {
 		t.Fatal("pause control event missing")
 	}
 	paused := daemon.Status{}
 	pausedResponse := authenticatedRequest(t, client, endpoint, http.MethodGet, "/v1/status", "")
-	if pausedResponse.StatusCode != http.StatusOK || json.NewDecoder(pausedResponse.Body).Decode(&paused) != nil || len(paused.Workers) != 1 || paused.Workers[0].State != "paused" {
-		t.Fatalf("paused status=%#v response=%d", paused, pausedResponse.StatusCode)
-	}
+	pausedErr := json.NewDecoder(pausedResponse.Body).Decode(&paused)
 	_ = pausedResponse.Body.Close()
+	if pausedResponse.StatusCode != http.StatusOK || pausedErr != nil || len(paused.Workers) != 1 || paused.Workers[0].State != "paused" {
+		t.Fatalf("paused status=%#v response=%d decode_err=%v", paused, pausedResponse.StatusCode, pausedErr)
+	}
 	if _, err := postDaemon(t, client, endpoint, "/v1/shutdown", ""); err != nil {
 		t.Fatal(err)
 	}
 	_ = eventsResponse.Body.Close()
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("run shutdown: %v", err)
+	waitErr, exited := waiter.wait(6 * time.Second)
+	if !exited {
+		t.Fatal("daemon process did not exit after shutdown; cleanup will signal and reap it")
+	}
+	if waitErr != nil {
+		t.Fatalf("run shutdown: %v", waitErr)
 	}
 }
 
@@ -453,10 +536,9 @@ func TestInteractiveRunCtrlCLeavesDaemonForExplicitShutdown(t *testing.T) {
 	endpoint := waitForDaemonEndpoint(t, stateDir, stderr.String)
 	// The complete run -i startup view is emitted only after the supervisor
 	// has started its workers and the console has obtained its first snapshot.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && !strings.Contains(stdout.String(), "ticket-orc> ") {
-		time.Sleep(10 * time.Millisecond)
-	}
+	testutil.Await(t, 3*time.Second, "interactive console prompt", func() bool {
+		return strings.Contains(stdout.String(), "ticket-orc> ")
+	}, func() string { return "stdout=" + stdout.String() + " stderr=" + stderr.String() })
 	startup := stdout.String()
 	loadedLine := "[ticket-orc] loaded " + configPath + "\n"
 	endpointLine := strings.Index(startup, "[ticket-orc] endpoint: orc://")
@@ -470,10 +552,11 @@ func TestInteractiveRunCtrlCLeavesDaemonForExplicitShutdown(t *testing.T) {
 	if err := signalInteractiveGroup(cmd.Process); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
-	if cmd.ProcessState != nil {
-		t.Fatalf("interactive run exited after Ctrl-C: state=%#v stderr=%q", cmd.ProcessState, stderr.String())
-	}
+	// Wait for the console's post-signal prompt, then check the authoritative
+	// daemon status. This proves Ctrl-C was consumed without relying on a delay.
+	testutil.Await(t, 3*time.Second, "interactive console prompt after Ctrl-C", func() bool {
+		return strings.Count(stdout.String(), "ticket-orc> ") >= 2
+	}, func() string { return "stdout=" + stdout.String() + " stderr=" + stderr.String() })
 	statusResponse := authenticatedRequest(t, &http.Client{Timeout: 3 * time.Second}, endpoint, http.MethodGet, "/v1/status", "")
 	var status daemon.Status
 	if statusResponse.StatusCode != http.StatusOK || json.NewDecoder(statusResponse.Body).Decode(&status) != nil || len(status.Workers) != 1 || status.Workers[0].State != "running" {
@@ -561,18 +644,21 @@ func TestAttachEOFLeavesForegroundDaemonRunning(t *testing.T) {
 
 func waitForDaemonEndpoint(t *testing.T, stateDir string, diagnostics ...func() string) daemon.Endpoint {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if endpoint, err := daemon.ReadEndpoint(stateDir); err == nil {
-			return endpoint
+	var endpoint daemon.Endpoint
+	testutil.Await(t, 5*time.Second, "daemon endpoint file", func() bool {
+		current, err := daemon.ReadEndpoint(stateDir)
+		if err != nil {
+			return false
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if len(diagnostics) > 0 && diagnostics[0] != nil {
-		t.Fatalf("timed out waiting for daemon endpoint; child stderr=%q", diagnostics[0]())
-	}
-	t.Fatalf("timed out waiting for daemon endpoint")
-	return daemon.Endpoint{}
+		endpoint = current
+		return true
+	}, func() string {
+		if len(diagnostics) > 0 && diagnostics[0] != nil {
+			return "child stderr=" + diagnostics[0]()
+		}
+		return "state directory=" + stateDir
+	})
+	return endpoint
 }
 
 func authenticatedRequest(t *testing.T, client *http.Client, endpoint daemon.Endpoint, method, path, body string) *http.Response {
@@ -600,26 +686,145 @@ func postDaemon(t *testing.T, client *http.Client, endpoint daemon.Endpoint, pat
 		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return payload, &httpStatusError{status: response.StatusCode}
+		return payload, httpStatusErrorFromPayload(response.StatusCode, "POST "+path, payload)
 	}
 	return payload, nil
 }
 
-type httpStatusError struct{ status int }
+func httpStatusErrorFromPayload(status int, operation string, payload map[string]any) *httpStatusError {
+	statusErr := &httpStatusError{status: status, operation: operation}
+	errorBody, _ := payload["error"].(map[string]any)
+	if errorBody == nil {
+		return statusErr
+	}
+	statusErr.code = boundedDiagnosticText(stringValue(errorBody["code"]), 64)
+	statusErr.message = boundedDiagnosticText(stringValue(errorBody["message"]), 256)
+	statusErr.state = boundedDiagnosticText(stringValue(errorBody["state"]), 64)
+	if applied, ok := errorBody["mutation_applied"].(bool); ok {
+		statusErr.mutationApplied = &applied
+	}
+	return statusErr
+}
 
-func (e *httpStatusError) Error() string { return "daemon HTTP status " + fmt.Sprint(e.status) }
+type httpStatusError struct {
+	status          int
+	operation       string
+	code            string
+	message         string
+	state           string
+	mutationApplied *bool
+}
 
-func readEventContaining(t *testing.T, reader *bufio.Reader, text string) bool {
+func (e *httpStatusError) Error() string {
+	detail := "daemon HTTP status " + fmt.Sprint(e.status) + " for " + e.operation
+	if e.code != "" {
+		detail += " code=" + e.code
+	}
+	if e.message != "" {
+		detail += " message=" + e.message
+	}
+	if e.mutationApplied != nil {
+		detail += " mutation_applied=" + fmt.Sprint(*e.mutationApplied)
+	}
+	if e.state != "" {
+		detail += " state=" + e.state
+	}
+	return detail
+}
+
+func TestHTTPStatusErrorIncludesBoundedControlEvidence(t *testing.T) {
+	err := httpStatusErrorFromPayload(http.StatusServiceUnavailable, "POST /v1/workers/worker/pause", map[string]any{
+		"error": map[string]any{
+			"code": "mutation_timeout", "message": "worker pause timed out",
+			"mutation_applied": true, "state": "paused", "endpoint_key": "secret-capability",
+		},
+	})
+	got := err.Error()
+	for _, want := range []string{"503", "POST /v1/workers/worker/pause", "mutation_timeout", "worker pause timed out", "mutation_applied=true", "state=paused"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status error %q omitted %q", got, want)
+		}
+	}
+	if strings.Contains(got, "secret-capability") {
+		t.Fatalf("status error leaked unapproved response data: %q", got)
+	}
+}
+
+func TestHTTPStatusErrorBoundsResponseFields(t *testing.T) {
+	long := strings.Repeat("x", 512)
+	err := httpStatusErrorFromPayload(http.StatusServiceUnavailable, "POST /v1/workers/worker/pause", map[string]any{
+		"error": map[string]any{"code": long, "message": long, "state": long},
+	})
+	if len(err.code) > 67 || len(err.message) > 259 || len(err.state) > 67 {
+		t.Fatalf("unbounded response fields: code=%d message=%d state=%d", len(err.code), len(err.message), len(err.state))
+	}
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func boundedDiagnosticText(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return "…" + value[len(value)-limit:]
+}
+
+func readDiagnosticFileTail(path string, limit int64) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return "<unavailable>"
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "<unavailable>"
+	}
+	truncated := info.Size() > limit
+	if truncated {
+		if _, err := file.Seek(-limit, io.SeekEnd); err != nil {
+			return "<unavailable>"
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit))
+	if err != nil {
+		return "<unavailable>"
+	}
+	if truncated {
+		return "[earlier output omitted]\n" + string(data)
+	}
+	return string(data)
+}
+
+const eventReadTimeout = 3 * time.Second
+
+func readEventContaining(t *testing.T, reader *bufio.Reader, text string, cancelStream func()) bool {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	timer := time.AfterFunc(eventReadTimeout, cancelStream)
+	defer timer.Stop()
+	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			cancelStream()
 			return false
 		}
 		if strings.Contains(line, text) {
 			return true
 		}
 	}
-	return false
+}
+
+func TestReadEventContainingCancelsQuietStreamAtDeadline(t *testing.T) {
+	streamReader, streamWriter := net.Pipe()
+	defer streamWriter.Close()
+	cancelStream := func() { _ = streamReader.Close() }
+	started := time.Now()
+	if readEventContaining(t, bufio.NewReader(streamReader), "worker.control", cancelStream) {
+		t.Fatal("quiet stream unexpectedly contained the requested event")
+	}
+	if elapsed := time.Since(started); elapsed > eventReadTimeout+time.Second {
+		t.Fatalf("quiet stream read took %s, want bounded by %s", elapsed, eventReadTimeout)
+	}
 }

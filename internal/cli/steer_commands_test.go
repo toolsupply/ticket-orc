@@ -25,6 +25,30 @@ func writeSteerConfig(t *testing.T, dir string) {
 	writeConfigFixture(t, filepath.Join(dir, "config.json"), fmt.Sprintf(`{"version":1,"id":"7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"Coding."},"reviewer":{"ticket_queue":"review","nudge_prompt":"Review."},"architect":{"ticket_queue":"open","nudge_prompt":"Plan."}}}`, dir))
 }
 
+func TestJoinAcceptsNamedSignoffRoles(t *testing.T) {
+	for _, role := range []string{"architect", "architect-api"} {
+		t.Run(role, func(t *testing.T) {
+			dir := t.TempDir()
+			repositoryDir := t.TempDir()
+			configPath := filepath.Join(dir, "config.json")
+			writeConfigFixture(t, configPath, fmt.Sprintf(`{"version":1,"id":"7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"default_role":"coder","roles":{"architect":{"ticket_queue":"signoff","nudge_prompt":"Accept."},"architect-api":{"ticket_queue":"signoff","nudge_prompt":"Accept API."},"coder":{"ticket_queue":"open","nudge_prompt":"Code."},"reviewer":{"ticket_queue":"review","nudge_prompt":"Review."}}}`, dir))
+			lookup := mapEnv(map[string]string{"TICKET_ORC": dir, "CODEX_THREAD_ID": steerTestThread, "CODEX_HOME": filepath.Join(dir, "codex")})
+			runner, calls := fakeTicketRunner(dir, repositoryDir)
+			var output bytes.Buffer
+			if err := joinWithConfigRunner(context.Background(), role, configPath, &output, lookup, runner); err != nil {
+				t.Fatalf("join signoff role: %v", err)
+			}
+			if !reflect.DeepEqual(*calls, [][]string{{"actor", "-j"}, {"info", "-j"}, {"check", "--active", "-j"}}) {
+				t.Fatalf("Ticket command calls = %#v", *calls)
+			}
+			registration, found, err := state.NewRegistrationStore(dir).Find(context.Background(), "d659917f-5939-4e93-bfde-6346a0f2bc50", "reviewer")
+			if err != nil || !found || registration.Role != role || registration.RepositoryPath != repositoryDir || registration.SessionID != steerTestThread {
+				t.Fatalf("signoff registration=%#v found=%v err=%v", registration, found, err)
+			}
+		})
+	}
+}
+
 func fakeTicketRunner(lockDir string, repositoryPaths ...string) (ticketCommandRunner, *[][]string) {
 	calls := make([][]string, 0)
 	repositoryPath := ""

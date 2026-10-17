@@ -16,6 +16,8 @@ import (
 // ReviewerConfig contains policy and process settings for one reviewer loop.
 type ReviewerConfig struct {
 	WorkerName                 string
+	RoleName                   string
+	TicketQueue                string
 	Actor                      string
 	Harness                    string
 	Model                      string
@@ -49,6 +51,15 @@ type ReviewerTickets interface {
 // RunReviewer continuously claims review tickets until cancellation or a
 // state, harness, or lifecycle error occurs.
 func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) error {
+	if config.RoleName == "" {
+		config.RoleName = "reviewer"
+	}
+	if config.TicketQueue == "" {
+		config.TicketQueue = "review"
+	}
+	if config.TicketQueue != "review" {
+		return fmt.Errorf("review executor requires the review queue, got %q", config.TicketQueue)
+	}
 	if ctx == nil {
 		return fmt.Errorf("reviewer context must not be nil")
 	}
@@ -100,7 +111,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		}
 		config.WorkingDir = workingDir
 	}
-	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: "reviewer", State: "ready", Phase: "startup"})
+	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: config.RoleName, State: "ready", Phase: "startup"})
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -152,7 +163,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			}
 		}
 		logReviewer(config.Diagnostics, "%s: claimed review work", claimed.ID)
-		emitEvent(config.EventSink, Event{Type: "ticket.claim", Worker: config.WorkerName, Role: "reviewer", State: "claimed", Ticket: claimed.ID})
+		emitEvent(config.EventSink, Event{Type: "ticket.claim", Worker: config.WorkerName, Role: config.RoleName, State: "claimed", Ticket: claimed.ID})
 
 		turn, prepareErr := runReviewerTurn(ctx, config, claimed.ID, agent, orchestrationState)
 		if prepareErr != nil {
@@ -174,7 +185,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			}
 			return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, recoveryErr)
 		}
-		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: "reviewer", State: observed.State, Ticket: observed.ID})
+		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: config.RoleName, State: observed.State, Ticket: observed.ID})
 		if loopState, ok := orchestrationState.(TicketLoopState); ok {
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
@@ -255,11 +266,15 @@ type reviewerTurnResult struct {
 }
 
 func runReviewerTurn(ctx context.Context, config ReviewerConfig, ticketID string, agent harness.Harness, orchestrationState TicketState) (reviewerTurnResult, error) {
+	roleName := config.RoleName
+	if roleName == "" {
+		roleName = "reviewer"
+	}
 	prompt := resolvedReviewerPrompt(config.TicketPrompt, ticketID, config.ReviewCompletion)
 	request := harness.RunRequest{
 		WorkerName:           config.WorkerName,
 		WorkingDir:           config.WorkingDir,
-		Role:                 "reviewer",
+		Role:                 roleName,
 		Actor:                config.Actor,
 		TicketID:             ticketID,
 		Prompt:               prompt,

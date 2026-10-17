@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 )
 
@@ -415,6 +416,65 @@ func TestResolvedWorkerCarriesConfiguredRoleNameAndQueue(t *testing.T) {
 	}
 	if config.Role != RoleCoder || config.RoleName != "backend" || config.TicketQueue != "open" {
 		t.Fatalf("resolved worker policy role=%q name=%q queue=%q, want coder/backend/open", config.Role, config.RoleName, config.TicketQueue)
+	}
+}
+
+func TestConfiguredRoleNamesKeepQueueActorDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"roles":{"backend":{"ticket_queue":"open","nudge_prompt":"work"},"security-review":{"ticket_queue":"review","nudge_prompt":"review"}},"workers":{"open-worker":{"role":"backend"},"review-worker":{"role":"security-review"}}}`)
+	open, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "open-worker"}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, _, err := parseRoleConfig(RoleReviewer, []string{"--config", path, "--worker", "review-worker"}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.RoleName != "backend" || open.TicketQueue != "open" || open.Actor != "coder" {
+		t.Fatalf("open role identity/actor = %q/%q/%q", open.RoleName, open.TicketQueue, open.Actor)
+	}
+	if review.RoleName != "security-review" || review.TicketQueue != "review" || review.Actor != "reviewer" {
+		t.Fatalf("review role identity/actor = %q/%q/%q", review.RoleName, review.TicketQueue, review.Actor)
+	}
+}
+
+func TestConfiguredSignoffRoleUsesArchitectActorDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"roles":{"architect-api":{"ticket_queue":"signoff","nudge_prompt":"accept"}},"workers":{"acceptor":{"role":"architect-api"},"explicit-actor":{"role":"architect-api","actor":"acceptance-bot"}}}`)
+	config, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "acceptor"}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Role != RoleCoder || config.RoleName != "architect-api" || config.TicketQueue != "signoff" || config.Actor != "architect" || config.TicketPrompt != orc.AcceptanceTicketPromptTemplate {
+		t.Fatalf("resolved signoff worker role=%q/%q queue=%q actor=%q prompt=%q", config.Role, config.RoleName, config.TicketQueue, config.Actor, config.TicketPrompt)
+	}
+	override, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "explicit-actor"}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if override.Actor != "acceptance-bot" {
+		t.Fatalf("explicit signoff actor=%q, want acceptance-bot", override.Actor)
+	}
+}
+
+func TestSignoffPromptCustomizationSurvivesDefaultRoleAndWorkerResolution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfigFixture(t, path, `{"version":1,"defaults":{"ticket_prompt":"default {{ticket}}"},"roles":{"signoff-default":{"ticket_queue":"signoff","nudge_prompt":"accept"},"architect-api":{"ticket_queue":"signoff","nudge_prompt":"accept","ticket_prompt":"role {{ticket}}"}},"workers":{"default-prompt":{"role":"signoff-default"},"role-prompt":{"role":"architect-api"},"worker-prompt":{"role":"architect-api","ticket_prompt":"worker {{ticket}}"}}}`)
+	for _, test := range []struct {
+		worker string
+		want   string
+	}{
+		{worker: "default-prompt", want: "default {{ticket}}"},
+		{worker: "role-prompt", want: "role {{ticket}}"},
+		{worker: "worker-prompt", want: "worker {{ticket}}"},
+	} {
+		config, _, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", test.worker}, emptyEnv)
+		if err != nil {
+			t.Fatalf("parse %s: %v", test.worker, err)
+		}
+		if config.TicketQueue != "signoff" || config.TicketPrompt != test.want {
+			t.Errorf("worker %s queue=%q prompt=%q; want signoff and %q", test.worker, config.TicketQueue, config.TicketPrompt, test.want)
+		}
 	}
 }
 

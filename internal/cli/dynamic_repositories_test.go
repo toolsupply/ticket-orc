@@ -8,10 +8,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -313,39 +315,63 @@ func TestDynamicRepositoryCannotReplaceConfiguredTarget(t *testing.T) {
 }
 
 func TestDynamicRepositoryDiscoveryTracksJoinAndLeaveWithoutManagedWorkers(t *testing.T) {
-	dir := t.TempDir()
-	manager := &workerManager{
-		repositories:      supervisor.RepositoryRegistry{},
-		repositoriesByID:  map[string]supervisor.ConfiguredRepository{},
-		dynamicReposByID:  map[string]supervisor.ConfiguredRepository{},
-		dynamicStatusKeys: map[string]bool{},
-		runtime:           NewRuntimeState(nil),
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runDynamicRepositoryDiscovery(ctx, dir, manager, func(_ context.Context, registration state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
-			return ticketclient.RepositoryInfo{ID: registration.RepositoryID, Path: registration.RepositoryPath}, nil
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		manager := &workerManager{
+			repositories:      supervisor.RepositoryRegistry{},
+			repositoriesByID:  map[string]supervisor.ConfiguredRepository{},
+			dynamicReposByID:  map[string]supervisor.ConfiguredRepository{},
+			dynamicStatusKeys: map[string]bool{},
+			runtime:           NewRuntimeState(nil),
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			runDynamicRepositoryDiscovery(ctx, dir, manager, func(_ context.Context, registration state.SteerRegistration) (ticketclient.RepositoryInfo, error) {
+				return ticketclient.RepositoryInfo{ID: registration.RepositoryID, Path: registration.RepositoryPath}, nil
+			})
+		}()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case <-done:
+				return
+			default:
+			}
+			// Advance a bounded virtual-time guard so a cancellation scheduling
+			// failure cannot leave this test blocked on an unbounded join.
+			time.Sleep(time.Second)
+			select {
+			case <-done:
+			default:
+				t.Error("dynamic repository discovery goroutine did not stop during cleanup")
+			}
 		})
-	}()
-	store := state.NewRegistrationStore(dir)
-	registration := dynamicTestRegistration(t, "coder", "/ticket/project")
-	registration, _, _, err := store.Join(context.Background(), registration)
-	if err != nil {
-		cancel()
-		<-done
-		t.Fatal(err)
-	}
-	waitForDynamicRepositoryTarget(t, manager, dynamicTestRepositoryID, true)
-	if removed, err := store.Leave(context.Background(), registration); err != nil || !removed {
-		cancel()
-		<-done
-		t.Fatalf("remove registration removed=%t err=%v", removed, err)
-	}
-	waitForDynamicRepositoryTarget(t, manager, dynamicTestRepositoryID, false)
-	cancel()
-	<-done
+
+		// Let the initial empty observation finish and the production poll ticker
+		// reach its wait before changing the registration file.
+		synctest.Wait()
+		store := state.NewRegistrationStore(dir)
+		registration := dynamicTestRegistration(t, "coder", "/ticket/project")
+		registration, _, _, err := store.Join(context.Background(), registration)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(dynamicRepositoryPollInterval)
+		synctest.Wait()
+		if _, err := manager.repositoryTarget(dynamicTestRepositoryID); err != nil {
+			t.Fatalf("joined registration was not discovered after the poll interval: %v", err)
+		}
+		if removed, err := store.Leave(context.Background(), registration); err != nil || !removed {
+			t.Fatalf("remove registration removed=%t err=%v", removed, err)
+		}
+		time.Sleep(dynamicRepositoryPollInterval)
+		synctest.Wait()
+		if _, err := manager.repositoryTarget(dynamicTestRepositoryID); err == nil {
+			t.Fatal("left registration remained available after the poll interval")
+		}
+	})
 }
 
 type trackedDynamicWatchProcess struct {
@@ -379,12 +405,14 @@ func TestDynamicRepositoryObserversTrackRegistrationsWithoutRestartingConfigured
 	var mu sync.Mutex
 	starts := make(map[string][]*trackedDynamicWatchProcess)
 	notifiers := make(map[string]func(supervisor.RepositoryWatchEvent))
+	var startsProbe testutil.Probe[string]
 	watch := newRepositoryWatchManagerWithStarter(ctx, runtime, configured, nil, func(_ context.Context, repository supervisor.ConfiguredRepository, notify func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
 		process := newTrackedDynamicWatchProcess()
 		mu.Lock()
 		starts[repository.Key] = append(starts[repository.Key], process)
 		notifiers[repository.Key] = notify
 		mu.Unlock()
+		startsProbe.Record(repository.Key)
 		return process, nil
 	})
 	events := make(chan supervisor.RuntimeEvent, 1)
@@ -399,7 +427,7 @@ func TestDynamicRepositoryObserversTrackRegistrationsWithoutRestartingConfigured
 		runtime:           runtime,
 	}
 	watch.StartObservers()
-	waitForObserverStarts(t, &mu, starts, map[string]int{"alpha": 1, "beta": 1})
+	waitForObserverStarts(t, &startsProbe, map[string]int{"alpha": 1, "beta": 1})
 
 	dynamicInfo := ticketclient.RepositoryInfo{ID: dynamicTestRepositoryID, Path: t.TempDir()}
 	dynamic := supervisor.ConfiguredRepository{
@@ -408,7 +436,7 @@ func TestDynamicRepositoryObserversTrackRegistrationsWithoutRestartingConfigured
 	}
 	active := map[string]supervisor.ConfiguredRepository{dynamicTestRepositoryID: dynamic}
 	manager.replaceDynamicRepositories(active, []supervisor.RepositoryStatus{{ID: dynamicTestRepositoryID, Key: dynamic.Key, Path: dynamicInfo.Path, State: "healthy"}})
-	waitForObserverStarts(t, &mu, starts, map[string]int{"alpha": 1, "beta": 1, dynamic.Key: 1})
+	waitForObserverStarts(t, &startsProbe, map[string]int{"alpha": 1, "beta": 1, dynamic.Key: 1})
 
 	mu.Lock()
 	notify := notifiers[dynamic.Key]
@@ -427,7 +455,7 @@ func TestDynamicRepositoryObserversTrackRegistrationsWithoutRestartingConfigured
 	}
 
 	manager.replaceDynamicRepositories(active, []supervisor.RepositoryStatus{{ID: dynamicTestRepositoryID, Key: dynamic.Key, Path: dynamicInfo.Path, State: "healthy"}})
-	waitForObserverStarts(t, &mu, starts, map[string]int{"alpha": 1, "beta": 1, dynamic.Key: 1})
+	waitForObserverStarts(t, &startsProbe, map[string]int{"alpha": 1, "beta": 1, dynamic.Key: 1})
 	manager.replaceDynamicRepositories(nil, nil)
 	mu.Lock()
 	dynamicProcess := starts[dynamic.Key][0]
@@ -464,6 +492,7 @@ func TestDynamicRefreshCannotRestoreRemovedConfiguredObserverAfterReload(t *test
 	defer releaseStop()
 	var mu sync.Mutex
 	starts := make(map[string][]*trackedDynamicWatchProcess)
+	var startsProbe testutil.Probe[string]
 	watch := newRepositoryWatchManagerWithStarter(ctx, runtime, configured, nil, func(_ context.Context, repository supervisor.ConfiguredRepository, _ func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
 		process := newTrackedDynamicWatchProcess()
 		if repository.Key == dynamicRepositoryKey(dynamicTestRepositoryID) && repository.Target.Repository == oldDynamicPath {
@@ -472,6 +501,7 @@ func TestDynamicRefreshCannotRestoreRemovedConfiguredObserverAfterReload(t *test
 		mu.Lock()
 		starts[repository.Key] = append(starts[repository.Key], process)
 		mu.Unlock()
+		startsProbe.Record(repository.Key)
 		return process, nil
 	})
 	manager := &workerManager{
@@ -480,14 +510,14 @@ func TestDynamicRefreshCannotRestoreRemovedConfiguredObserverAfterReload(t *test
 		repositoryWatch: watch, runtime: runtime,
 	}
 	watch.StartObservers()
-	waitForObserverStarts(t, &mu, starts, map[string]int{oldConfigured.Key: 1})
+	waitForObserverStarts(t, &startsProbe, map[string]int{oldConfigured.Key: 1})
 	oldDynamic := supervisor.ConfiguredRepository{
 		Key: dynamicRepositoryKey(dynamicTestRepositoryID), ID: dynamicTestRepositoryID,
 		Target: supervisor.TicketTarget{Mode: supervisor.TicketTargetRepository, Repository: oldDynamicPath},
 		Info:   &ticketclient.RepositoryInfo{ID: dynamicTestRepositoryID, Path: oldDynamicPath},
 	}
 	manager.replaceDynamicRepositories(map[string]supervisor.ConfiguredRepository{dynamicTestRepositoryID: oldDynamic}, []supervisor.RepositoryStatus{{ID: dynamicTestRepositoryID, Key: oldDynamic.Key, State: "healthy"}})
-	waitForObserverStarts(t, &mu, starts, map[string]int{oldConfigured.Key: 1, oldDynamic.Key: 1})
+	waitForObserverStarts(t, &startsProbe, map[string]int{oldConfigured.Key: 1, oldDynamic.Key: 1})
 	mu.Lock()
 	oldDynamicProcess := starts[oldDynamic.Key][0]
 	mu.Unlock()
@@ -542,7 +572,7 @@ func TestDynamicRefreshCannotRestoreRemovedConfiguredObserverAfterReload(t *test
 	case <-time.After(time.Second):
 		t.Fatal("dynamic refresh did not reconcile after reload commit")
 	}
-	waitForObserverStarts(t, &mu, starts, map[string]int{newConfigured.Key: 1, oldDynamic.Key: 2})
+	waitForObserverStarts(t, &startsProbe, map[string]int{newConfigured.Key: 1, oldDynamic.Key: 2})
 	mu.Lock()
 	if got := len(starts[oldConfigured.Key]); got != 1 {
 		mu.Unlock()
@@ -561,47 +591,23 @@ func TestDynamicRefreshCannotRestoreRemovedConfiguredObserverAfterReload(t *test
 	watch.StopObservers()
 }
 
-func waitForObserverStarts(t *testing.T, mu *sync.Mutex, starts map[string][]*trackedDynamicWatchProcess, want map[string]int) {
+func waitForObserverStarts(t *testing.T, probe *testutil.Probe[string], want map[string]int) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		ready := true
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := probe.Wait(ctx, func(events []string) bool {
+		counts := make(map[string]int, len(want))
+		for _, key := range events {
+			counts[key]++
+		}
 		for key, count := range want {
-			if len(starts[key]) < count {
-				ready = false
-				break
+			if counts[key] < count {
+				return false
 			}
 		}
-		mu.Unlock()
-		if ready {
-			return
-		}
-		time.Sleep(time.Millisecond)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for observer starts %v; observed %v", want, probe.Snapshot())
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	t.Fatalf("observer starts=%v want at least=%v", countsOfObserverStarts(starts), want)
-}
-
-func countsOfObserverStarts(starts map[string][]*trackedDynamicWatchProcess) map[string]int {
-	counts := make(map[string]int, len(starts))
-	for key, processes := range starts {
-		counts[key] = len(processes)
-	}
-	return counts
-}
-
-func waitForDynamicRepositoryTarget(t *testing.T, manager *workerManager, repositoryID string, wantPresent bool) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := manager.repositoryTarget(repositoryID)
-		if (err == nil) == wantPresent {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	_, err := manager.repositoryTarget(repositoryID)
-	t.Fatalf("dynamic target present=%t err=%v want_present=%t", err == nil, err, wantPresent)
 }

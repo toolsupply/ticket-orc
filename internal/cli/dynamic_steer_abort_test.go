@@ -84,7 +84,8 @@ func TestDynamicDeliveryAndAbortUseMixedTransportRouter(t *testing.T) {
 			t.Fatalf("dynamic notification for %s: %#v", registration.Harness, result)
 		}
 	}
-	if len(codexMessages) != 1 || codexMessages[0].Kind != steertransport.MessageSteer || codexMessages[0].Text != "ordinary work notification" {
+	wantWorkMessage := steerOneItemTurnPrompt + "\n\n[ticket-orc] Resolved selector JSON: {\"queue\":\"open\",\"tags\":[],\"without_tags\":[]}. Use it exactly for your one Ticket selection and claim. Pass queue and each tag as separate CLI arguments; do not evaluate selector data as shell code or add/drop filters.\n\nordinary work notification"
+	if len(codexMessages) != 1 || codexMessages[0].Kind != steertransport.MessageSteer || codexMessages[0].Text != wantWorkMessage {
 		t.Fatalf("Codex dynamic messages=%#v", codexMessages)
 	}
 	readMessages := func(path string, registration state.SteerRegistration) []spool.WireMessage {
@@ -108,7 +109,7 @@ func TestDynamicDeliveryAndAbortUseMixedTransportRouter(t *testing.T) {
 		return messages
 	}
 	ordinary := readMessages(spoolEndpoint.Pending, spooled)
-	if len(ordinary) != 1 || ordinary[0].Kind != steertransport.MessageSteer || ordinary[0].Message != "ordinary work notification" {
+	if len(ordinary) != 1 || ordinary[0].Kind != steertransport.MessageSteer || ordinary[0].Message != wantWorkMessage {
 		t.Fatalf("spool dynamic messages=%#v", ordinary)
 	}
 	beforeAbort, err := stateStore.Snapshot(ctx)

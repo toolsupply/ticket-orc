@@ -105,7 +105,7 @@ Global options:
 
 const initHelp = `
 Usage:
-  ticket-orc init [--global] [--force]
+  ticket-orc init [--global] [--architect] [--force]
 
 Create a minimal instance in .ticket-orc under the current directory. TICKET_ORC
 selects another directory for this command; relative paths are based on the
@@ -116,8 +116,10 @@ owned runtime state, and creates a fresh config ID; an external local_dir is
 removed only when its ownership marker matches the existing config. The
 generated .gitignore keeps mutable instance data untracked while allowing
 config.json to be tracked. The generated reviewer role closes accepted
-reviews; hand-written configurations keep the signoff default unless they set
-review_completion explicitly.
+reviews. --architect adds an architect role on the signoff queue and routes
+accepted reviews to it. Without --architect, init creates only coder and
+reviewer. --force replaces the config with the topology selected by this
+invocation and discards custom config edits.
 
 `
 
@@ -128,6 +130,9 @@ Usage:
 Register the current Ticket actor and interactive session with this Orc instance.
 Without endpoint flags, the current Codex session is discovered automatically.
 Supply all endpoint flags together to register an extension-backed session.
+Configured signoff roles can join through this command. A signoff wake names one
+unclaimed ticket and Orc records its one-shot outcome; human handoff assigns the
+ticket to user through Ticket's atomic query/reassign command.
 ROLE may be omitted. The role is selected from, in order:
   1. explicit ROLE
   2. TICKET_ORC_ROLE
@@ -173,6 +178,13 @@ Show the current Ticket frontier and the configured or registered owners that
 would receive work. This is a read-only forecast and remains available when
 daemon dispatch is paused or aborted; output identifies the dispatch mode.
 JSON output includes daemon_mode, dispatch_inhibited, and owners.
+
+Managed signoff roles use Ticket's filtered unassigned signoff list. Overlapping
+signoff selectors can show the same eligible ticket for multiple actors; Orc
+does not reserve signoff work across those actors. Dynamic signoff sends one
+exact unclaimed ticket per wake and records its outcome before considering it
+again. Human handoff uses Ticket's atomic query/reassign command with assignee
+user.
 
 `
 
@@ -343,9 +355,19 @@ Validate the complete configuration without claiming tickets, launching a
 harness, contacting Ticket, or changing orchestration state.
 
 Role configuration may set roles.<name>.ticket_tags; every listed tag is
-required. review.skip_tags adds exclusions for review roles. A committed reload
-updates dynamic steering immediately, while running managed workers keep their
-effective selector until restarted through the normal worker lifecycle.
+required. roles.<name>.ticket_without_tags excludes tickets carrying any listed
+tag. review.skip_tags also excludes review tickets and retains its review
+bypass behavior. A committed reload updates dynamic steering immediately,
+while running managed workers keep their effective selector until restarted
+through the normal worker lifecycle.
+
+Managed roles may use ticket_queue=signoff for final acceptance. Each turn
+handles one unassigned signoff entry; the worker may inspect related tickets,
+and must resolve it with a valid lifecycle outcome or atomic human handoff to
+user. Dynamic signoff sends one exact unclaimed ticket per wake and records
+its outcome before considering it again. Overlapping signoff selectors can
+grant multiple configured actors authority over the same entry; Orc does not
+reserve entries across roles.
 
 Options:
   --output MODE             compact|quiet|json (default: compact)

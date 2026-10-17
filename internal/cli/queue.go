@@ -18,25 +18,28 @@ import (
 )
 
 type queueForecastOwner struct {
-	Owner        string                `json:"owner"`
-	Kind         string                `json:"kind"`
-	RepositoryID string                `json:"repository_id"`
-	Repository   string                `json:"repository"`
-	Role         string                `json:"role"`
-	Actor        string                `json:"actor"`
-	Session      string                `json:"session,omitempty"`
-	Queue        string                `json:"queue"`
-	State        string                `json:"state,omitempty"`
-	Reason       string                `json:"reason,omitempty"`
-	Delivery     string                `json:"delivery,omitempty"`
-	Active       []ticketclient.Ticket `json:"active"`
-	Next         *ticketclient.Ticket  `json:"next,omitempty"`
-	MoreReady    bool                  `json:"more_ready,omitempty"`
+	Owner         string                `json:"owner"`
+	Kind          string                `json:"kind"`
+	RepositoryID  string                `json:"repository_id"`
+	Repository    string                `json:"repository"`
+	Role          string                `json:"role"`
+	Actor         string                `json:"actor"`
+	Session       string                `json:"session,omitempty"`
+	Queue         string                `json:"queue"`
+	State         string                `json:"state,omitempty"`
+	Reason        string                `json:"reason,omitempty"`
+	Delivery      string                `json:"delivery,omitempty"`
+	Active        []ticketclient.Ticket `json:"active"`
+	Next          *ticketclient.Ticket  `json:"next,omitempty"`
+	MoreReady     bool                  `json:"more_ready,omitempty"`
+	AuthorityNote string                `json:"authority_note,omitempty"`
 
 	repositoryPath string
 	deliveryCode   string
 	filters        ticketclient.QueueFilters
 }
+
+const signoffForecastLimit = 20
 
 func executeQueue(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
 	jsonOutput := false
@@ -149,7 +152,7 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 				queue = role.TicketQueue
 			}
 		}
-		if roleName == "" || (queue != "open" && queue != "review") {
+		if roleName == "" || (queue != "open" && queue != "review" && queue != "signoff") {
 			return nil, fmt.Errorf("managed worker %q has unsupported role or queue %q/%q", worker.Name, roleName, queue)
 		}
 		repoID, repoPath, repoName := worker.RepositoryID, worker.RepositoryPath, worker.RepositoryName
@@ -170,7 +173,8 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			Repository: repositoryDisplayLabel(repoName, repoPath, repoID), Role: roleName,
 			Actor: worker.TicketActor, Queue: queue, State: worker.State,
 			Reason: managedForecastReason(worker), Active: []ticketclient.Ticket{}, repositoryPath: repoPath,
-			filters: filters,
+			AuthorityNote: signoffAuthorityNote(queue),
+			filters:       filters,
 		})
 	}
 	for _, session := range status.Steer {
@@ -181,9 +185,12 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 		queue := session.EffectiveTicketQueue
 		filters := ticketclient.QueueFilters{
 			Tags:        append([]string(nil), session.EffectiveTicketTags...),
-			WithoutTags: append([]string(nil), session.EffectiveReviewSkipTags...),
+			WithoutTags: append([]string(nil), session.EffectiveTicketWithoutTags...),
 		}
-		if queue != "" && queue != "open" && queue != "review" {
+		if queue == "review" {
+			filters.WithoutTags = mergeTicketTags(filters.WithoutTags, session.EffectiveReviewSkipTags)
+		}
+		if queue != "" && queue != "open" && queue != "review" && queue != "signoff" {
 			return nil, fmt.Errorf("steer session %q has unsupported role or queue %q/%q", session.Actor, registration.Role, queue)
 		}
 		ownerName := repositoryDisplayLabel(registration.RepositoryName, registration.RepositoryPath, registration.RepositoryID) + "/" + session.Actor
@@ -197,6 +204,9 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 		}
 		if queue == "" {
 			owner.Reason = "role policy unavailable"
+		}
+		if queue == "signoff" {
+			owner.AuthorityNote = signoffAuthorityNote(queue)
 		}
 		if session.ManagedOwner != "" {
 			owner.Reason = "actor is owned by managed worker " + session.ManagedOwner
@@ -238,14 +248,25 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			_ = client.Close()
 			return nil, fmt.Errorf("read active claims for %s/%s: %w", owner.Repository, owner.Actor, err)
 		}
-		if owner.Queue != "open" && owner.Queue != "review" {
+		if owner.Queue != "open" && owner.Queue != "review" && owner.Queue != "signoff" {
 			_ = client.Close()
 			continue
 		}
 		frontierKey := queueForecastFrontierKey(*owner)
 		frontier, found := frontiers[frontierKey]
 		if !found {
-			frontier, err = client.ReadyFrontier(ctx, owner.Queue, owner.filters, localTicketLimit)
+			if owner.Queue == "signoff" {
+				reader, ok := client.(interface {
+					SignoffFrontier(context.Context, ticketclient.QueueFilters, int, int) (ticketclient.ListResult, error)
+				})
+				if !ok {
+					_ = client.Close()
+					return nil, errors.New("Ticket reader does not support the public signoff frontier")
+				}
+				frontier, err = reader.SignoffFrontier(ctx, owner.filters, signoffForecastLimit, 0)
+			} else {
+				frontier, err = client.ReadyFrontier(ctx, owner.Queue, owner.filters, localTicketLimit)
+			}
 			if err == nil {
 				frontiers[frontierKey] = frontier
 			}
@@ -262,11 +283,21 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 	assignedByQueue := make(map[string]map[string]struct{})
 	for index := range owners {
 		owner := &owners[index]
-		if owner.Reason != "" && owner.Reason != "already notified" {
+		if owner.Reason != "" && owner.Reason != "already notified" && !(owner.Queue == "signoff" && owner.Reason == "awaiting signoff outcome") {
 			continue
 		}
 		key := queueForecastFrontierKey(*owner)
 		frontier := frontiers[key]
+		if owner.Queue == "signoff" {
+			if len(frontier.Items) > 0 {
+				item := frontier.Items[0]
+				owner.Next = &item
+				owner.MoreReady = frontier.More || len(frontier.Items) > 1
+			} else if owner.Reason == "" {
+				owner.Reason = "no eligible unassigned signoff work"
+			}
+			continue
+		}
 		offset := frontierOffsets[key]
 		queueKey := queueForecastDedupKey(*owner)
 		assigned := assignedByQueue[queueKey]
@@ -302,11 +333,18 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 }
 
 func managedForecastFilters(queue string, worker daemon.WorkerStatus) (ticketclient.QueueFilters, error) {
-	filters := ticketclient.QueueFilters{Tags: append([]string(nil), worker.EffectiveTicketTags...)}
+	filters := ticketclient.QueueFilters{Tags: append([]string(nil), worker.EffectiveTicketTags...), WithoutTags: append([]string(nil), worker.EffectiveTicketWithoutTags...)}
 	if queue == "review" {
-		filters.WithoutTags = append([]string(nil), worker.EffectiveReviewSkipTags...)
+		filters.WithoutTags = mergeTicketTags(filters.WithoutTags, worker.EffectiveReviewSkipTags)
 	}
 	return ticketclient.CanonicalQueueFilters(filters)
+}
+
+func signoffAuthorityNote(queue string) string {
+	if queue != "signoff" {
+		return ""
+	}
+	return "unassigned eligibility is not reserved across acceptance actors"
 }
 
 func queueForecastFrontierKey(owner queueForecastOwner) string {
@@ -340,6 +378,9 @@ func steerForecastReason(session daemon.SteerStatus) string {
 	if session.State == "degraded" || session.PersistenceCode != "" {
 		return "degraded delivery"
 	}
+	if session.Code == "awaiting_signoff_outcome" {
+		return "awaiting signoff outcome"
+	}
 	if session.State == "queued" {
 		return "already notified"
 	}
@@ -368,7 +409,11 @@ func renderQueueForecast(out io.Writer, owners []queueForecastOwner) error {
 			rowsByRepository[owner.RepositoryID] = append(rowsByRepository[owner.RepositoryID], queueForecastTicket{Actor: owner.Actor, Ticket: ticket, State: "claimed"})
 		}
 		if owner.Next != nil {
-			rowsByRepository[owner.RepositoryID] = append(rowsByRepository[owner.RepositoryID], queueForecastTicket{Actor: owner.Actor, Ticket: *owner.Next, State: "queued"})
+			state := "queued"
+			if owner.Queue == "signoff" {
+				state = "signoff eligible (unreserved)"
+			}
+			rowsByRepository[owner.RepositoryID] = append(rowsByRepository[owner.RepositoryID], queueForecastTicket{Actor: owner.Actor, Ticket: *owner.Next, State: state, Queue: owner.Queue})
 		}
 	}
 	rowCount := 0
@@ -377,6 +422,7 @@ func renderQueueForecast(out io.Writer, owners []queueForecastOwner) error {
 	}
 	if rowCount == 0 {
 		_, _ = io.WriteString(out, "\nNo non-terminal tickets.\n\n")
+		writeSignoffForecastDiagnostics(out, owners)
 		return nil
 	}
 	seenTickets := make(map[string]bool, rowCount)
@@ -389,23 +435,38 @@ func renderQueueForecast(out io.Writer, owners []queueForecastOwner) error {
 		fmt.Fprintf(w, "\nRepository: %s (%s) %s\n\n", consoleField(owner.Repository), shortIdentity(repositoryID), consoleField(owner.repositoryPath))
 		fmt.Fprintln(w, "Actor\tTicket\tTitle\tState")
 		for _, row := range repositoryRows {
-			ticketKey := repositoryID + "\x00" + row.Ticket.ID
-			if seenTickets[ticketKey] {
-				continue
+			if row.Queue != "signoff" {
+				ticketKey := repositoryID + "\x00" + row.Ticket.ID
+				if seenTickets[ticketKey] {
+					continue
+				}
+				seenTickets[ticketKey] = true
 			}
-			seenTickets[ticketKey] = true
 			title := consoleEllipsize(consoleField(strings.TrimSpace(row.Ticket.Title)), 19)
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", consoleField(row.Actor), row.Ticket.ID, title, row.State)
 		}
 	}
 	fmt.Fprintln(w)
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	writeSignoffForecastDiagnostics(out, owners)
+	return nil
+}
+
+func writeSignoffForecastDiagnostics(out io.Writer, owners []queueForecastOwner) {
+	for _, owner := range owners {
+		if owner.Queue == "signoff" && owner.Kind == "steer" && owner.Reason != "" {
+			fmt.Fprintf(out, "Signoff owner %s: %s.\n", consoleField(owner.Owner), consoleField(owner.Reason))
+		}
+	}
 }
 
 type queueForecastTicket struct {
 	Actor  string
 	Ticket ticketclient.Ticket
 	State  string
+	Queue  string
 }
 
 func queueStatus(ctx context.Context, client *daemonclient.Client) (daemon.Status, error) {

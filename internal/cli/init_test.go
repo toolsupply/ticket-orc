@@ -97,11 +97,11 @@ func TestInitCreatesMinimalSecureInstanceAndRequiresForceToReplace(t *testing.T)
 			t.Fatalf("init role %q fields=%#v", name, fields)
 		}
 	}
-	if prompt := roles["coder"].(map[string]any)["nudge_prompt"].(string); !strings.Contains(prompt, "current actor") || !strings.Contains(prompt, "objective and acceptance criteria") || !strings.Contains(prompt, "relevant checks") || !strings.Contains(prompt, "Set a goal") || strings.Contains(strings.ToLower(prompt), "skill") {
+	if prompt := roles["coder"].(map[string]any)["nudge_prompt"].(string); !strings.Contains(prompt, "at most one") || !strings.Contains(prompt, "stop and return") || !strings.Contains(prompt, "Do not claim another ticket") || !strings.Contains(prompt, "no item is selected") || !strings.Contains(prompt, "objective and acceptance criteria") || !strings.Contains(prompt, "relevant checks") || !strings.Contains(prompt, "Set a goal") || strings.Contains(strings.ToLower(prompt), "until none remains") || strings.Contains(strings.ToLower(prompt), "skill") {
 		t.Fatalf("coder nudge lost required guidance or activates Skills: %q", prompt)
 	}
-	if prompt := roles["reviewer"].(map[string]any)["nudge_prompt"].(string); !strings.Contains(prompt, "substantive review") || !strings.Contains(prompt, "specification compliance") || !strings.Contains(prompt, "Set a goal") || strings.Contains(strings.ToLower(prompt), "approve") || strings.Contains(strings.ToLower(prompt), "close") || strings.Contains(strings.ToLower(prompt), "skill") {
-		t.Fatalf("reviewer nudge has incomplete review guidance or lifecycle/Skill instructions: %q", prompt)
+	if prompt := roles["reviewer"].(map[string]any)["nudge_prompt"].(string); !strings.Contains(prompt, "substantive independent review") || !strings.Contains(prompt, "specification compliance") || !strings.Contains(prompt, "objective and acceptance criteria") || !strings.Contains(prompt, "correctness, edge cases, integration, error handling, and maintainability") || !strings.Contains(prompt, "coder has run routine/basic tests") || !strings.Contains(prompt, "targeted tests only to investigate specific concerns") || !strings.Contains(prompt, "Set a goal before starting") || strings.Contains(strings.ToLower(prompt), "until none remains") || strings.Contains(prompt, "at most one") || strings.Contains(prompt, "Do not select or claim") || strings.Contains(prompt, "If no item is selected") || strings.Contains(strings.ToLower(prompt), "approve") || strings.Contains(strings.ToLower(prompt), "close") || strings.Contains(strings.ToLower(prompt), "skill") {
+		t.Fatalf("reviewer nudge has incomplete review guidance or repeats dynamic boundary/lifecycle instructions: %q", prompt)
 	}
 	loaded, err := LoadFileConfig(dir, path, true)
 	wantLocalDir := filepath.Join(dir, ".local")
@@ -210,6 +210,236 @@ func TestInitGlobalAndTicketORCOverrideSelection(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cwd, defaultInstanceDirectoryName, instanceConfigFileName)); !os.IsNotExist(err) {
 		t.Fatalf("--global unexpectedly created the local instance: %v", err)
+	}
+}
+
+func TestInitGeneratesValidatedDefaultAndArchitectTopologies(t *testing.T) {
+	tests := []struct {
+		name      string
+		global    bool
+		architect bool
+		args      []string
+	}{
+		{name: "local default"},
+		{name: "global default", global: true, args: []string{"--global"}},
+		{name: "local architect", architect: true, args: []string{"--architect"}},
+		{name: "global architect", global: true, architect: true, args: []string{"--architect", "--global"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			cwd := filepath.Join(root, "project")
+			if err := os.Mkdir(cwd, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(cwd)
+			home := filepath.Join(root, "home")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			dir := filepath.Join(root, "local-instance")
+			if test.global {
+				dir = filepath.Join(home, defaultInstanceDirectoryName)
+			}
+			lookup := mapEnv(map[string]string{"TICKET_ORC": filepath.Join(root, "ignored-override")})
+			if !test.global {
+				lookup = mapEnv(map[string]string{"TICKET_ORC": dir})
+			}
+			var stdout, stderr bytes.Buffer
+			if code := executeInit(test.args, &stdout, &stderr, lookup); code != 0 {
+				t.Fatalf("init code=%d stderr=%q", code, stderr.String())
+			}
+			configPath := filepath.Join(dir, instanceConfigFileName)
+			loaded, err := LoadFileConfig(dir, configPath, true)
+			if err != nil {
+				t.Fatalf("production config loader rejected generated config: %v", err)
+			}
+			assertInitTopology(t, loaded, test.architect)
+
+			if test.architect {
+				repositoryDir := filepath.Join(root, "tickets")
+				if err := os.Mkdir(repositoryDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				joinEnv := mapEnv(map[string]string{"TICKET_ORC": dir, "CODEX_THREAD_ID": steerTestThread, "CODEX_HOME": filepath.Join(root, "codex")})
+				managedConfig := loaded.Config
+				managedConfig.Workers = map[string]WorkerFileConfig{"architect-worker": {Role: "architect", Actor: "architect"}}
+				managedData, err := json.MarshalIndent(managedConfig, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(configPath, append(managedData, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runConfig, help, err := parseRunConfig([]string{"--all", "--config", configPath}, joinEnv)
+				if err != nil || help || len(runConfig.Workers) != 1 || runConfig.Workers[0].Config.RoleName != "architect" || runConfig.Workers[0].Config.TicketQueue != "signoff" {
+					t.Fatalf("managed architect config=%#v help=%v err=%v", runConfig.Workers, help, err)
+				}
+				runner, _ := fakeTicketRunner("", repositoryDir)
+				var joinOutput bytes.Buffer
+				if err := joinWithRunner(context.Background(), "architect", &joinOutput, joinEnv, runner); err != nil {
+					t.Fatalf("join generated architect role: %v", err)
+				}
+				registration, found, err := state.NewRegistrationStore(loaded.Instance.LocalDir).Find(context.Background(), "d659917f-5939-4e93-bfde-6346a0f2bc50", "reviewer")
+				if err != nil || !found || registration.Role != "architect" || registration.RepositoryID != "d659917f-5939-4e93-bfde-6346a0f2bc50" || registration.Actor != "reviewer" || registration.RepositoryPath != repositoryDir || registration.SessionID != steerTestThread {
+					t.Fatalf("architect registration=%#v found=%v err=%v", registration, found, err)
+				}
+			}
+		})
+	}
+}
+
+func assertInitTopology(t *testing.T, loaded LoadedFileConfig, architect bool) {
+	t.Helper()
+	wantRoles := 2
+	wantReviewerCompletion := ReviewCompletionClose
+	if architect {
+		wantRoles = 3
+		wantReviewerCompletion = ReviewCompletionSignoff
+	}
+	if loaded.Config.DefaultRole != "coder" || len(loaded.Config.Roles) != wantRoles {
+		t.Fatalf("generated topology default=%q roles=%#v", loaded.Config.DefaultRole, loaded.Config.Roles)
+	}
+	coder, ok := loaded.Config.Roles["coder"]
+	if !ok || coder.TicketQueue != "open" || coder.ReviewCompletion != "" {
+		t.Fatalf("generated coder role=%#v", coder)
+	}
+	reviewer, ok := loaded.Config.Roles["reviewer"]
+	if !ok || reviewer.TicketQueue != "review" || reviewer.ReviewCompletion != wantReviewerCompletion {
+		t.Fatalf("generated reviewer role=%#v, want completion %q", reviewer, wantReviewerCompletion)
+	}
+	architectRole, found := loaded.Config.Roles["architect"]
+	if architect && (!found || architectRole.TicketQueue != "signoff" || !strings.Contains(architectRole.NudgePrompt, "final acceptance")) {
+		t.Fatalf("generated architect role=%#v found=%v", architectRole, found)
+	}
+	if !architect && found {
+		t.Fatalf("default topology unexpectedly includes architect: %#v", architectRole)
+	}
+}
+
+func TestInitForceReplacesRequestedTopologyAndDiscardsCustomEdits(t *testing.T) {
+	tests := []struct {
+		name          string
+		global        bool
+		wantArchitect bool
+		initialArch   bool
+		forceArgs     []string
+	}{
+		{name: "local two-stage to architect", wantArchitect: true, forceArgs: []string{"--architect", "--force"}},
+		{name: "local architect to two-stage", initialArch: true, forceArgs: []string{"--force"}},
+		{name: "global two-stage to architect", global: true, wantArchitect: true, forceArgs: []string{"--architect", "--global", "--force"}},
+		{name: "global architect to two-stage", global: true, initialArch: true, forceArgs: []string{"--force", "--global"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			cwd := filepath.Join(root, "project")
+			if err := os.Mkdir(cwd, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(cwd)
+			home := filepath.Join(root, "home")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			dir := filepath.Join(root, "local-instance")
+			if test.global {
+				dir = filepath.Join(home, defaultInstanceDirectoryName)
+			}
+			lookup := mapEnv(map[string]string{"TICKET_ORC": dir})
+			initialArgs := []string{}
+			if test.global {
+				initialArgs = append(initialArgs, "--global")
+			}
+			if test.initialArch {
+				initialArgs = append(initialArgs, "--architect")
+			}
+			var stdout, stderr bytes.Buffer
+			if code := executeInit(initialArgs, &stdout, &stderr, lookup); code != 0 {
+				t.Fatalf("initial init code=%d stderr=%q", code, stderr.String())
+			}
+			configPath := filepath.Join(dir, instanceConfigFileName)
+			originalConfig, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(originalConfig, &document); err != nil {
+				t.Fatal(err)
+			}
+			roles := document["roles"].(map[string]any)
+			coder := roles["coder"].(map[string]any)
+			coder["nudge_prompt"] = "custom edit that force must discard"
+			roles["custom-role"] = map[string]any{"ticket_queue": "open", "nudge_prompt": "custom role"}
+			customConfig, err := json.MarshalIndent(document, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			customConfig = append(customConfig, '\n')
+			if err := os.WriteFile(configPath, customConfig, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ignorePath := filepath.Join(dir, ".gitignore")
+			if err := os.WriteFile(ignorePath, []byte("# user ignore\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(dir, "state.json")
+			if err := os.WriteFile(statePath, []byte("preserve on refusal"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			noForceArgs := append([]string(nil), test.forceArgs...)
+			for index := 0; index < len(noForceArgs); index++ {
+				if noForceArgs[index] == "--force" {
+					noForceArgs = append(noForceArgs[:index], noForceArgs[index+1:]...)
+					break
+				}
+			}
+			if code := executeInit(noForceArgs, &stdout, &stderr, lookup); code == 0 {
+				t.Fatal("init without --force replaced an existing config")
+			}
+			if got, err := os.ReadFile(configPath); err != nil || string(got) != string(customConfig) {
+				t.Fatalf("refused init changed config: got=%q err=%v", got, err)
+			}
+			if got, err := os.ReadFile(ignorePath); err != nil || string(got) != "# user ignore\n" {
+				t.Fatalf("refused init changed .gitignore: got=%q err=%v", got, err)
+			}
+			if got, err := os.ReadFile(statePath); err != nil || string(got) != "preserve on refusal" {
+				t.Fatalf("refused init changed state: got=%q err=%v", got, err)
+			}
+
+			stdout.Reset()
+			stderr.Reset()
+			if code := executeInit(test.forceArgs, &stdout, &stderr, lookup); code != 0 {
+				t.Fatalf("forced init code=%d stderr=%q", code, stderr.String())
+			}
+			loaded, err := LoadFileConfig(dir, configPath, true)
+			if err != nil {
+				t.Fatalf("load forced config: %v", err)
+			}
+			assertInitTopology(t, loaded, test.wantArchitect)
+			if _, found := loaded.Config.Roles["custom-role"]; found || strings.Contains(loaded.Config.Roles["coder"].NudgePrompt, "custom edit") {
+				t.Fatalf("force preserved custom config edits: %#v", loaded.Config.Roles)
+			}
+		})
+	}
+}
+
+func TestInitHelpDocumentsArchitectTopology(t *testing.T) {
+	for _, want := range []string{"[--architect]", "--architect adds an architect role on the signoff queue", "routes", "accepted reviews to it", "--force replaces the config", "discards custom config edits"} {
+		if !strings.Contains(initHelp, want) {
+			t.Errorf("init help omitted %q", want)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeInit([]string{"--architect", "--architect"}, &stdout, &stderr, emptyEnv); code == 0 || !strings.Contains(stderr.String(), "duplicate flag --architect") {
+		t.Fatalf("duplicate architect flag code=%d stderr=%q", code, stderr.String())
 	}
 }
 

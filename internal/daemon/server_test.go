@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -224,10 +225,25 @@ func TestServerPublishesAuthenticatedStatusAndCleansUp(t *testing.T) {
 		t.Fatal("status response leaked bearer token")
 	}
 
+	// Keep real Start/Shutdown wiring covered separately from the fake-time
+	// mutation deadline test.
+	mutation, mutationCancel, err := server.MutationContext(context.Background(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutationCancel()
 	shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdown); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-mutation.Done():
+		if !errors.Is(mutation.Err(), context.Canceled) {
+			t.Fatalf("mutation after server shutdown = %v, want cancellation", mutation.Err())
+		}
+	case <-shutdown.Done():
+		t.Fatal("mutation was not canceled by server shutdown")
 	}
 	if _, err := os.Stat(EndpointPath(server.config.StateDir)); !os.IsNotExist(err) {
 		t.Fatalf("endpoint after shutdown: %v", err)
@@ -489,44 +505,77 @@ func TestDecodeJSONRejectsContentTypeAndErrorsAreBounded(t *testing.T) {
 }
 
 func TestMutationContextIgnoresRequestCancellationHonorsDeadlineAndShutdown(t *testing.T) {
-	server, _ := startTestServer(t)
-	request, requestCancel := context.WithCancel(context.Background())
-	requestCancel()
-	mutation, cancel, err := server.MutationContext(request, 30*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	select {
-	case <-mutation.Done():
-		t.Fatal("mutation canceled with request context")
-	case <-time.After(5 * time.Millisecond):
-	}
-	select {
-	case <-mutation.Done():
+	synctest.Test(t, func(t *testing.T) {
+		server, err := NewServer(Config{EndpointKey: testEndpointKey, StateDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Install the same lifecycle fields as Start without opening a listener.
+		// Transport startup and shutdown remain covered by the server tests.
+		server.lifecycle, server.lifecycleCancel = context.WithCancel(context.Background())
+		server.started = true
+		server.http = &http.Server{}
+		server.endpointPath = EndpointPath(server.config.StateDir)
+		t.Cleanup(func() {
+			server.lifecycleCancel()
+			shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdown); err != nil {
+				t.Errorf("cleanup shutdown: %v", err)
+			}
+			synctest.Wait()
+		})
+
+		request, requestCancel := context.WithCancel(context.Background())
+		defer requestCancel()
+		requestCancel()
+		mutation, cancel, err := server.MutationContext(request, 30*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel()
+		// Settle any cancellation propagation, then advance to just before the
+		// actual deadline. Both checks follow a bubble-wide scheduling barrier.
+		synctest.Wait()
+		if err := mutation.Err(); err != nil {
+			t.Fatalf("mutation canceled with request context: %v", err)
+		}
+		time.Sleep(30*time.Millisecond - time.Nanosecond)
+		synctest.Wait()
+		if err := mutation.Err(); err != nil {
+			t.Fatalf("mutation canceled before deadline: %v", err)
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		select {
+		case <-mutation.Done():
+		default:
+			t.Fatal("mutation deadline did not fire")
+		}
 		if !errors.Is(mutation.Err(), context.DeadlineExceeded) {
 			t.Fatalf("mutation error = %v, want deadline", mutation.Err())
 		}
-	case <-time.After(time.Second):
-		t.Fatal("mutation deadline did not fire")
-	}
 
-	shutdownRequest := context.Background()
-	mutation, cancel, err = server.MutationContext(shutdownRequest, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	shutdown, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdown); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-mutation.Done():
-	case <-time.After(time.Second):
-		t.Fatal("mutation was not canceled by daemon shutdown")
-	}
+		mutation, cancel, err = server.MutationContext(context.Background(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel()
+		shutdown, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdown); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case <-mutation.Done():
+		default:
+			t.Fatal("mutation was not canceled by daemon shutdown")
+		}
+		if !errors.Is(mutation.Err(), context.Canceled) {
+			t.Fatalf("mutation error = %v, want shutdown cancellation", mutation.Err())
+		}
+	})
 }
 
 func TestServerInstanceIDIsIndependentOfEndpointKeyAndListener(t *testing.T) {

@@ -140,6 +140,8 @@ func consoleSteerActivity(state, code string) string {
 		return "actionable work"
 	case "awaiting_claim":
 		return "waiting for Ticket claim"
+	case "awaiting_signoff_outcome":
+		return "awaiting signoff outcome"
 	case "queue_uncertain":
 		return "delivery uncertain"
 	case "queue_rejected":

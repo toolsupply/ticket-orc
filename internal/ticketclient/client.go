@@ -19,7 +19,10 @@ import (
 // request. A canceled request permanently stops the connection because replay
 // could duplicate an uncertain claim or mutation.
 type Client struct {
-	actor string
+	actor      string
+	executable string
+	workingDir string
+	target     Target
 
 	requestSlot chan struct{}
 	stateMu     sync.Mutex
@@ -135,6 +138,9 @@ func newClient(actor, executable string, environ environFunc, workingDir string,
 
 	client := &Client{
 		actor:       actor,
+		executable:  executable,
+		workingDir:  workingDir,
+		target:      target,
 		requestSlot: make(chan struct{}, 1),
 		command:     command,
 		stdin:       stdin,

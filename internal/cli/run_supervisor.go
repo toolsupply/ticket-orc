@@ -374,8 +374,42 @@ func equalStringSlices(left, right []string) bool {
 }
 
 func (m *workerManager) workerRole(name string) string {
+	if role := effectiveWorkerRole(m.runtime, name); role != "" {
+		return role
+	}
 	if worker, ok := m.lifecycle.Worker(name); ok {
-		return string(worker.Config.Role)
+		return configuredWorkerRole(worker)
+	}
+	return ""
+}
+
+func configuredWorkerRole(worker supervisor.RunWorker) string {
+	if worker.Config.RoleName != "" {
+		return worker.Config.RoleName
+	}
+	return string(worker.Config.Role)
+}
+
+func effectiveWorkerRole(runtime *supervisor.RuntimeState[supervisor.RunWorker], name string) string {
+	if runtime == nil {
+		return ""
+	}
+	for _, worker := range runtime.EffectiveWorkers() {
+		if worker.Name == name {
+			return configuredWorkerRole(worker)
+		}
+	}
+	return ""
+}
+
+func runConfigWorkerRole(config RunConfig, name string) string {
+	if role := effectiveWorkerRole(config.Runtime, name); role != "" {
+		return role
+	}
+	for _, worker := range config.Workers {
+		if worker.Name == name {
+			return configuredWorkerRole(worker)
+		}
 	}
 	return ""
 }
@@ -430,7 +464,7 @@ func newSupervisorWorkerTransition(config RunConfig, emitEvent func(supervisor.R
 		if config.Hooks.WorkerState != nil {
 			config.Hooks.WorkerState(event)
 		}
-		published := supervisor.RuntimeEvent{Type: "worker.state", Worker: worker, State: string(state)}
+		published := supervisor.RuntimeEvent{Type: "worker.state", Worker: worker, Role: runConfigWorkerRole(config, worker), State: string(state)}
 		if err != nil {
 			published.Code = "worker_failed"
 		}
@@ -485,7 +519,7 @@ func wireSupervisorRuntimeEvents(config RunConfig, manager *workerManager, emitE
 			return
 		}
 		config.Runtime.SetFailure(worker, failure)
-		emitEvent(supervisor.RuntimeEvent{Type: "worker.failure", Worker: worker, State: string(state), Code: failure.Classification, Phase: failure.Phase, Failure: failure})
+		emitEvent(supervisor.RuntimeEvent{Type: "worker.failure", Worker: worker, Role: runConfigWorkerRole(config, worker), State: string(state), Code: failure.Classification, Phase: failure.Phase, Failure: failure})
 	}
 }
 
@@ -556,42 +590,45 @@ func wireSupervisorControlCallbacks(config *RunConfig, manager *workerManager, e
 		emitEvent(supervisor.RuntimeEvent{Type: "daemon.aborted", State: result.Mode, Applied: result.Applied})
 		return result, nil
 	}
-	publishControlIntent := func(kind, name string) {
-		role := manager.workerRole(name)
+	publishControlIntent := func(kind, name, role string) {
 		emitEvent(supervisor.RuntimeEvent{Type: "worker.control", Worker: name, Role: role, Phase: kind, Code: "intent"})
 	}
-	publishMutation := func(kind, name string, result supervisor.MutationResult, err error) {
-		role := manager.workerRole(name)
+	publishMutation := func(kind, name, role string, result supervisor.MutationResult, err error) {
 		emitEvent(supervisor.RuntimeEvent{Type: "worker.control", Worker: name, Role: role, Phase: kind, State: result.State, Code: mutationEventCode(result, err), Applied: result.Applied})
 	}
 	config.control.StartWorker = func(ctx context.Context, name string) (supervisor.MutationResult, error) {
-		publishControlIntent("start", name)
+		role := manager.workerRole(name)
+		publishControlIntent("start", name, role)
 		result, err := manager.start(ctx, name)
-		publishMutation("start", name, result, err)
+		publishMutation("start", name, role, result, err)
 		return result, err
 	}
 	config.control.StopWorker = func(ctx context.Context, name string) (supervisor.MutationResult, error) {
-		publishControlIntent("stop", name)
+		role := manager.workerRole(name)
+		publishControlIntent("stop", name, role)
 		result, err := manager.stop(ctx, name)
-		publishMutation("stop", name, result, err)
+		publishMutation("stop", name, role, result, err)
 		return result, err
 	}
 	config.control.PauseWorker = func(ctx context.Context, name string) (supervisor.MutationResult, error) {
-		publishControlIntent("pause", name)
+		role := manager.workerRole(name)
+		publishControlIntent("pause", name, role)
 		result, err := manager.pause(ctx, name)
-		publishMutation("pause", name, result, err)
+		publishMutation("pause", name, role, result, err)
 		return result, err
 	}
 	config.control.ResumeWorker = func(ctx context.Context, name string) (supervisor.MutationResult, error) {
-		publishControlIntent("resume", name)
+		role := manager.workerRole(name)
+		publishControlIntent("resume", name, role)
 		result, err := manager.resume(ctx, name)
-		publishMutation("resume", name, result, err)
+		publishMutation("resume", name, role, result, err)
 		return result, err
 	}
 	config.control.RestartWorker = func(ctx context.Context, name string) (supervisor.MutationResult, error) {
-		publishControlIntent("restart", name)
+		role := manager.workerRole(name)
+		publishControlIntent("restart", name, role)
 		result, err := manager.restart(ctx, name)
-		publishMutation("restart", name, result, err)
+		publishMutation("restart", name, role, result, err)
 		return result, err
 	}
 	config.control.StartGroup = func(ctx context.Context, name string) (supervisor.GroupResult, error) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/daemonclient"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 func TestDynamicSteerContainsTwoSameTicketStalls(t *testing.T) {
@@ -163,15 +164,15 @@ func TestDynamicSteerContainsTwoSameTicketStalls(t *testing.T) {
 			"\nloop=" + readText(filepath.Join(localDir, "state.json")) +
 			"\nstdout=" + readText(filepath.Join(root, "run.out")) + "\nstderr=" + readText(filepath.Join(root, "run.err"))
 	}
-	waitForDynamicSteerLivelock(t, 15*time.Second, diagnostics, func() bool {
-		return len(readCodexCalls(t, codexLog)) >= 1
-	})
+	firstDelivery := awaitSteerDelivery(t, localDir, actor, time.Time{}, 15*time.Second, func(delivery state.SteerDelivery) bool {
+		return (delivery.State == "idle" || delivery.State == "queued" || delivery.State == "consumed") && !delivery.BootstrapPending
+	}, diagnostics)
+	if got := len(readCodexCalls(t, codexLog)); got != 1 {
+		t.Fatalf("initial Codex wakes=%d, want one after delivery persistence; %s", got, diagnostics())
+	}
 	if err := os.WriteFile(watchEventFile, []byte("change"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	waitForDynamicSteerLivelock(t, 15*time.Second, diagnostics, func() bool {
-		return countDynamicSteerWorkWakes(readCodexCalls(t, codexLog), coder.NudgePrompt) == 1
-	})
 	setClaimActive := func(active bool) {
 		t.Helper()
 		value := "0"
@@ -193,18 +194,27 @@ func TestDynamicSteerContainsTwoSameTicketStalls(t *testing.T) {
 	}
 	setClaimActive(true)
 	resumeSteer()
+	activeDelivery := awaitSteerDelivery(t, localDir, actor, firstDelivery.UpdatedAt, 10*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "consumed"
+	}, diagnostics)
 	waitForDynamicSteerLivelock(t, 10*time.Second, diagnostics, func() bool {
 		loop, found := readLoop()
 		return found && loop.ClaimState == "open" && loop.ClaimActor == actor
 	})
 	setClaimActive(false)
 	resumeSteer()
+	stallDelivery := awaitSteerDelivery(t, localDir, actor, activeDelivery.UpdatedAt, 10*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "queued"
+	}, diagnostics)
 	waitForDynamicSteerLivelock(t, 10*time.Second, diagnostics, func() bool {
 		loop, found := readLoop()
 		return found && loop.StallCount == 1 && countDynamicSteerWorkWakes(readCodexCalls(t, codexLog), coder.NudgePrompt) == 2
 	})
 	setClaimActive(true)
 	resumeSteer()
+	_ = awaitSteerDelivery(t, localDir, actor, stallDelivery.UpdatedAt, 10*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "consumed"
+	}, diagnostics)
 	waitForDynamicSteerLivelock(t, 10*time.Second, diagnostics, func() bool {
 		loop, found := readLoop()
 		return found && loop.StallCount == 1 && loop.ClaimState == "open" && loop.ClaimActor == actor
@@ -288,12 +298,5 @@ func countDynamicSteerWorkWakes(calls []codexCall, prompt string) int {
 
 func waitForDynamicSteerLivelock(t *testing.T, timeout time.Duration, diagnostics func() string, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatalf("dynamic-steer livelock condition timed out: %s", diagnostics())
+	testutil.Await(t, timeout, "dynamic-steer livelock state", condition, diagnostics)
 }

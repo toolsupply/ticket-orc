@@ -8,10 +8,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -191,69 +193,69 @@ func TestRepositoryObserverLifecycleEventsDoNotDuplicateReadyReconciliation(t *t
 }
 
 func TestRepositoryWatchWaitsForReadyThenDirtiesAndRefreshesRepository(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runtime := NewRuntimeState(nil)
-	dirty := newSteerDirtySet()
-	started := make(chan struct{})
-	releaseReady := make(chan struct{})
-	var probedPath atomic.Value
-	probes := atomic.Int32{}
-	repository := testRepositoryRegistry()["alpha"]
-	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": repository}, func(_ context.Context, _ supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
-		probes.Add(1)
-		path, _ := probedPath.Load().(string)
-		return ticketclient.RepositoryInfo{ID: repository.ID, Path: path}, nil
-	}, func(_ context.Context, _ supervisor.ConfiguredRepository, _ func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
-		close(started)
-		<-releaseReady
-		return newFakeRepositoryWatchProcess(nil), nil
-	})
-	ready := make(chan string, 1)
-	manager.SetReadySink(func(repositoryID string) {
-		dirty.MarkRepository(repositoryID)
-		ready <- repositoryID
-	})
-	manager.StartObservers()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("watch startup did not begin")
-	}
-	if statuses := runtime.RepositoryStatuses(); len(statuses) != 1 || statuses[0].State != "starting" {
-		t.Fatalf("observer status before READY=%#v, want starting", statuses)
-	}
-	if probes.Load() != 0 {
-		t.Fatalf("repository was probed before READY: %d", probes.Load())
-	}
-	if snapshot := dirty.Drain(); !snapshot.empty() {
-		t.Fatalf("pre-READY state caused a reconciliation: %#v", snapshot)
-	}
-	// The watcher's initial baseline now contains B. Its READY must trigger a
-	// fresh authoritative read even if Orc already observed A at startup.
-	probedPath.Store("/repo/state-B")
-	close(releaseReady)
-	select {
-	case repositoryID := <-ready:
-		if repositoryID != repository.ID {
-			t.Fatalf("READY repository=%q, want %q", repositoryID, repository.ID)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runtime := NewRuntimeState(nil)
+		dirty := newSteerDirtySet()
+		started := make(chan struct{})
+		releaseReady := make(chan struct{})
+		var probedPath atomic.Value
+		probes := atomic.Int32{}
+		repository := testRepositoryRegistry()["alpha"]
+		manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": repository}, func(_ context.Context, _ supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
+			probes.Add(1)
+			path, _ := probedPath.Load().(string)
+			return ticketclient.RepositoryInfo{ID: repository.ID, Path: path}, nil
+		}, func(_ context.Context, _ supervisor.ConfiguredRepository, _ func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			close(started)
+			<-releaseReady
+			return newFakeRepositoryWatchProcess(nil), nil
+		})
+		ready := make(chan string, 1)
+		manager.SetReadySink(func(repositoryID string) {
+			dirty.MarkRepository(repositoryID)
+			ready <- repositoryID
+		})
+		manager.StartObservers()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("watch startup did not begin")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("valid READY did not trigger its repository callback")
-	}
-	deadline := time.Now().Add(time.Second)
-	for (probes.Load() != 1 || len(runtime.RepositoryStatuses()) != 1 || runtime.RepositoryStatuses()[0].Path != "/repo/state-B") && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if probes.Load() != 1 || runtime.RepositoryStatuses()[0].Path != "/repo/state-B" {
-		t.Fatalf("post-READY authoritative refresh: probes=%d status=%#v", probes.Load(), runtime.RepositoryStatuses())
-	}
-	if snapshot := dirty.Drain(); snapshot.all || len(snapshot.repositories) != 1 {
-		t.Fatalf("READY dirty snapshot=%#v, want one targeted repository", snapshot)
-	} else if _, ok := snapshot.repositories[repository.ID]; !ok {
-		t.Fatalf("READY dirtied %#v, want repository %s", snapshot.repositories, repository.ID)
-	}
-	manager.StopObservers()
+		if statuses := runtime.RepositoryStatuses(); len(statuses) != 1 || statuses[0].State != "starting" {
+			t.Fatalf("observer status before READY=%#v, want starting", statuses)
+		}
+		if probes.Load() != 0 {
+			t.Fatalf("repository was probed before READY: %d", probes.Load())
+		}
+		if snapshot := dirty.Drain(); !snapshot.empty() {
+			t.Fatalf("pre-READY state caused a reconciliation: %#v", snapshot)
+		}
+		// The watcher's initial baseline now contains B. Its READY must trigger a
+		// fresh authoritative read even if Orc already observed A at startup.
+		probedPath.Store("/repo/state-B")
+		close(releaseReady)
+		select {
+		case repositoryID := <-ready:
+			if repositoryID != repository.ID {
+				t.Fatalf("READY repository=%q, want %q", repositoryID, repository.ID)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("valid READY did not trigger its repository callback")
+		}
+		synctest.Wait()
+		statuses := runtime.RepositoryStatuses()
+		if probes.Load() != 1 || len(statuses) != 1 || statuses[0].Path != "/repo/state-B" {
+			t.Fatalf("post-READY authoritative refresh: probes=%d status=%#v", probes.Load(), statuses)
+		}
+		if snapshot := dirty.Drain(); snapshot.all || len(snapshot.repositories) != 1 {
+			t.Fatalf("READY dirty snapshot=%#v, want one targeted repository", snapshot)
+		} else if _, ok := snapshot.repositories[repository.ID]; !ok {
+			t.Fatalf("READY dirtied %#v, want repository %s", snapshot.repositories, repository.ID)
+		}
+		manager.StopObservers()
+	})
 }
 
 func TestRepositoryWatchDoesNotRecoverUntilReplacementReady(t *testing.T) {
@@ -348,14 +350,17 @@ func TestRepositoryWatchManagerStartsOneObserverPerConfiguredRepository(t *testi
 	defer cancel()
 	runtime := NewRuntimeState(nil)
 	var starts atomic.Int32
+	var startEvents testutil.Probe[string]
 	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, testRepositoryRegistry(), nil, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
 		starts.Add(1)
+		startEvents.Record("started")
 		return newFakeRepositoryWatchProcess(nil), nil
 	})
 	manager.StartObservers()
-	deadline := time.Now().Add(time.Second)
-	for starts.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	waitCtx, stopWaiting := context.WithTimeout(context.Background(), time.Second)
+	defer stopWaiting()
+	if _, err := startEvents.Wait(waitCtx, func(events []string) bool { return len(events) >= 2 }); err != nil {
+		t.Fatalf("observer starts=%d, want one per repository: %v", starts.Load(), err)
 	}
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("observer starts = %d, want one per repository", got)
@@ -420,236 +425,261 @@ func TestRepositoryWatchManagerStopsProcessStartedAfterObserverCancellation(t *t
 }
 
 func TestRepositoryWatchManagerIgnoresLateStartFailureAfterObserverRemoval(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runtime := NewRuntimeState(nil)
-	started := make(chan struct{})
-	releaseStart := make(chan struct{})
-	returned := make(chan struct{})
-	events := make(chan supervisor.RuntimeEvent, 1)
-	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}, nil, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
-		close(started)
-		<-releaseStart
-		close(returned)
-		return nil, errors.New("late watcher startup failure")
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runtime := NewRuntimeState(nil)
+		started := make(chan struct{})
+		releaseStart := make(chan struct{})
+		returned := make(chan struct{})
+		events := make(chan supervisor.RuntimeEvent, 1)
+		manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}, nil, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			close(started)
+			<-releaseStart
+			close(returned)
+			return nil, errors.New("late watcher startup failure")
+		})
+		manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
+		manager.StartObservers()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("observer starter did not begin")
+		}
+		if err := manager.Replace(ctx, supervisor.RepositoryRegistry{}); err != nil {
+			t.Fatal(err)
+		}
+		if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
+			t.Fatalf("removed observer status before late failure=%#v", statuses)
+		}
+		close(releaseStart)
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("observer starter did not return")
+		}
+		// Wait for runObserver to consume the returned error. The removed observer
+		// must not recreate its status or publish a stale observer event.
+		synctest.Wait()
+		if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
+			t.Fatalf("late start failure restored removed observer status=%#v", statuses)
+		}
+		select {
+		case event := <-events:
+			t.Fatalf("late start failure published stale observer event=%#v", event)
+		default:
+		}
 	})
-	manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
-	manager.StartObservers()
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("observer starter did not begin")
-	}
-	if err := manager.Replace(ctx, supervisor.RepositoryRegistry{}); err != nil {
-		t.Fatal(err)
-	}
-	if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
-		t.Fatalf("removed observer status before late failure=%#v", statuses)
-	}
-	close(releaseStart)
-	select {
-	case <-returned:
-	case <-time.After(time.Second):
-		t.Fatal("observer starter did not return")
-	}
-	// Give runObserver time to process the returned error. The removed observer
-	// must not recreate its status or publish a stale observer event.
-	time.Sleep(20 * time.Millisecond)
-	if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
-		t.Fatalf("late start failure restored removed observer status=%#v", statuses)
-	}
-	select {
-	case event := <-events:
-		t.Fatalf("late start failure published stale observer event=%#v", event)
-	default:
-	}
 }
 
 func TestRepositoryWatchManagerDoesNotRefreshStatusAfterObserverRemoval(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runtime := NewRuntimeState(nil)
-	probeStarted := make(chan struct{})
-	releaseProbe := make(chan struct{})
-	probeReturned := make(chan struct{})
-	processReady := make(chan *trackedDynamicWatchProcess, 1)
-	events := make(chan supervisor.RuntimeEvent, 1)
-	repository := testRepositoryRegistry()["alpha"]
-	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": repository}, func(context.Context, supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
-		close(probeStarted)
-		<-releaseProbe
-		close(probeReturned)
-		name := "Ticket project"
-		return ticketclient.RepositoryInfo{ID: repository.ID, Path: "/ticket/project", Name: &name}, nil
-	}, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
-		process := newTrackedDynamicWatchProcess()
-		processReady <- process
-		return process, nil
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runtime := NewRuntimeState(nil)
+		probeStarted := make(chan struct{})
+		releaseProbe := make(chan struct{})
+		probeReturned := make(chan struct{})
+		processReady := make(chan *trackedDynamicWatchProcess, 1)
+		events := make(chan supervisor.RuntimeEvent, 1)
+		repository := testRepositoryRegistry()["alpha"]
+		manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": repository}, func(context.Context, supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
+			close(probeStarted)
+			<-releaseProbe
+			close(probeReturned)
+			name := "Ticket project"
+			return ticketclient.RepositoryInfo{ID: repository.ID, Path: "/ticket/project", Name: &name}, nil
+		}, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			process := newTrackedDynamicWatchProcess()
+			processReady <- process
+			return process, nil
+		})
+		manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
+		manager.StartObservers()
+		var process *trackedDynamicWatchProcess
+		select {
+		case process = <-processReady:
+		case <-time.After(time.Second):
+			t.Fatal("observer process did not start")
+		}
+		select {
+		case <-probeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("initial repository probe did not begin")
+		}
+		if err := manager.Replace(ctx, supervisor.RepositoryRegistry{}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-process.stopped:
+		case <-time.After(time.Second):
+			t.Fatal("removing observer did not stop its active process")
+		}
+		close(releaseProbe)
+		select {
+		case <-probeReturned:
+		case <-time.After(time.Second):
+			t.Fatal("repository probe did not return")
+		}
+		synctest.Wait()
+		if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
+			t.Fatalf("removed observer refresh restored repository status=%#v", statuses)
+		}
+		select {
+		case event := <-events:
+			t.Fatalf("removed observer refresh published stale event=%#v", event)
+		default:
+		}
+		manager.StopObservers()
 	})
-	manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
-	manager.StartObservers()
-	var process *trackedDynamicWatchProcess
-	select {
-	case process = <-processReady:
-	case <-time.After(time.Second):
-		t.Fatal("observer process did not start")
-	}
-	select {
-	case <-probeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("initial repository probe did not begin")
-	}
-	if err := manager.Replace(ctx, supervisor.RepositoryRegistry{}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-process.stopped:
-	case <-time.After(time.Second):
-		t.Fatal("removing observer did not stop its active process")
-	}
-	close(releaseProbe)
-	select {
-	case <-probeReturned:
-	case <-time.After(time.Second):
-		t.Fatal("repository probe did not return")
-	}
-	time.Sleep(20 * time.Millisecond)
-	if statuses := runtime.RepositoryStatuses(); len(statuses) != 0 {
-		t.Fatalf("removed observer refresh restored repository status=%#v", statuses)
-	}
-	select {
-	case event := <-events:
-		t.Fatalf("removed observer refresh published stale event=%#v", event)
-	default:
-	}
-	manager.StopObservers()
 }
 
 func TestRepositoryWatchManagerCoalescesChangesAndPublishesRepositoryEvent(t *testing.T) {
-	runtime := NewRuntimeState(nil)
-	manager := newRepositoryWatchManager(context.Background(), runtime, testRepositoryRegistry(), nil)
-	events := make(chan supervisor.RuntimeEvent, 2)
-	manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
-	manager.TicketChanged("alpha", supervisor.RepositoryWatchEvent{Ticket: "20260921-00001", Event: "claimed", State: "open"})
-	var latest supervisor.RepositoryWatchEvent
-	if err := json.Unmarshal([]byte(`{"ticket":"20260921-00002","event":"submitted","state":"review","actor":"reviewer","from":"open","to":"review","message":"private Ticket message"}`), &latest); err != nil {
-		t.Fatal(err)
-	}
-	manager.TicketChanged("alpha", latest)
-	select {
-	case event := <-events:
-		if event.Type != "ticket.repository_changed" || event.RepositoryID != joinTestRepositoryID || event.RepositoryKey != "alpha" || event.Ticket != "20260921-00002" || event.Code != "submitted" || event.Actor != "reviewer" || event.State != "review" {
-			t.Fatalf("repository event = %#v", event)
+	synctest.Test(t, func(t *testing.T) {
+		runtime := NewRuntimeState(nil)
+		manager := newRepositoryWatchManager(context.Background(), runtime, testRepositoryRegistry(), nil)
+		events := make(chan supervisor.RuntimeEvent, 2)
+		manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
+		manager.TicketChanged("alpha", supervisor.RepositoryWatchEvent{Ticket: "20260921-00001", Event: "claimed", State: "open"})
+		var latest supervisor.RepositoryWatchEvent
+		if err := json.Unmarshal([]byte(`{"ticket":"20260921-00002","event":"submitted","state":"review","actor":"reviewer","from":"open","to":"review","message":"private Ticket message"}`), &latest); err != nil {
+			t.Fatal(err)
 		}
-		encoded, err := json.Marshal(daemon.RuntimeEventDTO(event))
-		if err != nil || strings.Contains(string(encoded), "private Ticket message") || strings.Contains(string(encoded), `"message"`) {
-			t.Fatalf("public repository event leaked Ticket message: %s err=%v", encoded, err)
+		manager.TicketChanged("alpha", latest)
+		synctest.Wait()
+		select {
+		case event := <-events:
+			t.Fatalf("debounce flushed before its timer expired: %#v", event)
+		default:
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for coalesced repository event")
-	}
-	select {
-	case event := <-events:
-		t.Fatalf("unexpected duplicate repository event: %#v", event)
-	case <-time.After(repositoryWatchDebounce * 2):
-	}
-	statuses := runtime.RepositoryStatuses()
-	if len(statuses) != 2 || statuses[0].LastEventAt.IsZero() || statuses[0].State != "healthy" {
-		t.Fatalf("repository health = %#v", statuses)
-	}
+
+		time.Sleep(repositoryWatchDebounce)
+		synctest.Wait()
+		select {
+		case event := <-events:
+			if event.Type != "ticket.repository_changed" || event.RepositoryID != joinTestRepositoryID || event.RepositoryKey != "alpha" || event.Ticket != "20260921-00002" || event.Code != "submitted" || event.Actor != "reviewer" || event.State != "review" {
+				t.Fatalf("repository event = %#v", event)
+			}
+			encoded, err := json.Marshal(daemon.RuntimeEventDTO(event))
+			if err != nil || strings.Contains(string(encoded), "private Ticket message") || strings.Contains(string(encoded), `"message"`) {
+				t.Fatalf("public repository event leaked Ticket message: %s err=%v", encoded, err)
+			}
+		default:
+			t.Fatal("debounce timer did not flush the pending event")
+		}
+		select {
+		case event := <-events:
+			t.Fatalf("unexpected duplicate repository event: %#v", event)
+		default:
+		}
+		statuses := runtime.RepositoryStatuses()
+		if len(statuses) != 2 || statuses[0].LastEventAt.IsZero() || statuses[0].State != "healthy" {
+			t.Fatalf("repository health = %#v", statuses)
+		}
+	})
 }
 
 func TestRepositoryWatchManagerRestartsAndRefreshesAfterUnexpectedExit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runtime := NewRuntimeState(nil)
-	var starts atomic.Int32
-	var probes atomic.Int32
-	events := make(chan supervisor.RuntimeEvent, 4)
-	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}, func(context.Context, supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
-		probes.Add(1)
-		return ticketclient.RepositoryInfo{Path: "/repo/alpha"}, nil
-	}, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
-		if starts.Add(1) == 1 {
-			return newFakeRepositoryWatchProcess(errors.New("watch exited")), nil
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runtime := NewRuntimeState(nil)
+		var starts atomic.Int32
+		var probes atomic.Int32
+		events := make(chan supervisor.RuntimeEvent, 4)
+		manager := newRepositoryWatchManagerWithStarter(ctx, runtime, supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}, func(context.Context, supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
+			probes.Add(1)
+			return ticketclient.RepositoryInfo{Path: "/repo/alpha"}, nil
+		}, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			if starts.Add(1) == 1 {
+				return newFakeRepositoryWatchProcess(errors.New("watch exited")), nil
+			}
+			return newFakeRepositoryWatchProcess(nil), nil
+		})
+		manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
+		manager.StartObservers()
+		synctest.Wait()
+		if starts.Load() != 1 || probes.Load() != 1 {
+			t.Fatalf("before backoff expiry starts=%d probes=%d, want 1 and 1", starts.Load(), probes.Load())
 		}
-		return newFakeRepositoryWatchProcess(nil), nil
-	})
-	manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
-	manager.StartObservers()
-	deadline := time.Now().Add(time.Second)
-	var statuses []supervisor.RepositoryStatus
-	for time.Now().Before(deadline) {
+		statuses := runtime.RepositoryStatuses()
+		if len(statuses) != 1 || statuses[0].State != "degraded" {
+			t.Fatalf("status before restart=%#v, want degraded", statuses)
+		}
+		const initialRestartBackoff = 100 * time.Millisecond
+		time.Sleep(initialRestartBackoff - time.Nanosecond)
+		synctest.Wait()
+		if starts.Load() != 1 {
+			t.Fatalf("observer restarted before backoff expired: starts=%d", starts.Load())
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
 		statuses = runtime.RepositoryStatuses()
-		if starts.Load() >= 2 && probes.Load() >= 2 && len(statuses) == 1 && statuses[0].RestartCount == 1 {
-			break
+		if starts.Load() != 2 || probes.Load() != 2 || len(statuses) != 1 || statuses[0].RestartCount != 1 || statuses[0].State != "healthy" {
+			t.Fatalf("restart status=%#v starts=%d probes=%d", statuses, starts.Load(), probes.Load())
 		}
-		time.Sleep(time.Millisecond)
-	}
-	if starts.Load() < 2 || len(statuses) != 1 || statuses[0].RestartCount != 1 || probes.Load() < 2 {
-		t.Fatalf("restart status=%#v probes=%d", statuses, probes.Load())
-	}
-	var sawDegraded, sawRecovered bool
-	eventDeadline := time.NewTimer(3 * time.Second)
-	defer eventDeadline.Stop()
-	for !sawDegraded || !sawRecovered {
-		select {
-		case event := <-events:
+		var sawDegraded, sawRecovered bool
+		for len(events) > 0 {
+			event := <-events
 			if event.Type == "ticket.repository_observer" && event.State == "degraded" {
 				sawDegraded = true
 			}
 			if event.Type == "ticket.repository_observer" && event.Code == "observer_recovered" {
 				sawRecovered = true
 			}
-		case <-eventDeadline.C:
-			t.Fatalf("timed out waiting for observer degradation/recovery events degraded=%t recovered=%t", sawDegraded, sawRecovered)
 		}
-	}
-	manager.StopObservers()
+		if !sawDegraded || !sawRecovered {
+			t.Fatalf("observer events degraded=%t recovered=%t", sawDegraded, sawRecovered)
+		}
+		manager.StopObservers()
+		synctest.Wait()
+	})
 }
 
 func TestRepositoryWatchManagerReplacesObserversAfterCandidateValidation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runtime := NewRuntimeState(nil)
-	old := supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}
-	var starts atomic.Int32
-	manager := newRepositoryWatchManagerWithStarter(ctx, runtime, old, nil, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
-		starts.Add(1)
-		return newFakeRepositoryWatchProcess(nil), nil
-	})
-	manager.StartObservers()
-	deadline := time.Now().Add(time.Second)
-	for starts.Load() < 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	renamed := testRepositoryRegistry()["alpha"]
-	renamed.Key = "backend"
-	candidate := supervisor.RepositoryRegistry{"backend": renamed}
-	if err := manager.Replace(context.Background(), candidate); err != nil {
-		t.Fatalf("replace: %v", err)
-	}
-	deadline = time.Now().Add(time.Second)
-	for starts.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if starts.Load() != 2 {
-		t.Fatalf("observer starts after replacement = %d, want old plus new", starts.Load())
-	}
-	statuses := runtime.RepositoryStatuses()
-	if len(statuses) != 1 || statuses[0].ID != joinTestRepositoryID || statuses[0].Key != "backend" || statuses[0].Path != "/repo/alpha" {
-		t.Fatalf("repository statuses after replacement = %#v", statuses)
-	}
-	events := make(chan supervisor.RuntimeEvent, 1)
-	manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
-	manager.TicketChanged("backend", supervisor.RepositoryWatchEvent{Ticket: "20260921-00003", Event: "reviewed", State: "review"})
-	select {
-	case event := <-events:
-		if event.Type != "ticket.repository_changed" || event.RepositoryID != joinTestRepositoryID || event.RepositoryKey != "backend" {
-			t.Fatalf("repository event after key rename = %#v", event)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runtime := NewRuntimeState(nil)
+		old := supervisor.RepositoryRegistry{"alpha": testRepositoryRegistry()["alpha"]}
+		var starts atomic.Int32
+		manager := newRepositoryWatchManagerWithStarter(ctx, runtime, old, nil, func(context.Context, supervisor.ConfiguredRepository, func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			starts.Add(1)
+			return newFakeRepositoryWatchProcess(nil), nil
+		})
+		manager.StartObservers()
+		synctest.Wait()
+		if starts.Load() != 1 {
+			t.Fatalf("initial observer starts=%d, want one", starts.Load())
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for repository event after key rename")
-	}
-	manager.StopObservers()
+		renamed := testRepositoryRegistry()["alpha"]
+		renamed.Key = "backend"
+		candidate := supervisor.RepositoryRegistry{"backend": renamed}
+		if err := manager.Replace(context.Background(), candidate); err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		synctest.Wait()
+		if starts.Load() != 2 {
+			t.Fatalf("observer starts after replacement = %d, want old plus new", starts.Load())
+		}
+		statuses := runtime.RepositoryStatuses()
+		if len(statuses) != 1 || statuses[0].ID != joinTestRepositoryID || statuses[0].Key != "backend" || statuses[0].Path != "/repo/alpha" {
+			t.Fatalf("repository statuses after replacement = %#v", statuses)
+		}
+		events := make(chan supervisor.RuntimeEvent, 1)
+		manager.SetEventSink(func(event supervisor.RuntimeEvent) { events <- event })
+		manager.TicketChanged("backend", supervisor.RepositoryWatchEvent{Ticket: "20260921-00003", Event: "reviewed", State: "review"})
+		time.Sleep(repositoryWatchDebounce)
+		synctest.Wait()
+		select {
+		case event := <-events:
+			if event.Type != "ticket.repository_changed" || event.RepositoryID != joinTestRepositoryID || event.RepositoryKey != "backend" {
+				t.Fatalf("repository event after key rename = %#v", event)
+			}
+		default:
+			t.Fatal("repository event after key rename was not flushed")
+		}
+		manager.StopObservers()
+		synctest.Wait()
+	})
 }

@@ -92,6 +92,10 @@ func renderRuntimeConfigWarnings(out io.Writer, diagnostics ConfigDiagnostics) {
 		if item.Severity != DiagnosticWarning {
 			continue
 		}
+		if item.Code == "run.obsolete_nudge_prompt" {
+			renderObsoleteNudgePromptWarning(out, item.Path, item.Message, item.Remediation)
+			continue
+		}
 		_, _ = fmt.Fprintf(out, "[ticket-orc] config warning: %s\n", runtimeConfigWarningMessage(item.Code, item.Worker, item.Message, item.Remediation))
 	}
 }

@@ -22,6 +22,10 @@ import (
 )
 
 func executeRole(config supervisor.RoleConfig) (err error) {
+	roleName := config.RoleName
+	if roleName == "" {
+		roleName = string(config.Role)
+	}
 	if err := ensureRuntimeOwnershipIfKnown(config.StateDir, config.InstanceID, config.LocalDirConfigured); err != nil {
 		return err
 	}
@@ -30,9 +34,17 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		if err == nil || errors.Is(err, context.Canceled) {
 			return
 		}
-		emitRoleFailure(eventSink, config.WorkerName, string(config.Role), err)
+		emitRoleFailure(eventSink, config.WorkerName, roleName, err)
 	}()
-	if config.Role != RoleCoder && config.Role != RoleReviewer {
+	queue := config.TicketQueue
+	if queue == "" {
+		if config.Role == RoleReviewer {
+			queue = "review"
+		} else if config.Role == RoleCoder {
+			queue = "open"
+		}
+	}
+	if queue != "open" && queue != "review" && queue != "signoff" {
 		return unavailableRoleExecutor(config)
 	}
 	supervised := os.Getenv(supervisedRoleEnv) == "1"
@@ -88,9 +100,11 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 	if err != nil {
 		return orc.NewFailureContextError(orc.FailureContext{Origin: "orc_state", Operation: "cleanup setup", Phase: "worker startup"}, fmt.Errorf("startup phase cleanup setup: %w", err))
 	}
-	if config.Role == RoleReviewer {
+	if queue == "review" {
 		err = orc.RunReviewer(ctx, orc.ReviewerConfig{
 			WorkerName:                 config.WorkerName,
+			RoleName:                   roleName,
+			TicketQueue:                queue,
 			Actor:                      config.Actor,
 			Harness:                    config.Harness,
 			Model:                      config.Model,
@@ -104,7 +118,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 			ReviewCompletion:           config.ReviewCompletion,
 			QueueFilters: ticketclient.QueueFilters{
 				Tags:        splitTicketTags(config.TicketTags),
-				WithoutTags: splitReviewSkipTags(config.ReviewSkipTags),
+				WithoutTags: mergeTicketTags(splitTicketTags(config.TicketWithoutTags), splitReviewSkipTags(config.ReviewSkipTags)),
 			},
 			TicketPrompt:         config.TicketPrompt,
 			CodexSandbox:         config.Codex.Sandbox,
@@ -117,12 +131,54 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 			ContainmentTickets:   containmentTickets,
 		}, tickets, agent, store, cleaner)
 		if err != nil {
-			err = orc.NewFailureContextError(orc.FailureContext{Origin: "reviewer", Operation: "worker execution", Phase: "worker execution"}, err)
+			err = orc.NewFailureContextError(orc.FailureContext{Origin: roleName, Operation: "worker execution", Phase: "worker execution"}, err)
+		}
+		return quietSupervisedCancellation(supervised, ctx, err)
+	}
+	if queue == "signoff" {
+		repositoryID := config.RepositoryIdentity
+		if !ticketclient.ValidRepositoryID(repositoryID) {
+			info, probeErr := ticketclient.ProbeInfo(ctx, config.Actor, workingDir, ticketTarget(config))
+			if probeErr != nil {
+				return orc.NewFailureContextError(orc.FailureContext{Origin: "ticket", Operation: "repository identity", Phase: "Ticket client startup"}, fmt.Errorf("resolve Ticket repository identity for acceptance watch: %w", probeErr))
+			}
+			repositoryID = info.ID
+		}
+		err = orc.RunAcceptance(ctx, orc.AcceptanceConfig{
+			WorkerName:                 config.WorkerName,
+			RoleName:                   roleName,
+			Actor:                      config.Actor,
+			Harness:                    config.Harness,
+			Model:                      config.Model,
+			Reasoning:                  config.Reasoning,
+			SessionPolicy:              string(config.SessionPolicy),
+			SessionCleanup:             string(config.SessionCleanup),
+			MinimumReuseContextPercent: config.MinimumReuseContextPercent,
+			StateDir:                   config.StateDir,
+			OutputMode:                 string(config.Output),
+			QueueFilters: ticketclient.QueueFilters{
+				Tags:        splitTicketTags(config.TicketTags),
+				WithoutTags: splitTicketTags(config.TicketWithoutTags),
+			},
+			TicketPrompt:         config.TicketPrompt,
+			RepositoryID:         repositoryID,
+			CodexSandbox:         config.Codex.Sandbox,
+			PiProvider:           config.Pi.Provider,
+			ClaudePermissionMode: config.Claude.PermissionMode,
+			WorkingDir:           workingDir,
+			Operator:             os.Stdout,
+			Diagnostics:          os.Stderr,
+			EventSink:            eventSink,
+		}, tickets, agent, store, cleaner)
+		if err != nil {
+			err = orc.NewFailureContextError(orc.FailureContext{Origin: roleName, Operation: "worker execution", Phase: "worker execution"}, err)
 		}
 		return quietSupervisedCancellation(supervised, ctx, err)
 	}
 	err = orc.RunCoder(ctx, orc.CoderConfig{
 		WorkerName:                 config.WorkerName,
+		RoleName:                   roleName,
+		TicketQueue:                queue,
 		Actor:                      config.Actor,
 		Harness:                    config.Harness,
 		Model:                      config.Model,
@@ -135,7 +191,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		OutputMode:                 string(config.Output),
 		ReviewCompletion:           config.ReviewFinalGate,
 		ReviewSkipTags:             splitReviewSkipTags(config.ReviewSkipTags),
-		QueueFilters:               ticketclient.QueueFilters{Tags: splitTicketTags(config.TicketTags)},
+		QueueFilters:               ticketclient.QueueFilters{Tags: splitTicketTags(config.TicketTags), WithoutTags: splitTicketTags(config.TicketWithoutTags)},
 		CodexSandbox:               config.Codex.Sandbox,
 		TicketPrompt:               config.TicketPrompt,
 		PiProvider:                 config.Pi.Provider,
@@ -147,7 +203,7 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		ContainmentTickets:         containmentTickets,
 	}, tickets, agent, store, cleaner)
 	if err != nil {
-		err = orc.NewFailureContextError(orc.FailureContext{Origin: "coder", Operation: "worker execution", Phase: "worker execution"}, err)
+		err = orc.NewFailureContextError(orc.FailureContext{Origin: roleName, Operation: "worker execution", Phase: "worker execution"}, err)
 	}
 	return quietSupervisedCancellation(supervised, ctx, err)
 }

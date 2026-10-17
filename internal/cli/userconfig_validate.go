@@ -195,10 +195,13 @@ func validateRolePolicies(config *FileConfig) error {
 		if err := validateWorkerName(name); err != nil {
 			return fmt.Errorf("role %q: %w", name, err)
 		}
-		if role.TicketQueue != "open" && role.TicketQueue != "review" {
-			return fmt.Errorf("roles.%s.ticket_queue must be open or review", name)
+		if role.TicketQueue != "open" && role.TicketQueue != "review" && role.TicketQueue != "signoff" {
+			return fmt.Errorf("roles.%s.ticket_queue must be open, review, or signoff", name)
 		}
 		if err := validateTicketTagList("roles."+name+".ticket_tags", role.TicketTags); err != nil {
+			return err
+		}
+		if err := validateTicketTagList("roles."+name+".ticket_without_tags", role.TicketWithoutTags); err != nil {
 			return err
 		}
 		if role.TicketQueue == "review" {
@@ -209,6 +212,9 @@ func validateRolePolicies(config *FileConfig) error {
 					}
 				}
 			}
+		}
+		if _, err := resolvedRoleQueueFilters(role, config.Review); err != nil {
+			return fmt.Errorf("roles.%s ticket selector: %w", name, err)
 		}
 		if role.ReviewCompletion != "" && role.TicketQueue != "review" {
 			return fmt.Errorf("roles.%s.review_completion is only valid for review roles", name)

@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -10,15 +12,29 @@ import (
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 )
 
-func setTestLocalLocation(t *testing.T, location *time.Location) {
+const testLocalTimeProcessEnv = "TICKET_ORC_TEST_LOCAL_TIME_PROCESS"
+
+func runWithTestLocalTime(t *testing.T) bool {
 	t.Helper()
-	previous := time.Local
-	time.Local = location
-	t.Cleanup(func() { time.Local = previous })
+	if os.Getenv(testLocalTimeProcessEnv) == "1" {
+		return false
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^"+t.Name()+"$")
+	command.Env = append(os.Environ(), testLocalTimeProcessEnv+"=1")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("local-time subprocess failed: %v\n%s", err, output)
+	}
+	return true
 }
 
 func TestDaemonCompactStatusRendersLocalTimeWithoutChangingJSON(t *testing.T) {
-	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	if runWithTestLocalTime(t) {
+		return
+	}
 	started := time.Date(2026, 9, 28, 1, 30, 0, 0, time.UTC)
 	status := daemon.Status{StartedAt: started}
 	var output bytes.Buffer
@@ -36,7 +52,9 @@ func TestDaemonCompactStatusRendersLocalTimeWithoutChangingJSON(t *testing.T) {
 }
 
 func TestConsoleDetailStatusRendersLocalRepositoryAndWorkerTimes(t *testing.T) {
-	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	if runWithTestLocalTime(t) {
+		return
+	}
 	status := daemon.Status{
 		Repositories: []daemon.RepositoryStatus{{
 			Key:           "project",
@@ -63,7 +81,9 @@ func TestConsoleDetailStatusRendersLocalRepositoryAndWorkerTimes(t *testing.T) {
 }
 
 func TestReviewReportWindowRendersLocalDateAndOffset(t *testing.T) {
-	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	if runWithTestLocalTime(t) {
+		return
+	}
 	report := reviewReport{
 		WindowStart: time.Date(2026, 9, 28, 1, 30, 0, 0, time.UTC),
 		WindowEnd:   time.Date(2026, 9, 29, 1, 30, 0, 0, time.UTC),
@@ -83,7 +103,9 @@ func TestReviewReportWindowRendersLocalDateAndOffset(t *testing.T) {
 }
 
 func TestConsoleWatchTimeAndDateMarkerUseLocalDay(t *testing.T) {
-	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	if runWithTestLocalTime(t) {
+		return
+	}
 	var output bytes.Buffer
 	renderer := &consoleWatchRenderer{}
 	first := time.Date(2026, 9, 28, 6, 59, 59, 0, time.UTC)

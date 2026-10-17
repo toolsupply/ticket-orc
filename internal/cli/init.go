@@ -17,6 +17,7 @@ import (
 func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
 	force := false
 	global := false
+	architect := false
 	for _, arg := range args {
 		switch arg {
 		case "--force":
@@ -29,6 +30,11 @@ func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 				return usageError(stderr, "duplicate flag --global")
 			}
 			global = true
+		case "--architect":
+			if architect {
+				return usageError(stderr, "duplicate flag --architect")
+			}
+			architect = true
 		case "-h", "--help":
 			fmt.Fprint(stdout, initHelp)
 			return 0
@@ -66,6 +72,10 @@ func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 			"coder":    {TicketQueue: "open", NudgePrompt: coderNudgePrompt},
 			"reviewer": {TicketQueue: "review", NudgePrompt: reviewerNudgePrompt, ReviewCompletion: ReviewCompletionClose},
 		},
+	}
+	if architect {
+		config.Roles["reviewer"] = initRoleFile{TicketQueue: "review", NudgePrompt: reviewerNudgePrompt, ReviewCompletion: ReviewCompletionSignoff}
+		config.Roles["architect"] = initRoleFile{TicketQueue: "signoff", NudgePrompt: architectNudgePrompt}
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {

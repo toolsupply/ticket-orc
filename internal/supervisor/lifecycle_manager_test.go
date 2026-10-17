@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 type lifecycleTestWorker struct{ name string }
@@ -148,18 +150,36 @@ func TestLifecycleManagerReloadCommitsWatchersBeforeConcurrentStart(t *testing.T
 	if _, err := manager.Start(context.Background(), "one"); err != nil {
 		t.Fatalf("start initial worker: %v", err)
 	}
-	watching := make(chan struct{})
-	releaseWatchers := make(chan struct{})
+	watchersGate := testutil.NewBarrier()
+	ctx, cancel := context.WithCancel(context.Background())
 	reloaded := make(chan error, 1)
+	reloadDone := make(chan struct{})
+	var startDone chan struct{}
+	t.Cleanup(func() {
+		watchersGate.Release()
+		cancel()
+		for _, operation := range []struct {
+			name string
+			done <-chan struct{}
+		}{{"reload", reloadDone}, {"start", startDone}} {
+			if operation.done == nil {
+				continue
+			}
+			select {
+			case <-operation.done:
+			case <-time.After(time.Second):
+				t.Errorf("%s goroutine did not exit during cleanup", operation.name)
+			}
+		}
+	})
 	go func() {
-		_, err := manager.ApplyReload(context.Background(), map[string]lifecycleTestWorker{
+		defer close(reloadDone)
+		_, err := manager.ApplyReload(ctx, map[string]lifecycleTestWorker{
 			"one": {name: "one"}, "two": {name: "two"},
 		}, ReloadHooks[lifecycleTestWorker]{
 			ReplaceWatchers: func(context.Context) error {
 				watchers.Store(true)
-				close(watching)
-				<-releaseWatchers
-				return nil
+				return watchersGate.Arrive(ctx)
 			},
 			Commit: func([]lifecycleTestWorker, map[string]bool) string {
 				if !watchers.Load() {
@@ -171,22 +191,31 @@ func TestLifecycleManagerReloadCommitsWatchersBeforeConcurrentStart(t *testing.T
 		})
 		reloaded <- err
 	}()
-	<-watching
+	watching, watchingCancel := context.WithTimeout(ctx, time.Second)
+	defer watchingCancel()
+	if err := watchersGate.WaitReached(watching); err != nil {
+		t.Fatalf("wait for watcher replacement: %v", err)
+	}
+	startDone = make(chan struct{})
 	started := make(chan error, 1)
 	go func() {
-		_, err := manager.Start(context.Background(), "two")
+		defer close(startDone)
+		_, err := manager.Start(ctx, "two")
 		started <- err
 	}()
+	// Start's first boundary is the global mutex, with no hook before lock
+	// acquisition. Mutex waits are not durably blocked for synctest.Wait.
+	// Retain this timed assertion until an observable boundary is available.
 	select {
 	case err := <-started:
 		t.Fatalf("start crossed reload commit boundary: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(releaseWatchers)
-	if err := <-reloaded; err != nil {
+	watchersGate.Release()
+	if err := testutil.Receive(t, time.Second, "reload result", reloaded); err != nil {
 		t.Fatalf("apply reload: %v", err)
 	}
-	if err := <-started; err != nil {
+	if err := testutil.Receive(t, time.Second, "start result", started); err != nil {
 		t.Fatalf("start newly configured worker after reload: %v", err)
 	}
 	if _, ok := manager.Worker("two"); !ok || !watchers.Load() || !committed.Load() {

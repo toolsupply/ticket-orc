@@ -28,6 +28,7 @@ type localQueueStub struct {
 	active, ready ticketclient.ListResult
 	activeByQueue map[string]ticketclient.ListResult
 	readyByQueue  map[string]ticketclient.ListResult
+	signoff       ticketclient.ListResult
 	filters       map[string]ticketclient.QueueFilters
 	calls         []string
 	closed        bool
@@ -50,6 +51,14 @@ func (stub *localQueueStub) ReadyFrontier(_ context.Context, queue string, filte
 		return result, nil
 	}
 	return stub.ready, nil
+}
+func (stub *localQueueStub) SignoffFrontier(_ context.Context, filters ticketclient.QueueFilters, limit, offset int) (ticketclient.ListResult, error) {
+	stub.calls = append(stub.calls, "signoff:"+fmt.Sprint(limit)+":"+fmt.Sprint(offset))
+	if stub.filters == nil {
+		stub.filters = make(map[string]ticketclient.QueueFilters)
+	}
+	stub.filters["signoff"] = filters
+	return stub.signoff, nil
 }
 func (stub *localQueueStub) Close() error { stub.closed = true; return nil }
 
@@ -106,6 +115,142 @@ func TestNextUsesReadOnlyClaimsAndReadyFrontier(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(queries.calls, ","), "active:open:20") || !strings.Contains(strings.Join(queries.calls, ","), "active:review:20") || !strings.Contains(strings.Join(queries.calls, ","), "ready:review:20") || !queries.closed {
 		t.Fatalf("Ticket observations=%v closed=%v", queries.calls, queries.closed)
+	}
+}
+
+func TestJoinedSignoffRolesUseFilteredFrontierAndShowOutstandingTarget(t *testing.T) {
+	for _, role := range []string{"architect", "architect-api"} {
+		t.Run(role, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfigFixture(t, filepath.Join(dir, "config.json"), fmt.Sprintf(`{"version":1,"id":"7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"Code."},"architect":{"ticket_queue":"signoff","nudge_prompt":"Accept.","ticket_tags":["accept"],"ticket_without_tags":["blocked"]},"architect-api":{"ticket_queue":"signoff","nudge_prompt":"Accept API.","ticket_tags":["accept"],"ticket_without_tags":["blocked"]}}}`, dir))
+			registration := registerLocalSession(t, dir, role)
+			const target = "20261008-12345"
+			runtime := state.NewSteerRuntimeStore(dir)
+			if err := runtime.Reconcile(context.Background(), []state.SteerRegistration{registration}); err != nil {
+				t.Fatal(err)
+			}
+			if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target); err != nil || !reserved {
+				t.Fatalf("reserve signoff target=%v err=%v", reserved, err)
+			}
+			if completed, err := runtime.CompleteSignoffDelivery(context.Background(), registration, target); err != nil || !completed {
+				t.Fatalf("complete signoff target=%v err=%v", completed, err)
+			}
+			runner, _ := fakeTicketRunner("")
+			lookup := localIdentityEnv(dir)
+			queries := &localQueueStub{signoff: ticketclient.ListResult{Items: []ticketclient.Ticket{{ID: target, State: "signoff", Priority: 1}}}}
+			var output bytes.Buffer
+			if err := nextWithRunner(context.Background(), true, &output, lookup, runner, localQueueFactory(queries)); err != nil {
+				t.Fatalf("next signoff: %v", err)
+			}
+			var next map[string]any
+			if err := json.Unmarshal(output.Bytes(), &next); err != nil {
+				t.Fatal(err)
+			}
+			if next["role"] != role || next["queue"] != "signoff" || next["active_claim"] != false || next["signoff_target"] != target || next["signoff_outcome"] != "awaiting_signoff_outcome" {
+				t.Fatalf("next signoff result=%#v", next)
+			}
+			items, ok := next["items"].([]any)
+			if !ok || len(items) != 1 || items[0].(map[string]any)["queue"] != "signoff" {
+				t.Fatalf("next signoff items=%#v", next["items"])
+			}
+			if !reflect.DeepEqual(queries.filters["signoff"], ticketclient.QueueFilters{Tags: []string{"accept"}, WithoutTags: []string{"blocked"}}) {
+				t.Fatalf("signoff filters=%#v", queries.filters["signoff"])
+			}
+			if strings.Contains(strings.Join(queries.calls, ","), "ready:") || !strings.Contains(strings.Join(queries.calls, ","), "signoff:20:0") {
+				t.Fatalf("signoff frontier calls=%v", queries.calls)
+			}
+
+			loaded, err := loadSteerConfig(lookup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			queries = &localQueueStub{signoff: ticketclient.ListResult{Items: []ticketclient.Ticket{{ID: target, State: "signoff"}}}}
+			result, err := currentSessionStateWithConfig(context.Background(), dir, loaded, lookup, runner, localQueueFactory(queries), func(context.Context, string) (daemon.Status, error) {
+				return daemon.Status{}, nil
+			})
+			if err != nil || result.Role != role || result.RoleQueue != "signoff" || result.ReadyCount != 0 || result.SignoffCount != 1 || result.SignoffTarget != target || result.SignoffOutcome != "awaiting_signoff_outcome" || len(result.ActiveClaims) != 0 {
+				t.Fatalf("signoff session state=%#v err=%v", result, err)
+			}
+			output.Reset()
+			if err := renderCurrentSessionState(&output, result); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"Work: 1 unassigned signoff", "Active: none", "Signoff target: " + target, "Signoff outcome: waiting for a signoff outcome"} {
+				if !strings.Contains(output.String(), want) {
+					t.Errorf("session state omitted %q: %s", want, output.String())
+				}
+			}
+
+			// An existing open/review claim keeps precedence and suppresses a
+			// signoff frontier lookup even for a signoff-configured role.
+			queries = &localQueueStub{activeByQueue: map[string]ticketclient.ListResult{"review": {Items: []ticketclient.Ticket{{ID: "20261008-54321", State: "review", Assignee: "reviewer"}}}}}
+			output.Reset()
+			if err := nextWithRunner(context.Background(), true, &output, lookup, runner, localQueueFactory(queries)); err != nil {
+				t.Fatalf("next with cross-queue claim: %v", err)
+			}
+			if strings.Contains(strings.Join(queries.calls, ","), "signoff:") {
+				t.Fatalf("queried signoff frontier despite active claim: %v", queries.calls)
+			}
+		})
+	}
+}
+
+func TestSignoffLocalViewsShowDurableSendingTargetAsUncertain(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFixture(t, filepath.Join(dir, "config.json"), fmt.Sprintf(`{"version":1,"id":"7e4f5f6d-3a59-49f6-8c2f-e18186ac45aa","local_dir":%q,"default_role":"architect","roles":{"architect":{"ticket_queue":"signoff","nudge_prompt":"Accept."}}}`, dir))
+	registration := registerLocalSession(t, dir, "architect")
+	const target = "20261008-32145"
+	runtime := state.NewSteerRuntimeStore(dir)
+	if err := runtime.Reconcile(context.Background(), []state.SteerRegistration{registration}); err != nil {
+		t.Fatal(err)
+	}
+	if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target); err != nil || !reserved {
+		t.Fatalf("reserve uncertain signoff target=%v err=%v", reserved, err)
+	}
+	runner, _ := fakeTicketRunner("")
+	lookup := localIdentityEnv(dir)
+	queries := &localQueueStub{}
+	var output bytes.Buffer
+	if err := nextWithRunner(context.Background(), true, &output, lookup, runner, localQueueFactory(queries)); err != nil {
+		t.Fatalf("next JSON: %v", err)
+	}
+	var next map[string]any
+	if err := json.Unmarshal(output.Bytes(), &next); err != nil {
+		t.Fatal(err)
+	}
+	if next["delivery"] != "sending notification" || next["signoff_target"] != target || next["signoff_outcome"] != "queue_uncertain" || next["active_claim"] != false {
+		t.Fatalf("next JSON omitted durable uncertainty: %#v", next)
+	}
+
+	output.Reset()
+	if err := nextWithRunner(context.Background(), false, &output, lookup, runner, localQueueFactory(&localQueueStub{})); err != nil {
+		t.Fatalf("next text: %v", err)
+	}
+	for _, want := range []string{"Signoff target: " + target, "Signoff outcome: notification outcome is uncertain"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("next text omitted %q: %s", want, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "Orc reported a delivery issue") {
+		t.Fatalf("next text mislabeled uncertain target: %s", output.String())
+	}
+
+	loaded, err := loadSteerConfig(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := currentSessionStateWithConfig(context.Background(), dir, loaded, lookup, runner, localQueueFactory(&localQueueStub{}), func(context.Context, string) (daemon.Status, error) {
+		return daemon.Status{}, nil
+	})
+	if err != nil || result.SignoffTarget != target || result.SignoffOutcome != "queue_uncertain" || len(result.ActiveClaims) != 0 {
+		t.Fatalf("session state=%#v err=%v", result, err)
+	}
+	output.Reset()
+	if err := renderCurrentSessionState(&output, result); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Signoff target: "+target) || !strings.Contains(output.String(), "Signoff outcome: notification outcome is uncertain") {
+		t.Fatalf("session state omitted uncertainty: %s", output.String())
 	}
 }
 

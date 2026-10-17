@@ -12,6 +12,7 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/state"
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
@@ -29,10 +30,14 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 	codexLog := filepath.Join(root, "codex.jsonl")
 	ticketLog := filepath.Join(root, "ticket.log")
 	watchEventFile := filepath.Join(root, "watch-event")
+	activeFile := filepath.Join(root, "active-claim")
 	if err := os.WriteFile(codexLog, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(ticketLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activeFile, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	const actor = "dynamic-coder"
@@ -42,7 +47,7 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 		"TICKET_ORC_FAKE_REPOSITORY_ID": integrationRepositoryID(root), "TICKET_ORC_FAKE_TICKET_LOG": ticketLog,
 		"TICKET_ORC_FAKE_WATCH_EVENT_FILE": watchEventFile,
 		"TICKET_ORC_FAKE_CODEX_LOG":        codexLog, "TICKET_ORC_FAKE_TICKET_ID": integrationTicketID,
-		"TICKET_ORC_FAKE_READY_SEQUENCE": "1,1,0", "TICKET_ORC_FAKE_ACTIVE_SEQUENCE": "0,0,1,0,0,0",
+		"TICKET_ORC_FAKE_READY_SEQUENCE": "1,1,0", "TICKET_ORC_FAKE_ACTIVE_FILE": activeFile,
 		"TICKET_ACTOR": actor, "CODEX_HOME": codexHome, "CODEX_THREAD_ID": thread,
 	}
 	init := exec.Command(binary, "init")
@@ -93,7 +98,7 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 	localDir := filepath.Join(root, ".local")
 	prompt := config.Roles["coder"].NudgePrompt
 	reviewerPrompt := config.Roles["reviewer"].NudgePrompt
-	if !strings.Contains(reviewerPrompt, "substantive review") || !strings.Contains(reviewerPrompt, "specification compliance") || strings.Contains(strings.ToLower(reviewerPrompt), "approve") || strings.Contains(strings.ToLower(reviewerPrompt), "close") || strings.Contains(strings.ToLower(reviewerPrompt), "skill") {
+	if !strings.Contains(reviewerPrompt, "substantive independent review") || !strings.Contains(reviewerPrompt, "specification compliance") || strings.Contains(strings.ToLower(reviewerPrompt), "approve") || strings.Contains(strings.ToLower(reviewerPrompt), "close") || strings.Contains(strings.ToLower(reviewerPrompt), "skill") {
 		t.Fatalf("init reviewer nudge is incomplete or contains lifecycle/Skill policy: %q", reviewerPrompt)
 	}
 	if got := readText(ticketLog); got != "" {
@@ -155,28 +160,34 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 	// Initial READY establishes the watch baseline. Signal one repository change
 	// after the first wake; that event must trigger an authoritative targeted
 	// query that observes the active claim, without an idle safety sweep.
-	firstWakeDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(firstWakeDeadline) && len(readCodexCalls(t, codexLog)) < 1 {
-		time.Sleep(25 * time.Millisecond)
-	}
-	if len(readCodexCalls(t, codexLog)) != 1 {
+	firstDelivery := awaitSteerDelivery(t, localDir, actor, time.Time{}, 10*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "queued" || delivery.State == "consumed"
+	}, func() string {
+		return "codex=" + readText(codexLog) + " ticket=" + readText(ticketLog) +
+			" runtime=" + readText(filepath.Join(localDir, "steer-runtime.json"))
+	})
+	if got := len(readCodexCalls(t, codexLog)); got != 1 {
 		_ = cmd.Process.Kill()
-		t.Fatalf("initial Codex wake was not sent; ticket=%q runtime=%q", readText(ticketLog), readText(filepath.Join(localDir, "steer-runtime.json")))
+		t.Fatalf("initial Codex wakes=%d, want one after delivery persistence; ticket=%q runtime=%q", got, readText(ticketLog), readText(filepath.Join(localDir, "steer-runtime.json")))
 	}
 	if got := readText(ticketLog); !strings.Contains(got, "ready open --tag backend --tag urgent --limit 1 --fields id") {
 		_ = cmd.Process.Kill()
 		t.Fatalf("steering readiness did not use the complete configured role selector: %q", got)
 	}
+	if err := os.WriteFile(activeFile, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(watchEventFile, []byte("change"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	claimDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(claimDeadline) && countTicketRequest(ticketLog, "list --state open") < 2 {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if got := countTicketRequest(ticketLog, "list --state open"); got < 2 {
-		_ = cmd.Process.Kill()
-		t.Fatalf("active claim was not observed after the repository watch event; open-queue observations=%d ticket=%q", got, readText(ticketLog))
+	eventDelivery := awaitSteerDelivery(t, localDir, actor, firstDelivery.UpdatedAt, 10*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "consumed"
+	}, func() string {
+		return "codex=" + readText(codexLog) + " ticket=" + readText(ticketLog) +
+			" runtime=" + readText(filepath.Join(localDir, "steer-runtime.json"))
+	})
+	if err := os.WriteFile(activeFile, []byte("0"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	resume := exec.Command(binary, "resume", "--config", configPath)
 	resume.Dir = root
@@ -184,24 +195,24 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 	if output, err := resume.CombinedOutput(); err != nil {
 		t.Fatalf("daemon resume after claim observation failed: %v: %s", err, output)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		calls := readCodexCalls(t, codexLog)
-		if len(calls) >= 2 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	awaitSteerDelivery(t, localDir, actor, eventDelivery.UpdatedAt, 5*time.Second, func(delivery state.SteerDelivery) bool {
+		return delivery.State == "queued"
+	}, func() string {
+		return "codex=" + readText(codexLog) + " ticket=" + readText(ticketLog) +
+			" runtime=" + readText(filepath.Join(localDir, "steer-runtime.json")) +
+			" stdout=" + readText(filepath.Join(root, "run.out")) + " stderr=" + readText(filepath.Join(root, "run.err"))
+	})
 	calls := readCodexCalls(t, codexLog)
 	if len(calls) != 2 {
 		_ = cmd.Process.Kill()
 		t.Fatalf("Codex wakes=%d, want exactly two; codex=%q ticket=%q runtime=%q stdout=%q stderr=%q", len(calls), readText(codexLog), readText(ticketLog), readText(filepath.Join(localDir, "steer-runtime.json")), readText(filepath.Join(root, "run.out")), readText(filepath.Join(root, "run.err")))
 	}
-	if !strings.Contains(calls[0].Prompt, "[ticket-orc] This session is registered for Orc-steered Ticket work.") || !strings.Contains(calls[0].Prompt, prompt) {
-		t.Fatalf("first wake prompt=%q, want bootstrap and configured role prompt", calls[0].Prompt)
+	const oneItemBoundary = "For this turn, use Ticket's authoritative selection and claim flow"
+	if !strings.Contains(calls[0].Prompt, "[ticket-orc] This session is registered for Orc-steered Ticket work.") || !strings.Contains(calls[0].Prompt, oneItemBoundary) || !strings.Contains(calls[0].Prompt, prompt) {
+		t.Fatalf("first wake prompt=%q, want bootstrap, one-item boundary and configured role prompt", calls[0].Prompt)
 	}
-	if calls[1].Prompt != prompt {
-		t.Fatalf("second wake prompt=%q, want configured role prompt", calls[1].Prompt)
+	if !strings.Contains(calls[1].Prompt, oneItemBoundary) || !strings.Contains(calls[1].Prompt, prompt) || strings.Index(calls[1].Prompt, oneItemBoundary) > strings.Index(calls[1].Prompt, prompt) {
+		t.Fatalf("second wake prompt=%q, want one-item boundary before configured role prompt", calls[1].Prompt)
 	}
 	if strings.Contains(calls[1].Prompt, "[ticket-orc] This session is registered for Orc-steered Ticket work.") {
 		t.Fatalf("second wake repeated bootstrap prompt: %q", calls[1].Prompt)
@@ -225,6 +236,26 @@ func TestDynamicSteerExecutableSendsSecondWakeAfterClaimEvidence(t *testing.T) {
 		t.Fatalf("scheduler mutated/claimed Ticket work: %q", readText(ticketLog))
 	}
 	_ = cmd.Process.Kill()
+}
+
+func awaitSteerDelivery(t *testing.T, localDir, actor string, after time.Time, timeout time.Duration, condition func(state.SteerDelivery) bool, diagnostics func() string) state.SteerDelivery {
+	t.Helper()
+	store := state.NewSteerRuntimeStore(localDir)
+	var current state.SteerDelivery
+	testutil.Await(t, timeout, "persisted steer delivery update", func() bool {
+		snapshot, err := store.Snapshot(t.Context())
+		if err != nil {
+			return false
+		}
+		for _, delivery := range snapshot.Deliveries {
+			if delivery.Actor == actor {
+				current = delivery
+				return delivery.UpdatedAt.After(after) && condition(delivery)
+			}
+		}
+		return false
+	}, diagnostics)
+	return current
 }
 
 func containsPair(args []string, key, value string) bool {

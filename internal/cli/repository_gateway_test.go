@@ -191,7 +191,10 @@ func TestTicketTransportFailureDoesNotAssertMutationWasNotApplied(t *testing.T) 
 	if err := server.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	t.Cleanup(func() {
+		_ = server.Close()
+		waitForTestDaemonStopped(t, server)
+	})
 	request, err := http.NewRequest(http.MethodPost, server.Endpoint().CapabilityURL()+"/v1/repositories/"+joinTestRepositoryID+"/tickets", strings.NewReader(`{"actor":"ui","title":"example"}`))
 	if err != nil {
 		t.Fatal(err)

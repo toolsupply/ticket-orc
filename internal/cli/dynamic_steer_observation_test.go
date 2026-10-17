@@ -99,8 +99,15 @@ func TestDynamicSteerReconcilesMatchingWorkAfterCrossQueueClaimEnds(t *testing.T
 	dirty := newSteerDirtySet()
 	queued := make(chan string, 1)
 	reconciled := make(chan struct{}, 1)
+	consumed := make(chan struct{}, 1)
 	statuses := &dynamicSteerStatus{}
 	statuses.setPublisher(func(event daemon.Event) {
+		if event.Type == "steer.status" && event.Actor == registration.Actor && event.State == string(orc.SteerConsumed) && event.Ticket == "20260926-00001" {
+			select {
+			case consumed <- struct{}{}:
+			default:
+			}
+		}
 		if event.Type == "steer.status" && event.Actor == registration.Actor && event.State == string(orc.SteerQueued) {
 			select {
 			case reconciled <- struct{}{}:
@@ -120,9 +127,11 @@ func TestDynamicSteerReconcilesMatchingWorkAfterCrossQueueClaimEnds(t *testing.T
 			}), statuses, persistence, newRegistrationObserver(state.NewRegistrationStore(dir)), nil, dirty)
 	}()
 	t.Cleanup(func() { cancel(); <-done })
-	waitSteerStatus(t, statuses, func(items []daemon.SteerStatus) bool {
-		return len(items) == 1 && items[0].State == string(orc.SteerConsumed) && items[0].Ticket == "20260926-00001"
-	})
+	select {
+	case <-consumed:
+	case <-time.After(time.Second):
+		t.Fatal("consumed status was not published")
+	}
 	select {
 	case message := <-queued:
 		t.Fatalf("active claim caused a new-work notification: %q", message)

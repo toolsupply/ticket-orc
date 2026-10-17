@@ -194,6 +194,32 @@ Concurrency behavior must be explicit and testable.
 For concurrency-sensitive changes, add a focused regression and run the race
 detector for the affected packages.
 
+## Asynchronous tests
+
+Tests must synchronize on the authoritative completion milestone for the
+behavior being asserted, not on elapsed time.
+
+* Do not use `time.Sleep` to wait for a goroutine, scheduler pass, HTTP
+  response, subprocess operation, state write, or event publication to
+  probably finish.
+* A channel send or receive proves only that handoff. It does not prove that
+  downstream work caused by it has completed.
+* Use timeouts as failure guards around deterministic completion signals, not
+  as synchronization mechanisms. Platform-specific timeout values are valid
+  only as failure guards.
+* For in-process work, prefer a synchronous step, explicit completion signal,
+  event probe, barrier, or `testing/synctest`. Reserve shared polling for real
+  process, filesystem, or OS boundaries, and wait for the external condition
+  the assertion requires.
+* Negative assertions should normally follow a completion barrier: finish the
+  relevant operation, then assert that the unwanted event did not occur.
+* Keep state-machine logic synchronous where possible and test event-loop
+  wiring separately. Preserve concurrency tests when interleaving is part of
+  the contract, and control that interleaving with explicit barriers.
+* Register cleanup before blocking. Cleanup must release test gates, cancel
+  background work, and wait for goroutine or process exit with bounded failure
+  guards.
+
 ## Lean design discipline
 
 Before adding a type, interface, package, state field, callback, retry, or

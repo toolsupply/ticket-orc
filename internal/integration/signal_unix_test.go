@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 func TestExecutableSIGTERMCancelsChildrenWithoutRespawn(t *testing.T) {
@@ -72,14 +74,16 @@ func TestExecutableSIGTERMCancelsChildrenWithoutRespawn(t *testing.T) {
 
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
-			return
+	testutil.Await(t, 5*time.Second, "non-empty file "+path, func() bool {
+		info, err := os.Stat(path)
+		return err == nil && info.Size() > 0
+	}, func() string {
+		if info, err := os.Stat(path); err != nil {
+			return err.Error()
+		} else {
+			return "file size=" + strconv.FormatInt(info.Size(), 10)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", path)
+	})
 }
 
 func waitCommand(t *testing.T, cmd *exec.Cmd) error {
@@ -101,12 +105,7 @@ func waitProcessGone(t *testing.T, pid int) {
 	if pid <= 0 {
 		t.Fatalf("invalid child PID %d", pid)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("child process %d is still alive", pid)
+	testutil.Await(t, 5*time.Second, "process exit for PID "+strconv.Itoa(pid), func() bool {
+		return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	}, func() string { return "process is still visible to signal 0" })
 }

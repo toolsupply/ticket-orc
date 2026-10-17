@@ -316,6 +316,12 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 	builtinPrompt := orc.CoderTicketPromptTemplate
 	if role == RoleReviewer {
 		builtinPrompt = orc.ReviewerTicketPromptTemplate
+	} else if roleDefaults.TicketQueue == "signoff" {
+		builtinPrompt = orc.AcceptanceTicketPromptTemplate
+	}
+	defaultActor := string(role)
+	if roleDefaults.TicketQueue == "signoff" {
+		defaultActor = "architect"
 	}
 
 	value := func(flag, env, workerValue, roleValue, defaultValue, builtin string) string {
@@ -388,7 +394,7 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		RoleName:                   roleName,
 		TicketQueue:                roleDefaults.TicketQueue,
 		Harness:                    value("harness", "TICKET_ORC_HARNESS", workerString(worker, func(w WorkerFileConfig) string { return w.Harness }), roleDefaults.Harness, loaded.Config.Defaults.Harness, defaultHarness),
-		Actor:                      value("actor", "TICKET_ORC_ACTOR", workerString(worker, func(w WorkerFileConfig) string { return w.Actor }), roleDefaults.Actor, "", string(role)),
+		Actor:                      value("actor", "TICKET_ORC_ACTOR", workerString(worker, func(w WorkerFileConfig) string { return w.Actor }), roleDefaults.Actor, "", defaultActor),
 		Model:                      value("model", "TICKET_ORC_MODEL", workerString(worker, func(w WorkerFileConfig) string { return w.Model }), roleDefaults.Model, loaded.Config.Defaults.Model, ""),
 		Reasoning:                  value("reasoning", "TICKET_ORC_REASONING", workerString(worker, func(w WorkerFileConfig) string { return w.Reasoning }), roleDefaults.Reasoning, loaded.Config.Defaults.Reasoning, ""),
 		SessionPolicy:              supervisor.SessionPolicy(value("session-policy", "TICKET_ORC_SESSION_POLICY", workerString(worker, func(w WorkerFileConfig) string { return w.SessionPolicy }), roleDefaults.SessionPolicy, loaded.Config.Defaults.SessionPolicy, defaultSessionPolicy)),
@@ -408,11 +414,15 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		Pi:                         supervisor.PiFileConfig{Provider: value("pi-provider", "TICKET_ORC_PI_PROVIDER", workerString(worker, func(w WorkerFileConfig) string { return w.Pi.Provider }), roleDefaults.Pi.Provider, loaded.Config.Defaults.Pi.Provider, "")},
 		Claude:                     supervisor.ClaudeFileConfig{PermissionMode: value("claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE", workerString(worker, func(w WorkerFileConfig) string { return w.Claude.PermissionMode }), roleDefaults.Claude.PermissionMode, loaded.Config.Defaults.Claude.PermissionMode, "")},
 	}
-	filters, err := resolvedRoleQueueFilters(roleDefaults, loaded.Config.Review)
+	filters, err := ticketclient.CanonicalQueueFilters(ticketclient.QueueFilters{
+		Tags:        roleDefaults.TicketTags,
+		WithoutTags: roleDefaults.TicketWithoutTags,
+	})
 	if err != nil {
 		return supervisor.RoleConfig{}, false, err
 	}
 	config.TicketTags = strings.Join(filters.Tags, "\x1f")
+	config.TicketWithoutTags = strings.Join(filters.WithoutTags, "\x1f")
 	if role == RoleReviewer {
 		config.ReviewCompletion = value("review-completion", "TICKET_ORC_REVIEW_COMPLETION", workerString(worker, func(w WorkerFileConfig) string { return w.ReviewCompletion }), roleDefaults.ReviewCompletion, loaded.Config.Defaults.ReviewCompletion, ReviewCompletionSignoff)
 	} else {
@@ -430,11 +440,31 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 }
 
 func resolvedRoleQueueFilters(role RoleFileConfig, review ReviewFileConfig) (ticketclient.QueueFilters, error) {
-	filters := ticketclient.QueueFilters{Tags: append([]string(nil), role.TicketTags...)}
+	filters := ticketclient.QueueFilters{
+		Tags:        append([]string(nil), role.TicketTags...),
+		WithoutTags: append([]string(nil), role.TicketWithoutTags...),
+	}
 	if role.TicketQueue == "review" {
-		filters.WithoutTags = append([]string(nil), review.SkipTags...)
+		filters.WithoutTags = mergeTicketTags(filters.WithoutTags, review.SkipTags)
 	}
 	return ticketclient.CanonicalQueueFilters(filters)
+}
+
+// mergeTicketTags forms an effective selector union before QueueFilters applies
+// its distinct-tag limit. Callers validate each configured list independently.
+func mergeTicketTags(groups ...[]string) []string {
+	var merged []string
+	seen := make(map[string]struct{})
+	for _, group := range groups {
+		for _, tag := range group {
+			if _, ok := seen[tag]; ok {
+				continue
+			}
+			seen[tag] = struct{}{}
+			merged = append(merged, tag)
+		}
+	}
+	return merged
 }
 
 func canonicalReviewSkipTags(tags []string) []string {
@@ -592,7 +622,11 @@ func validateRoleConfig(config supervisor.RoleConfig, values map[string]string, 
 			return configValidation("claude_permission_mode.invalid", "claude.permission_mode", "Claude permission mode is invalid", "choose a supported permission mode")
 		}
 	}
-	if err := orc.ValidateTicketPrompt(config.TicketPrompt, string(config.Role)); err != nil {
+	promptRole := string(config.Role)
+	if config.TicketQueue == "signoff" {
+		promptRole = "acceptance"
+	}
+	if err := orc.ValidateTicketPrompt(config.TicketPrompt, promptRole); err != nil {
 		return configValidationDetail("ticket_prompt.invalid", "ticket_prompt", "ticket prompt is invalid", "use the role ticket prompt template", err.Error())
 	}
 	if err := validateHarnessNamespace(config, values, lookupEnv); err != nil {

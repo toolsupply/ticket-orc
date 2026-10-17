@@ -84,7 +84,7 @@ func TestMainPageCommandsHaveHelpPaths(t *testing.T) {
 		usage   string
 	}{
 		{"init", []string{"help", "init"}, "ticket-orc init"},
-		{"join", []string{"help", "join"}, "ticket-orc join"},
+		{"join", []string{"help", "join"}, "Configured signoff roles can join through this command"},
 		{"leave", []string{"help", "leave"}, "ticket-orc leave"},
 		{"whoami", []string{"help", "whoami"}, "ticket-orc whoami"},
 		{"state", []string{"help", "state"}, "ticket-orc state"},
@@ -179,7 +179,7 @@ func TestConfigCheckHelpDescribesRoleTagRouting(t *testing.T) {
 	if code := run([]string{"help", "config", "check"}, &stdout, &stderr, emptyEnv, rejectExecution); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("config check help: code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"roles.<name>.ticket_tags", "every listed tag is", "review.skip_tags", "committed reload", "running managed workers"} {
+	for _, want := range []string{"roles.<name>.ticket_tags", "every listed tag is", "review.skip_tags", "committed reload", "running managed workers", "one unassigned signoff entry", "one exact unclaimed ticket per wake", "atomic human handoff", "Overlapping signoff selectors"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("config check help omitted %q: %q", want, stdout.String())
 		}

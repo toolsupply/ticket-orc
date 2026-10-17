@@ -11,6 +11,7 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/daemonclient"
+	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/steertransport"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
@@ -30,6 +31,7 @@ type localTicket struct {
 type localTicketReader interface {
 	ActiveClaims(context.Context, string, int) (ticketclient.ListResult, error)
 	ReadyFrontier(context.Context, string, ticketclient.QueueFilters, int) (ticketclient.ListResult, error)
+	SignoffFrontier(context.Context, ticketclient.QueueFilters, int, int) (ticketclient.ListResult, error)
 	Close() error
 }
 
@@ -51,7 +53,11 @@ type currentSessionState struct {
 	ActiveQueues     []string      `json:"active_queues,omitempty"`
 	ReadyCount       int           `json:"ready_count"`
 	ReadyMore        bool          `json:"ready_more,omitempty"`
+	SignoffCount     int           `json:"signoff_count,omitempty"`
+	SignoffMore      bool          `json:"signoff_more,omitempty"`
 	ActiveClaims     []localTicket `json:"active_claims"`
+	SignoffTarget    string        `json:"signoff_target,omitempty"`
+	SignoffOutcome   string        `json:"signoff_outcome,omitempty"`
 	Delivery         string        `json:"delivery,omitempty"`
 	DeliveryCode     string        `json:"delivery_code,omitempty"`
 	ManagedOwner     string        `json:"managed_owner,omitempty"`
@@ -128,7 +134,7 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 	result.Role = registration.Role
 	result.Harness = registration.Harness
 	role, ok := loaded.Config.Roles[registration.Role]
-	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
+	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review" && role.TicketQueue != "signoff") {
 		return result, fmt.Errorf("registered role %q has no supported Ticket queue", registration.Role)
 	}
 	result.Queue = role.TicketQueue
@@ -152,11 +158,15 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 		if err != nil {
 			return result, fmt.Errorf("resolve role Ticket filters: %w", err)
 		}
-		ready, err := client.ReadyFrontier(ctx, role.TicketQueue, filters, localTicketLimit)
+		ready, err := localRoleFrontier(ctx, client, role.TicketQueue, filters)
 		if err != nil {
 			return result, fmt.Errorf("read Ticket ready frontier: %w", err)
 		}
-		result.ReadyCount, result.ReadyMore = len(ready.Items), ready.More
+		if role.TicketQueue == "signoff" {
+			result.SignoffCount, result.SignoffMore = len(ready.Items), ready.More
+		} else {
+			result.ReadyCount, result.ReadyMore = len(ready.Items), ready.More
+		}
 	}
 	delivery, ok, err := findCurrentDelivery(ctx, localDir, registration)
 	if err != nil {
@@ -164,6 +174,10 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 	}
 	if ok {
 		result.Delivery, result.DeliveryCode = delivery.State, delivery.Code
+		if delivery.TargetTicket != "" {
+			result.SignoffTarget = delivery.TargetTicket
+			result.SignoffOutcome = signoffOutcomeCode(delivery)
+		}
 	}
 	if readStatus == nil {
 		result.StatusCode = "daemon_status_unavailable"
@@ -229,6 +243,20 @@ func openLocalTicketReader(identity currentTicketIdentity) (localTicketReader, e
 	return ticketclient.NewWithWorkingDirAndTarget(identity.Actor, identity.RepositoryPath, ticketclient.Target{Repository: identity.RepositoryPath})
 }
 
+func localRoleFrontier(ctx context.Context, client localTicketReader, queue string, filters ticketclient.QueueFilters) (ticketclient.ListResult, error) {
+	if queue == "signoff" {
+		return client.SignoffFrontier(ctx, filters, localTicketLimit, 0)
+	}
+	return client.ReadyFrontier(ctx, queue, filters, localTicketLimit)
+}
+
+func signoffOutcomeCode(delivery state.SteerDelivery) string {
+	if delivery.Code != "" {
+		return delivery.Code
+	}
+	return orc.SignoffAwaitingCode(orc.SteerDeliveryState(delivery.State))
+}
+
 func localTickets(items []ticketclient.Ticket, queue string) []localTicket {
 	result := make([]localTicket, 0, len(items))
 	for _, item := range items {
@@ -261,7 +289,9 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 		return nil
 	}
 	work := "none"
-	if result.ReadyCount > 0 {
+	if result.RoleQueue == "signoff" && result.SignoffCount > 0 {
+		work = readyCountLabel(result.SignoffCount, result.SignoffMore) + " unassigned signoff"
+	} else if result.ReadyCount > 0 {
 		work = readyCountLabel(result.ReadyCount, result.ReadyMore) + " ready"
 	}
 	fmt.Fprintf(out, "Role: %s\nWork: %s\n", result.Role, work)
@@ -277,6 +307,9 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 		}
 	}
 	fmt.Fprintf(out, "Delivery: %s\n", humanDelivery(result.Delivery))
+	if result.SignoffTarget != "" {
+		fmt.Fprintf(out, "Signoff target: %s\nSignoff outcome: %s\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome))
+	}
 	if result.ManagedOwner != "" {
 		fmt.Fprintln(out, "State: conflict")
 		fmt.Fprintf(out, "Reason: actor is owned by managed worker %s\n", result.ManagedOwner)
@@ -338,6 +371,8 @@ func humanDeliveryCode(code string) string {
 		return "no ready work is available"
 	case "awaiting_claim":
 		return "waiting for a Ticket claim"
+	case "awaiting_signoff_outcome":
+		return "waiting for a signoff outcome"
 	case "consumed":
 		return "Ticket work is active"
 	case "invalid_state":
@@ -443,7 +478,7 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		return fmt.Errorf("verify current steer endpoint: %w", err)
 	}
 	role, ok := loaded.Config.Roles[registration.Role]
-	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review") {
+	if !ok || (role.TicketQueue != "open" && role.TicketQueue != "review" && role.TicketQueue != "signoff") {
 		return fmt.Errorf("registered role %q has no supported Ticket queue", registration.Role)
 	}
 	client, err := open(identity)
@@ -462,7 +497,7 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		if err != nil {
 			return fmt.Errorf("resolve role Ticket filters: %w", err)
 		}
-		ready, err = client.ReadyFrontier(ctx, role.TicketQueue, filters, localTicketLimit)
+		ready, err = localRoleFrontier(ctx, client, role.TicketQueue, filters)
 		if err != nil {
 			return fmt.Errorf("read Ticket ready frontier: %w", err)
 		}
@@ -473,23 +508,29 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		activeQueue = activeQueues[0]
 	}
 	result := struct {
-		Role         string        `json:"role"`
-		Harness      string        `json:"harness"`
-		Session      string        `json:"session"`
-		Delivery     string        `json:"delivery"`
-		Queue        string        `json:"queue"`
-		RoleQueue    string        `json:"role_queue"`
-		ActiveQueue  string        `json:"active_queue,omitempty"`
-		ActiveQueues []string      `json:"active_queues,omitempty"`
-		Active       bool          `json:"active_claim"`
-		Items        []localTicket `json:"items"`
-		More         bool          `json:"more,omitempty"`
+		Role           string        `json:"role"`
+		Harness        string        `json:"harness"`
+		Session        string        `json:"session"`
+		Delivery       string        `json:"delivery"`
+		Queue          string        `json:"queue"`
+		RoleQueue      string        `json:"role_queue"`
+		ActiveQueue    string        `json:"active_queue,omitempty"`
+		ActiveQueues   []string      `json:"active_queues,omitempty"`
+		Active         bool          `json:"active_claim"`
+		Items          []localTicket `json:"items"`
+		More           bool          `json:"more,omitempty"`
+		SignoffTarget  string        `json:"signoff_target,omitempty"`
+		SignoffOutcome string        `json:"signoff_outcome,omitempty"`
 	}{Role: registration.Role, Harness: registration.Harness, Session: identity.SessionID, Queue: role.TicketQueue, RoleQueue: role.TicketQueue,
 		ActiveQueue: activeQueue, ActiveQueues: activeQueues, Active: len(activeItems) > 0, Items: items, More: ready.More}
 	if delivery, found, deliveryErr := findCurrentDelivery(ctx, loaded.Instance.LocalDir, registration); deliveryErr != nil {
 		return fmt.Errorf("read delivery status: %w", deliveryErr)
 	} else if found {
 		result.Delivery = humanDelivery(delivery.State)
+		if delivery.TargetTicket != "" {
+			result.SignoffTarget = delivery.TargetTicket
+			result.SignoffOutcome = signoffOutcomeCode(delivery)
+		}
 	} else {
 		result.Delivery = "none"
 	}
@@ -499,8 +540,15 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		return encoder.Encode(result)
 	}
 	fmt.Fprintf(stdout, "Role: %s\nSession: %s\nDelivery: %s\n\n", result.Role, shortIdentity(result.Session), result.Delivery)
+	if result.SignoffTarget != "" {
+		fmt.Fprintf(stdout, "Signoff target: %s\nSignoff outcome: %s\n\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome))
+	}
 	if len(items) == 0 {
-		fmt.Fprintln(stdout, "none ready")
+		if role.TicketQueue == "signoff" {
+			fmt.Fprintln(stdout, "no unassigned signoff entries")
+		} else {
+			fmt.Fprintln(stdout, "none ready")
+		}
 		return nil
 	}
 	if result.Active {
@@ -510,7 +558,11 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		}
 		fmt.Fprintf(stdout, "Active claim (%s queue):\n", label)
 	} else {
-		fmt.Fprintf(stdout, "%s ready\n", readyCountLabel(len(ready.Items), ready.More))
+		if role.TicketQueue == "signoff" {
+			fmt.Fprintf(stdout, "%s unassigned signoff\n", readyCountLabel(len(ready.Items), ready.More))
+		} else {
+			fmt.Fprintf(stdout, "%s ready\n", readyCountLabel(len(ready.Items), ready.More))
+		}
 	}
 	for _, item := range items {
 		prefix := fmt.Sprintf("P%d  %s", item.Priority, item.ID)
@@ -521,7 +573,11 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		}
 	}
 	if result.More {
-		fmt.Fprintln(stdout, "more ready work exists")
+		if role.TicketQueue == "signoff" {
+			fmt.Fprintln(stdout, "more unassigned signoff entries exist")
+		} else {
+			fmt.Fprintln(stdout, "more ready work exists")
+		}
 	}
 	return nil
 }

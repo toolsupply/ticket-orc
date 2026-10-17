@@ -31,7 +31,9 @@ func TestContextTelemetrySummaryShowsKnownAndStaleValues(t *testing.T) {
 }
 
 func TestContextTelemetrySummaryUsesLocalTimestampAcrossDateBoundary(t *testing.T) {
-	setTestLocalLocation(t, time.FixedZone("test-local", -7*60*60))
+	if runWithTestLocalTime(t) {
+		return
+	}
 	observedAt := time.Date(2026, 9, 28, 1, 30, 0, 0, time.UTC)
 	telemetry := contextheadroom.Telemetry{Known: true, Used: 800, Window: 1000, Remaining: 200, ObservedAt: observedAt}
 	now := observedAt.Add(time.Hour)

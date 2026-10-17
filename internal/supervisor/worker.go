@@ -72,6 +72,7 @@ type RoleConfig struct {
 	ReviewCompletion   string
 	ReviewFinalGate    string
 	TicketTags         string
+	TicketWithoutTags  string
 	ReviewSkipTags     string
 	TicketPrompt       string
 	Codex              CodexFileConfig

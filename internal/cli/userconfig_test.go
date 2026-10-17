@@ -484,6 +484,8 @@ func TestLoadFileConfigStrictJSONAndFinalSchema(t *testing.T) {
 		{"duplicate review tag", `{"version":1,"review":{"skip_tags":["trivial","trivial"]}}`, "duplicate"},
 		{"invalid review tag", `{"version":1,"review":{"skip_tags":["needs review"]}}`, "invalid Ticket tag"},
 		{"invalid role tag punctuation", `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["to:team-a"]}}}`, "invalid Ticket tag"},
+		{"invalid role excluded tag", `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_without_tags":["to:team-a"]}}}`, "invalid Ticket tag"},
+		{"required role tag excluded", `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["urgent"],"ticket_without_tags":["urgent"]}}}`, "both required and excluded"},
 		{"contradictory review tag", `{"version":1,"default_role":"reviewer","review":{"skip_tags":["no-review"]},"roles":{"reviewer":{"ticket_queue":"review","nudge_prompt":"work","ticket_tags":["no-review"]}}}`, "excluded by review.skip_tags"},
 	}
 	for _, test := range tests {
@@ -509,7 +511,7 @@ func TestLoadFileConfigStrictJSONAndFinalSchema(t *testing.T) {
 
 func TestRoleTicketTagsParsingAndResolvedCanonicalization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["urgent","backend"]},"reviewer":{"ticket_queue":"review","nudge_prompt":"review"}},"review":{"skip_tags":["no-review"]}}`)
+	writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work","ticket_tags":["urgent","backend"],"ticket_without_tags":["blocked","draft"]},"reviewer":{"ticket_queue":"review","nudge_prompt":"review","ticket_without_tags":["draft"]}},"review":{"skip_tags":["no-review"]}}`)
 	loaded, err := LoadFileConfig(filepath.Dir(path), path, true)
 	if err != nil {
 		t.Fatalf("LoadFileConfig: %v", err)
@@ -518,16 +520,19 @@ func TestRoleTicketTagsParsingAndResolvedCanonicalization(t *testing.T) {
 		t.Fatalf("parsed ticket_tags = %#v", loaded.Config.Roles["coder"].TicketTags)
 	}
 	role := loaded.Config.Roles["coder"]
+	if !reflect.DeepEqual(role.TicketWithoutTags, []string{"blocked", "draft"}) {
+		t.Fatalf("parsed ticket_without_tags = %#v", role.TicketWithoutTags)
+	}
 	originalTags := append([]string(nil), role.TicketTags...)
 	filters, err := resolvedRoleQueueFilters(role, loaded.Config.Review)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := ticketclient.QueueFilters{Tags: []string{"backend", "urgent"}}
+	want := ticketclient.QueueFilters{Tags: []string{"backend", "urgent"}, WithoutTags: []string{"blocked", "draft"}}
 	if !reflect.DeepEqual(filters, want) {
 		t.Fatalf("open role filters = %#v, want %#v", filters, want)
 	}
-	if !reflect.DeepEqual(role.TicketTags, originalTags) {
+	if !reflect.DeepEqual(role.TicketTags, originalTags) || !reflect.DeepEqual(role.TicketWithoutTags, []string{"blocked", "draft"}) {
 		t.Fatalf("selector resolution mutated parsed config: %#v", role.TicketTags)
 	}
 	role.TicketTags = []string{"urgent", "backend"}
@@ -547,7 +552,7 @@ func TestRoleTicketTagsParsingAndResolvedCanonicalization(t *testing.T) {
 	}
 	reviewer := loaded.Config.Roles["reviewer"]
 	reviewFilters, err := resolvedRoleQueueFilters(reviewer, loaded.Config.Review)
-	if err != nil || !reflect.DeepEqual(reviewFilters, ticketclient.QueueFilters{WithoutTags: []string{"no-review"}}) {
+	if err != nil || !reflect.DeepEqual(reviewFilters, ticketclient.QueueFilters{WithoutTags: []string{"draft", "no-review"}}) {
 		t.Fatalf("review filters = %#v, %v", reviewFilters, err)
 	}
 }
@@ -575,24 +580,72 @@ func TestTicketTagListBoundaries(t *testing.T) {
 	}
 }
 
+func TestReviewExclusionUnionDeduplicatesBeforeEffectiveLimit(t *testing.T) {
+	tags := func(start, count int) []string {
+		result := make([]string, count)
+		for i := range result {
+			result[i] = fmt.Sprintf("excluded-%02d", start+i)
+		}
+		return result
+	}
+	tests := []struct {
+		name      string
+		generic   []string
+		legacy    []string
+		wantCount int
+		wantErr   bool
+	}{
+		{name: "overlapping lists near per-field boundary", generic: tags(0, 33), legacy: tags(0, 33), wantCount: 33},
+		{name: "64 distinct effective exclusions", generic: tags(0, 32), legacy: tags(32, 32), wantCount: 64},
+		{name: "65 distinct effective exclusions", generic: tags(0, 33), legacy: tags(33, 32), wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			role := RoleFileConfig{TicketQueue: "review", NudgePrompt: "review", TicketWithoutTags: test.generic}
+			config := FileConfig{DefaultRole: "quality", Roles: map[string]RoleFileConfig{"quality": role}, Review: ReviewFileConfig{SkipTags: test.legacy}}
+			if err := validateRolePolicies(&config); (err != nil) != test.wantErr {
+				t.Fatalf("validateRolePolicies error = %v, wantErr=%t", err, test.wantErr)
+			}
+			policies, err := resolveSteerRolePolicies(config, emptyEnv)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("resolveSteerRolePolicies accepted more than 64 effective exclusions")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSteerRolePolicies: %v", err)
+			}
+			filters, err := resolvedRoleQueueFilters(role, config.Review)
+			if err != nil || len(filters.WithoutTags) != test.wantCount {
+				t.Fatalf("resolved filters = %#v, %v; want %d distinct exclusions", filters, err, test.wantCount)
+			}
+			policy := policies["quality"]
+			if !reflect.DeepEqual(policy.QueueFilters, filters) || len(policy.ReviewSkipTags) != len(test.legacy) || len(policy.TicketWithoutTags) != len(test.generic) {
+				t.Fatalf("dynamic policy selector/exclusion split = %#v, want filters %#v", policy, filters)
+			}
+		})
+	}
+}
+
 func TestRoleTicketTagsOmittedAndEmptyResolveUnrestricted(t *testing.T) {
 	var snapshots []supervisor.RunWorker
-	for _, field := range []string{"", `,"ticket_tags":[]`} {
+	for _, field := range []string{"", `,"ticket_tags":[],"ticket_without_tags":[]`} {
 		path := filepath.Join(t.TempDir(), "config.json")
 		writeConfigFixture(t, path, `{"version":1,"default_role":"coder","roles":{"coder":{"ticket_queue":"open","nudge_prompt":"work"`+field+`}},"workers":{"worker":{"role":"coder","actor":"worker"}}}`)
 		config, help, err := parseRoleConfig(RoleCoder, []string{"--config", path, "--worker", "worker"}, emptyEnv)
 		if help || err != nil {
 			t.Fatalf("parseRoleConfig for %q: help=%v err=%v", field, help, err)
 		}
-		if config.TicketTags != "" {
-			t.Fatalf("ticket tags for %q = %q, want unrestricted", field, config.TicketTags)
+		if config.TicketTags != "" || config.TicketWithoutTags != "" {
+			t.Fatalf("ticket selector for %q = %q/%q, want unrestricted", field, config.TicketTags, config.TicketWithoutTags)
 		}
 		if config.RoleName != "coder" || config.TicketQueue != "open" {
 			t.Fatalf("effective configured role policy for %q = %q/%q, want coder/open", field, config.RoleName, config.TicketQueue)
 		}
 		snapshots = append(snapshots, supervisor.RunWorker{Name: "worker", Config: supervisor.RoleConfig{
 			Role: config.Role, RoleName: config.RoleName, TicketQueue: config.TicketQueue,
-			TicketTags: config.TicketTags, ReviewSkipTags: config.ReviewSkipTags,
+			TicketTags: config.TicketTags, TicketWithoutTags: config.TicketWithoutTags, ReviewSkipTags: config.ReviewSkipTags,
 		}})
 	}
 	if len(snapshots) != 2 || !equalLaunchSnapshots(snapshots[0], snapshots[1]) {
@@ -606,7 +659,7 @@ func TestLoadFileConfigValidatesRoleTicketQueueAndNudgePrompt(t *testing.T) {
 		role string
 		want string
 	}{
-		{name: "invalid ticket queue", role: `"ticket_queue":"closed","nudge_prompt":"work"`, want: "roles.coder.ticket_queue must be open or review"},
+		{name: "invalid ticket queue", role: `"ticket_queue":"closed","nudge_prompt":"work"`, want: "roles.coder.ticket_queue must be open, review, or signoff"},
 		{name: "empty nudge prompt", role: `"ticket_queue":"open","nudge_prompt":"  "`, want: "roles.coder.nudge_prompt must not be empty"},
 	}
 	for _, test := range tests {

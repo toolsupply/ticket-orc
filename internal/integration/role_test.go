@@ -12,12 +12,39 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/toolsupply/ticket-orc/internal/state"
 )
 
 const integrationTicketID = "20260919-12345"
+
+var (
+	fixtureBuildOnce sync.Once
+	fixtureRoot      string
+	fixtureBinary    string
+	fixtureHelperDir string
+	fixtureBuildErr  error
+)
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "ticket-orc-integration-fixtures-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create integration fixture directory:", err)
+		os.Exit(1)
+	}
+	fixtureRoot = root
+
+	code := m.Run()
+	if err := os.RemoveAll(root); err != nil {
+		fmt.Fprintln(os.Stderr, "remove integration fixture directory:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
 
 func integrationState(stateDir string) *state.Store {
 	return state.NewForRepository(stateDir, integrationRepositoryID("/fake/tickets"))
@@ -664,8 +691,17 @@ func countTicketRequest(path, command string) int {
 
 func buildFixture(t *testing.T) (string, string) {
 	t.Helper()
+	fixtureBuildOnce.Do(func() {
+		fixtureBinary, fixtureHelperDir, fixtureBuildErr = buildFixtureBinaries(fixtureRoot)
+	})
+	if fixtureBuildErr != nil {
+		t.Fatalf("build integration fixtures: %v", fixtureBuildErr)
+	}
+	return fixtureBinary, fixtureHelperDir
+}
+
+func buildFixtureBinaries(dir string) (string, string, error) {
 	root := filepath.Clean(filepath.Join(filepath.Dir(mustCallerFile()), "../.."))
-	dir := t.TempDir()
 	name := "ticket-orc"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
@@ -674,7 +710,7 @@ func buildFixture(t *testing.T) (string, string) {
 	cacheRoot := filepath.Join(os.TempDir(), "codex-go")
 	for _, path := range []string{filepath.Join(cacheRoot, "cache"), filepath.Join(cacheRoot, "path"), filepath.Join(cacheRoot, "mod")} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatalf("prepare shared Go cache %s: %v", path, err)
+			return "", "", fmt.Errorf("prepare shared Go cache %s: %w", path, err)
 		}
 	}
 	buildEnv := testEnv("", nil, map[string]string{
@@ -686,21 +722,21 @@ func buildFixture(t *testing.T) (string, string) {
 	})
 	versionData, err := os.ReadFile(filepath.Join(root, "VERSION"))
 	if err != nil {
-		t.Fatalf("read fixture version: %v", err)
+		return "", "", fmt.Errorf("read fixture version: %w", err)
 	}
 	version := strings.TrimSpace(string(versionData))
 	if version == "" {
-		t.Fatal("VERSION is empty")
+		return "", "", fmt.Errorf("VERSION is empty")
 	}
 	cmd := exec.Command("go", "build", "-ldflags", "-X github.com/toolsupply/ticket-orc/internal/cli.Version="+version, "-o", binary, "./cmd/ticket-orc")
 	cmd.Dir = root
 	cmd.Env = buildEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build CLI: %v\n%s", err, output)
+		return "", "", fmt.Errorf("build CLI: %w\n%s", err, output)
 	}
 	helperDir := filepath.Join(dir, "helpers")
 	if err := os.MkdirAll(helperDir, 0o700); err != nil {
-		t.Fatalf("create helper directory: %v", err)
+		return "", "", fmt.Errorf("create helper directory: %w", err)
 	}
 	fakeName := "fake" + executableSuffix()
 	fakeBinary := filepath.Join(dir, fakeName)
@@ -708,15 +744,15 @@ func buildFixture(t *testing.T) (string, string) {
 	fakeBuild.Dir = root
 	fakeBuild.Env = buildEnv
 	if output, err := fakeBuild.CombinedOutput(); err != nil {
-		t.Fatalf("build fake executable: %v\n%s", err, output)
+		return "", "", fmt.Errorf("build fake executable: %w\n%s", err, output)
 	}
 	for _, name := range []string{"ticket", "codex", "pi", "claude"} {
 		helper := filepath.Join(helperDir, name+executableSuffix())
 		if err := copyFile(fakeBinary, helper); err != nil {
-			t.Fatalf("copy %s helper: %v", name, err)
+			return "", "", fmt.Errorf("copy %s helper: %w", name, err)
 		}
 	}
-	return binary, helperDir
+	return binary, helperDir, nil
 }
 
 func mustCallerFile() string {

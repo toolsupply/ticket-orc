@@ -17,6 +17,15 @@ func (terminalInfo) ModTime() time.Time { return time.Time{} }
 func (terminalInfo) IsDir() bool        { return false }
 func (terminalInfo) Sys() any           { return nil }
 
+type regularInfo struct{}
+
+func (regularInfo) Name() string       { return "regular" }
+func (regularInfo) Size() int64        { return 0 }
+func (regularInfo) Mode() os.FileMode  { return 0 }
+func (regularInfo) ModTime() time.Time { return time.Time{} }
+func (regularInfo) IsDir() bool        { return false }
+func (regularInfo) Sys() any           { return nil }
+
 func TestSanitize(t *testing.T) {
 	got := sanitize("ticket\norc\r\t\x1b\x07\x00\x1f\x7f\u0085✓")
 	if got != "ticket orc  ✓" {
@@ -45,6 +54,7 @@ func TestSetSupportAndOutput(t *testing.T) {
 	}{
 		{name: "unset term", goos: "linux", term: "", stat: stat},
 		{name: "dumb term", goos: "linux", term: "dumb", stat: stat},
+		{name: "regular file", goos: "linux", term: "xterm", stat: func() (os.FileInfo, error) { return regularInfo{}, nil }},
 		{name: "stat failure", goos: "linux", term: "xterm", stat: func() (os.FileInfo, error) { return nil, errors.New("stat failed") }},
 	} {
 		output = ""

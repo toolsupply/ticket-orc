@@ -115,16 +115,54 @@ This example uses two existing interactive Codex CLI sessions as a coder/reviewe
 
 Start from a project that already has an initialized `ticket` repository.
 
-Create a small default orc instance with config in ~/.ticket-orc/config.json:
+Create the default two-role Orc topology in ~/.ticket-orc/config.json:
 
 ```sh
 ticket-orc init --global
 ```
 
+Default initialization creates `coder` on `open` and `reviewer` on `review`;
+accepted reviews close automatically. To add a final acceptance role, opt in
+when initializing:
+
+```sh
+ticket-orc init --global --architect
+```
+
+This creates `coder` on `open`, `reviewer` on `review` with accepted reviews
+routed to `signoff`, and `architect` on `signoff`. The architect role makes the
+final acceptance decision.
+
+Final acceptance must close the ticket or use another Ticket-supported
+lifecycle transition. An architect can also atomically hand a signoff ticket
+to the human actor `user`, leaving it in signoff for that decision; do not
+assume signoff can transition directly to `hold`.
+
+To replace an existing global instance with the architect topology, stop Orc
+first, then run:
+
+```sh
+ticket-orc init --global --architect --force
+```
+
+`--force` replaces the generated configuration and removes owned runtime state
+under Orc's existing safeguards. Custom configuration edits are discarded.
+
 Start Orc with its interactive operator console:
 
 ```sh
 ticket-orc run -i
+```
+
+With the architect topology, start an interactive architect session after Orc
+is running and join it to the signoff role:
+
+```sh
+TICKET_ACTOR=architect codex --no-daemon
+```
+
+```sh
+!ticket-orc join architect
 ```
 
 In two other terminals, start Codex with different Ticket actors:
@@ -143,19 +181,9 @@ In each Codex session, join the current thread to Orc:
 !ticket-orc join
 ```
 
-The configuration created by `ticket-orc init` makes the reviewer close accepted work, allowing dependent tickets to become actionable automatically. Change:
-
-```json
-"review_completion": "close"
-```
-
-to:
-
-```json
-"review_completion": "signoff"
-```
-
-if you prefer accepted tickets to wait for manual final closure.
+With the default topology, accepted reviews close automatically, allowing
+dependent tickets to become actionable. The `--architect` topology routes
+accepted reviews to signoff for a separate final acceptance decision.
 
 When a reviewer finds a problem, the ticket is returned to implementation with review findings and can be picked up by the coder again.
 

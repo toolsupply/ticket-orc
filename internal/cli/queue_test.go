@@ -21,16 +21,162 @@ import (
 )
 
 type forecastTicketReader struct {
-	actor        string
-	repositoryID string
-	active       map[string]map[string]ticketclient.ListResult
-	ready        map[string]ticketclient.ListResult
-	frontiers    map[string]ticketclient.ListResult
-	activeErr    error
-	readyErr     error
-	calls        *[]string
-	filters      *[]ticketclient.QueueFilters
-	readyLimits  *[]int
+	actor         string
+	repositoryID  string
+	active        map[string]map[string]ticketclient.ListResult
+	ready         map[string]ticketclient.ListResult
+	frontiers     map[string]ticketclient.ListResult
+	signoffLimits *[]int
+	activeErr     error
+	readyErr      error
+	calls         *[]string
+	filters       *[]ticketclient.QueueFilters
+	readyLimits   *[]int
+}
+
+func (r *forecastTicketReader) SignoffFrontier(_ context.Context, filters ticketclient.QueueFilters, limit, offset int) (ticketclient.ListResult, error) {
+	if r.calls != nil {
+		*r.calls = append(*r.calls, r.actor+":signoff")
+	}
+	if r.filters != nil {
+		*r.filters = append(*r.filters, filters)
+	}
+	if r.signoffLimits != nil {
+		*r.signoffLimits = append(*r.signoffLimits, limit)
+	}
+	if offset != 0 {
+		return ticketclient.ListResult{}, errors.New("unexpected signoff offset")
+	}
+	if r.frontiers != nil {
+		key := queueForecastFrontierKey(queueForecastOwner{RepositoryID: r.repositoryID, Queue: "signoff", filters: filters})
+		return r.frontiers[key], nil
+	}
+	return ticketclient.ListResult{}, nil
+}
+
+func TestQueueForecastUsesFilteredSignoffFrontierAndShowsOverlappingAuthority(t *testing.T) {
+	dir := t.TempDir()
+	repositoryPath := t.TempDir()
+	workers := []daemon.WorkerStatus{
+		{Name: "api-coder", EffectiveRoleName: "coder-api", EffectiveTicketQueue: "open", EffectiveTicketTags: []string{"api"}, EffectiveTicketWithoutTags: []string{"blocked"}, TicketActor: "api-coder", RepositoryID: localRepoID, RepositoryPath: repositoryPath, State: "running"},
+		{Name: "api-reviewer", EffectiveRoleName: "reviewer-api", EffectiveTicketQueue: "review", EffectiveTicketTags: []string{"api"}, EffectiveTicketWithoutTags: []string{"blocked"}, EffectiveReviewSkipTags: []string{"no-review"}, TicketActor: "api-reviewer", RepositoryID: localRepoID, RepositoryPath: repositoryPath, State: "running"},
+		{Name: "api-architect-a", EffectiveRoleName: "architect-a", EffectiveTicketQueue: "signoff", EffectiveTicketTags: []string{"api"}, EffectiveTicketWithoutTags: []string{"blocked"}, TicketActor: "architect-a", RepositoryID: localRepoID, RepositoryPath: repositoryPath, State: "running"},
+		{Name: "api-architect-b", EffectiveRoleName: "architect-b", EffectiveTicketQueue: "signoff", EffectiveTicketTags: []string{"api"}, EffectiveTicketWithoutTags: []string{"blocked"}, TicketActor: "architect-b", RepositoryID: localRepoID, RepositoryPath: repositoryPath, State: "running"},
+	}
+	openFilters := ticketclient.QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}
+	reviewFilters := ticketclient.QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked", "no-review"}}
+	signoffFilters := ticketclient.QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}
+	frontiers := map[string]ticketclient.ListResult{
+		queueForecastFrontierKey(queueForecastOwner{RepositoryID: localRepoID, Queue: "open", filters: openFilters}): {
+			Items: []ticketclient.Ticket{{ID: "20261006-50698", State: "open"}},
+		},
+		queueForecastFrontierKey(queueForecastOwner{RepositoryID: localRepoID, Queue: "review", filters: reviewFilters}): {
+			Items: []ticketclient.Ticket{{ID: "20261006-50697", State: "review"}},
+		},
+		queueForecastFrontierKey(queueForecastOwner{RepositoryID: localRepoID, Queue: "signoff", filters: signoffFilters}): {
+			Items: []ticketclient.Ticket{{ID: "20261006-50701", State: "signoff"}, {ID: "20261006-50702", State: "signoff"}}, More: true,
+		},
+	}
+	var calls []string
+	var filters []ticketclient.QueueFilters
+	var signoffLimits []int
+	owners, err := queueForecast(context.Background(), LoadedFileConfig{
+		Instance: InstanceContext{InstanceDir: dir, LocalDir: dir},
+		Config: FileConfig{Roles: map[string]RoleFileConfig{
+			"coder-api": {TicketQueue: "open"}, "reviewer-api": {TicketQueue: "review"},
+			"architect-a": {TicketQueue: "signoff"}, "architect-b": {TicketQueue: "signoff"},
+		}},
+	}, daemon.Status{Workers: workers}, func(identity currentTicketIdentity) (localTicketReader, error) {
+		return &forecastTicketReader{actor: identity.Actor, repositoryID: identity.RepositoryID,
+			active: map[string]map[string]ticketclient.ListResult{}, frontiers: frontiers,
+			calls: &calls, filters: &filters, signoffLimits: &signoffLimits}, nil
+	})
+	if err != nil {
+		t.Fatalf("queue forecast with managed signoff owners: %v", err)
+	}
+	byActor := make(map[string]queueForecastOwner, len(owners))
+	for _, owner := range owners {
+		byActor[owner.Actor] = owner
+	}
+	for _, actor := range []string{"api-coder", "api-reviewer", "architect-a", "architect-b"} {
+		wantID := map[string]string{"api-coder": "20261006-50698", "api-reviewer": "20261006-50697", "architect-a": "20261006-50701", "architect-b": "20261006-50701"}[actor]
+		if byActor[actor].Next == nil || byActor[actor].Next.ID != wantID {
+			t.Errorf("owner %s was not forecast the filtered frontier entry: %#v", actor, byActor[actor])
+		}
+	}
+	for _, actor := range []string{"architect-a", "architect-b"} {
+		owner := byActor[actor]
+		if owner.AuthorityNote == "" || !owner.MoreReady {
+			t.Errorf("signoff owner %s missing overlap caveat or bounded frontier evidence: %#v", actor, owner)
+		}
+	}
+	wantFilters := []ticketclient.QueueFilters{openFilters, reviewFilters, signoffFilters}
+	if !reflect.DeepEqual(filters, wantFilters) || !reflect.DeepEqual(signoffLimits, []int{signoffForecastLimit}) {
+		t.Fatalf("Ticket frontier filters=%#v signoff limits=%v; want %#v and one limit %d", filters, signoffLimits, wantFilters, signoffForecastLimit)
+	}
+	if got := strings.Count(strings.Join(calls, " "), ":signoff"); got != 1 {
+		t.Fatalf("overlapping signoff owners caused %d identical frontier requests, want one reused observation", got)
+	}
+	var output bytes.Buffer
+	if err := renderQueueForecast(&output, owners); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(output.String(), "20261006-50701"); got != 2 {
+		t.Fatalf("forecast output rows for shared signoff ticket=%d, want both unreserved signoff actors: %s", got, output.String())
+	}
+	if got := strings.Count(output.String(), "signoff eligible (unreserved)"); got != 2 {
+		t.Fatalf("forecast did not show both signoff eligibilities as unreserved: %s", output.String())
+	}
+}
+
+func TestQueueForecastIncludesDynamicSignoffFrontier(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repositoryPath := t.TempDir()
+	registration, _, _, err := state.NewRegistrationStore(dir).Join(ctx, state.SteerRegistration{
+		RepositoryID: localRepoID, RepositoryPath: repositoryPath, Actor: "architect", Role: "architect-api",
+		Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := LoadedFileConfig{
+		Instance: InstanceContext{InstanceDir: dir, LocalDir: dir},
+		Config:   FileConfig{Roles: map[string]RoleFileConfig{"architect-api": {TicketQueue: "signoff"}}},
+	}
+	status := daemon.Status{Steer: []daemon.SteerStatus{{
+		RepositoryID: registration.RepositoryID, Actor: registration.Actor, Harness: registration.Harness,
+		Session: registration.SessionID, EffectiveTicketQueue: "signoff", State: "queued", Code: "awaiting_signoff_outcome",
+		EffectiveTicketTags: []string{"api"}, EffectiveTicketWithoutTags: []string{"blocked"},
+	}}}
+	frontier := ticketclient.Ticket{ID: "20261008-12345", State: "signoff"}
+	filters := ticketclient.QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}
+	owners, err := queueForecast(ctx, loaded, status, func(identity currentTicketIdentity) (localTicketReader, error) {
+		return &forecastTicketReader{actor: identity.Actor, repositoryID: identity.RepositoryID,
+			active: map[string]map[string]ticketclient.ListResult{},
+			frontiers: map[string]ticketclient.ListResult{
+				queueForecastFrontierKey(queueForecastOwner{RepositoryID: identity.RepositoryID, Queue: "signoff", filters: filters}): {Items: []ticketclient.Ticket{frontier}},
+			}}, nil
+	})
+	if err != nil || len(owners) != 1 || owners[0].Reason != "awaiting signoff outcome" || owners[0].Next == nil || owners[0].Next.ID != frontier.ID || owners[0].AuthorityNote == "" {
+		t.Fatalf("dynamic signoff forecast=%#v err=%v", owners, err)
+	}
+	var output bytes.Buffer
+	if err := renderQueueForecast(&output, owners); err != nil || !strings.Contains(output.String(), "signoff eligible (unreserved)") || !strings.Contains(output.String(), frontier.ID) {
+		t.Fatalf("dynamic signoff forecast output=%q err=%v", output.String(), err)
+	}
+
+	status.Steer[0].PersistenceCode = "runtime_state_write_failed"
+	owners, err = queueForecast(ctx, loaded, status, func(identity currentTicketIdentity) (localTicketReader, error) {
+		return &forecastTicketReader{actor: identity.Actor, repositoryID: identity.RepositoryID,
+			active: map[string]map[string]ticketclient.ListResult{},
+			frontiers: map[string]ticketclient.ListResult{
+				queueForecastFrontierKey(queueForecastOwner{RepositoryID: identity.RepositoryID, Queue: "signoff", filters: filters}): {Items: []ticketclient.Ticket{frontier}},
+			}}, nil
+	})
+	if err != nil || len(owners) != 1 || owners[0].Reason != "degraded delivery" || owners[0].Next != nil {
+		t.Fatalf("signoff persistence failure forecast=%#v err=%v", owners, err)
+	}
 }
 
 func (r *forecastTicketReader) ActiveClaims(_ context.Context, queue string, _ int) (ticketclient.ListResult, error) {
@@ -69,7 +215,7 @@ func TestManagedQueueForecastUsesEffectiveSelectors(t *testing.T) {
 	effective := supervisor.RunWorker{Name: "reviewer", Config: supervisor.RoleConfig{
 		Role: RoleCoder, RoleName: "backend", TicketQueue: "open", Actor: "reviewer",
 		RepositoryIdentity: localRepoID, Repository: repositoryPath,
-		TicketTags: "effective", ReviewSkipTags: "effective-exclusion",
+		TicketTags: "effective", TicketWithoutTags: "generic-effective-exclusion", ReviewSkipTags: "effective-exclusion",
 	}, TicketInfo: &ticketclient.RepositoryInfo{ID: localRepoID, Path: repositoryPath}}
 	runtime := NewRuntimeState([]supervisor.RunWorker{effective})
 	desired := effective
@@ -77,6 +223,7 @@ func TestManagedQueueForecastUsesEffectiveSelectors(t *testing.T) {
 	desired.Config.RoleName = "quality"
 	desired.Config.TicketQueue = "review"
 	desired.Config.TicketTags = "desired"
+	desired.Config.TicketWithoutTags = "generic-desired-exclusion"
 	desired.Config.ReviewSkipTags = "desired-exclusion"
 	runtime.SetConfiguredWorkers([]supervisor.RunWorker{desired})
 	status := runtimeDaemonStatus(runtime, nil)
@@ -99,7 +246,7 @@ func TestManagedQueueForecastUsesEffectiveSelectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantEffective := ticketclient.QueueFilters{Tags: []string{"effective"}}
+	wantEffective := ticketclient.QueueFilters{Tags: []string{"effective"}, WithoutTags: []string{"generic-effective-exclusion"}}
 	if len(forecast) != 1 || forecast[0].Role != "backend" || forecast[0].Queue != "open" || len(filters) != 1 || !reflect.DeepEqual(filters[0], wantEffective) || !reflect.DeepEqual(calls, []string{"reviewer:active:open", "reviewer:active:review", "reviewer:ready:open"}) {
 		t.Fatalf("effective forecast=%#v filters=%#v calls=%v", forecast, filters, calls)
 	}
@@ -113,9 +260,26 @@ func TestManagedQueueForecastUsesEffectiveSelectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDesired := ticketclient.QueueFilters{Tags: []string{"desired"}, WithoutTags: []string{"desired-exclusion"}}
+	wantDesired := ticketclient.QueueFilters{Tags: []string{"desired"}, WithoutTags: []string{"desired-exclusion", "generic-desired-exclusion"}}
 	if len(forecast) != 1 || forecast[0].Role != "quality" || forecast[0].Queue != "review" || len(filters) != 1 || !reflect.DeepEqual(filters[0], wantDesired) || !reflect.DeepEqual(calls, []string{"reviewer:active:open", "reviewer:active:review", "reviewer:ready:review"}) {
 		t.Fatalf("restarted forecast=%#v filters=%#v calls=%v", forecast, filters, calls)
+	}
+}
+
+func TestManagedForecastDeduplicatesGenericAndReviewExclusions(t *testing.T) {
+	shared := make([]string, 33)
+	for i := range shared {
+		shared[i] = fmt.Sprintf("excluded-%02d", i)
+	}
+	filters, err := managedForecastFilters("review", daemon.WorkerStatus{
+		EffectiveTicketWithoutTags: append([]string(nil), shared...),
+		EffectiveReviewSkipTags:    append([]string(nil), shared...),
+	})
+	if err != nil || len(filters.WithoutTags) != len(shared) {
+		t.Fatalf("managed review forecast filters = %d exclusions, %v; want %d distinct exclusions", len(filters.WithoutTags), err, len(shared))
+	}
+	if !reflect.DeepEqual(filters.WithoutTags, shared) {
+		t.Fatalf("managed review forecast exclusions = %#v, want %#v", filters.WithoutTags, shared)
 	}
 }
 
@@ -190,7 +354,7 @@ func TestSteerQueueForecastUsesCommittedPolicyProjection(t *testing.T) {
 	})
 
 	t.Run("forecast uses review exclusions from the status projection", func(t *testing.T) {
-		committed := steerRolePolicy{TicketQueue: "review", QueueFilters: ticketclient.QueueFilters{Tags: []string{"urgent"}, WithoutTags: []string{"manual"}}}
+		committed := steerRolePolicy{TicketQueue: "review", QueueFilters: ticketclient.QueueFilters{Tags: []string{"urgent"}, WithoutTags: []string{"manual"}}, TicketWithoutTags: []string{"manual"}, ReviewSkipTags: []string{"manual"}}
 		policies.Replace(map[string]steerRolePolicy{"quality": committed})
 		// Disk state can move again after the policy commit; the forecast must
 		// describe the committed policy that dynamic dispatch now queries.
@@ -821,7 +985,12 @@ func TestQueueOutputReportsDispatchInhibitionAndKeepsForecast(t *testing.T) {
 
 func TestQueueCommandAndConsoleHelp(t *testing.T) {
 	var output, stderr bytes.Buffer
-	if code := run([]string{"help", "queue"}, &output, &stderr, emptyEnv, rejectExecution); code != 0 || stderr.Len() != 0 || !strings.Contains(output.String(), "read-only forecast") {
+	queueHelp := ""
+	code := run([]string{"help", "queue"}, &output, &stderr, emptyEnv, rejectExecution)
+	if code == 0 && stderr.Len() == 0 {
+		queueHelp = strings.Join(strings.Fields(output.String()), " ")
+	}
+	if queueHelp == "" || !strings.Contains(queueHelp, "read-only forecast") || !strings.Contains(queueHelp, "Overlapping signoff selectors") || !strings.Contains(queueHelp, "one exact unclaimed ticket per wake") || !strings.Contains(queueHelp, "assignee user") {
 		t.Fatalf("queue help code=%d out=%q err=%q", code, output.String(), stderr.String())
 	}
 	output.Reset()

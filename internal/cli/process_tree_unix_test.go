@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
 
 func TestChildContainmentDoesNotForceUnverifiedGroupAfterLeaderExit(t *testing.T) {
@@ -59,13 +61,9 @@ func TestConfiguredChildProcessStopsDescendants(t *testing.T) {
 		t.Fatalf("force tree stop: %v", err)
 	}
 	waitForCommandExit(t, command)
-	deadline := time.Now().Add(time.Second)
-	for processExists(childPID) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if processExists(childPID) {
-		t.Fatalf("descendant process %d survived process-group stop", childPID)
-	}
+	testutil.Await(t, time.Second, "descendant process exit", func() bool {
+		return !processExists(childPID)
+	}, func() string { return "descendant PID=" + strconv.Itoa(childPID) })
 }
 
 func TestConfiguredChildProcessStopsDescendantAfterLeaderExit(t *testing.T) {
@@ -124,30 +122,27 @@ func TestConfiguredChildProcessStopsDescendantAfterLeaderExit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("descendant retained inherited output handle after process-group stop")
 	}
-	deadline := time.Now().Add(time.Second)
-	for processExists(childPID) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if processExists(childPID) {
-		t.Fatalf("descendant process %d survived process-group stop after leader exit", childPID)
-	}
+	testutil.Await(t, time.Second, "descendant process exit after leader exit", func() bool {
+		return !processExists(childPID)
+	}, func() string { return "descendant PID=" + strconv.Itoa(childPID) })
 }
 
 func waitForProcessPID(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	var pid int
+	testutil.Await(t, 2*time.Second, "descendant PID file", func() bool {
 		data, err := os.ReadFile(path)
-		if err == nil {
-			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if parseErr == nil && pid > 0 {
-				return pid
-			}
+		if err != nil {
+			return false
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for descendant PID")
-	return 0
+		parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr != nil || parsed <= 0 {
+			return false
+		}
+		pid = parsed
+		return true
+	}, func() string { return "path=" + path })
+	return pid
 }
 
 func waitForCommandExit(t *testing.T, command *exec.Cmd) {

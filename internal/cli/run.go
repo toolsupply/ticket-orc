@@ -74,11 +74,15 @@ func runtimeDaemonStatus(runtime *supervisor.RuntimeState[supervisor.RunWorker],
 	for _, worker := range configured {
 		transition := snapshot[worker.Name]
 		observation := runtime.Observed(worker.Name)
+		roleName := worker.Config.RoleName
+		if roleName == "" {
+			roleName = string(worker.Config.Role)
+		}
 		item := daemon.WorkerStatus{
 			Name: worker.Name, Groups: append([]string(nil), worker.Groups...),
-			Role: string(worker.Config.Role), EffectiveRoleName: worker.Config.RoleName,
+			Role: roleName, EffectiveRoleName: roleName,
 			EffectiveTicketQueue: worker.Config.TicketQueue, Harness: worker.Config.Harness, TicketActor: worker.Config.Actor,
-			EffectiveTicketTags: splitTicketTags(worker.Config.TicketTags), EffectiveReviewSkipTags: splitReviewSkipTags(worker.Config.ReviewSkipTags),
+			EffectiveTicketTags: splitTicketTags(worker.Config.TicketTags), EffectiveTicketWithoutTags: splitTicketTags(worker.Config.TicketWithoutTags), EffectiveReviewSkipTags: splitReviewSkipTags(worker.Config.ReviewSkipTags),
 			TicketActivityAt: observation.TicketAt, TicketActivity: observation.TicketEvent,
 			TicketActivityTicket: observation.TicketID, TicketActivitySource: observation.TicketSource,
 			State: string(transition.State), Reason: workerStatusReason(transition), Failure: daemon.WorkerFailureDTO(transition.Failure),
@@ -96,6 +100,7 @@ func runtimeDaemonStatusWithSteerPolicies(runtime *supervisor.RuntimeState[super
 		for index := range projected {
 			projected[index].EffectiveTicketQueue = ""
 			projected[index].EffectiveTicketTags = nil
+			projected[index].EffectiveTicketWithoutTags = nil
 			projected[index].EffectiveReviewSkipTags = nil
 			if policy, ok := policySnapshot.roles[projected[index].Role]; ok {
 				applySteerStatusPolicy(&projected[index], policy)

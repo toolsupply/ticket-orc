@@ -225,6 +225,7 @@ func parseRunConfig(args []string, lookupEnv envLookup) (RunConfig, bool, error)
 	}
 	diagnostics := append(ConfigDiagnostics(nil), resolutionDiagnostics...)
 	diagnostics = append(diagnostics, AnalyzeRunWorkers(allWorkers, selectedSet)...)
+	diagnostics = append(diagnostics, obsoleteNudgePromptDiagnostic(loaded.Config, loaded.Instance, lookupEnv)...)
 	if diagnostics.HasErrors() {
 		return RunConfig{}, false, diagnostics
 	}
@@ -264,7 +265,15 @@ func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[strin
 		if err != nil || limit < 1 {
 			return nil, configValidation("max_bounces.invalid", "max_bounces", "max bounces must be a positive integer", "set a positive integer")
 		}
-		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
+		genericFilters, err := ticketclient.CanonicalQueueFilters(ticketclient.QueueFilters{Tags: role.TicketTags, WithoutTags: role.TicketWithoutTags})
+		if err != nil {
+			return nil, err
+		}
+		reviewSkipTags := []string(nil)
+		if role.TicketQueue == "review" {
+			reviewSkipTags = canonicalReviewSkipTags(config.Review.SkipTags)
+		}
+		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, TicketWithoutTags: genericFilters.WithoutTags, ReviewSkipTags: reviewSkipTags, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
 	}
 	return steerRoles, nil
 }

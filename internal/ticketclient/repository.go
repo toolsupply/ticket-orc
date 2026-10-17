@@ -195,6 +195,30 @@ func (c *Client) Show(ctx context.Context, id string) (Ticket, error) {
 	if strings.TrimSpace(ticket.State) == "" {
 		return Ticket{}, fmt.Errorf("%w: show response has no state", ErrProtocol)
 	}
+	if ticket.State == "signoff" && ticket.Assignee == "" {
+		// Ticket 0.2.5's show projection omits signoff assignees after the
+		// query/reassign composition path. Refresh this exact entry through the
+		// public list projection so callers can observe human handoff and other
+		// ownership outcomes without reading managed metadata.
+		observed, err := c.ListTickets(ctx, ListQuery{IDs: []string{id}, States: []string{"all"}, Limit: 1})
+		if err != nil {
+			return Ticket{}, fmt.Errorf("observe signoff ticket ownership: %w", err)
+		}
+		if len(observed.Items) != 1 || observed.Items[0].ID != id {
+			// A terminal ticket may have been archived between Show and List.
+			// Preserve its authoritative lifecycle result if the exact Show now
+			// reports that it has left signoff.
+			var current Ticket
+			if showErr := c.invoke(ctx, []string{"show", id}, &current); showErr == nil && current.ID == id {
+				current = current.NormalizeState()
+				if current.State != "signoff" {
+					return current, nil
+				}
+			}
+			return Ticket{}, fmt.Errorf("%w: signoff list did not return ticket %q", ErrProtocol, id)
+		}
+		ticket = observed.Items[0]
+	}
 	return ticket, nil
 }
 
