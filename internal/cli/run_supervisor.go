@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/executionlog"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
@@ -84,6 +86,7 @@ func executeRun(config RunConfig, stdout, stderr io.Writer) error {
 				}
 				return runtimeDaemonStatusWithSteerPolicies(runtime, sessions, config.steerPolicies)
 			},
+			Logs:    runtimeLogSource(config.StateDir, runtime),
 			Control: control,
 		})
 	}
@@ -186,9 +189,9 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 	config.dispatchGate = newDispatchGate(controlStore, controlState.Mode)
 	config.steerDirty = newSteerDirtySet()
 	dispatchEnabled := controlState.Mode == state.DaemonRunning
-	if len(config.Workers) > 1 {
+	if len(config.StartupWorkers) > 1 {
 		for _, worker := range config.Workers {
-			if worker.Config.Output == OutputJSON {
+			if slices.Contains(config.StartupWorkers, worker.Name) && worker.Config.Output == OutputJSON {
 				return fmt.Errorf("run cannot multiplex json output for multiple workers; use compact or quiet output")
 			}
 		}
@@ -728,32 +731,32 @@ func startInitialManagedWorkers(ctx context.Context, config RunConfig, manager *
 	if config.Doctor {
 		return nil
 	}
-	for _, worker := range config.Workers {
-		if preflightErr := preflightFailures[worker.Name]; preflightErr != nil {
-			transition(worker.Name, WorkerFailed, preflightErr)
+	for _, name := range config.StartupWorkers {
+		if preflightErr := preflightFailures[name]; preflightErr != nil {
+			transition(name, WorkerFailed, preflightErr)
 			continue
 		}
-		result, startErr := manager.start(ctx, worker.Name)
+		result, startErr := manager.start(ctx, name)
 		if isDispatchSuppressed(startErr) {
 			continue
 		}
 		if startErr != nil && result.State == string(WorkerPaused) {
-			transition(worker.Name, WorkerPaused, nil)
+			transition(name, WorkerPaused, nil)
 			continue
 		}
 		if startErr != nil {
 			manager.stopAll(context.Background())
 			for _, running := range config.Workers {
-				if running.Name != worker.Name {
+				if running.Name != name {
 					transition(running.Name, WorkerStopped, nil)
 				}
 			}
-			return fmt.Errorf("worker %q failed to start: %w", worker.Name, startErr)
+			return fmt.Errorf("worker %q failed to start: %w", name, startErr)
 		}
-		if verifyErr := manager.verifyWorkerStartup(ctx, worker.Name); verifyErr != nil {
-			renderServiceFailure(stderr, worker.Name, "readiness")
+		if verifyErr := manager.verifyWorkerStartup(ctx, name); verifyErr != nil {
+			renderServiceFailure(stderr, name, "readiness")
 			if failure := classifyWorkerFailureError(verifyErr); failure != nil {
-				renderWorkerFailure(stderr, worker.Name, WorkerFailed, failure)
+				renderWorkerFailure(stderr, name, WorkerFailed, failure)
 			}
 			// The failed worker has already been removed and reconciled by
 			// verifyWorkerStartup. Keep starting independent workers so one
@@ -940,8 +943,8 @@ func preflightSupervisorWorkers(ctx context.Context, config *RunConfig, stderr i
 				resolvedWorkers[worker.Name] = worker
 			}
 		}
-		selected := make(map[string]bool, len(resolvedWorkers))
-		for name := range resolvedWorkers {
+		selected := make(map[string]bool, len(config.StartupWorkers))
+		for _, name := range config.StartupWorkers {
 			selected[name] = true
 		}
 		postDiagnostics := AnalyzeRunWorkers(resolvedWorkers, selected)
@@ -952,4 +955,27 @@ func preflightSupervisorWorkers(ctx context.Context, config *RunConfig, stderr i
 		renderRuntimeConfigWarnings(stderr, postDiagnostics)
 	}
 	return preflightedWorkers, preflightFailures, nil
+}
+
+// runtimeLogSource projects authoritative runtime identities, including stopped
+// workers. Its callback releases runtime locks before the daemon does file IO.
+func runtimeLogSource(localDir string, runtime *supervisor.RuntimeState[supervisor.RunWorker]) *daemon.LogSource {
+	return &daemon.LogSource{LocalDir: localDir, Inventory: func() daemon.LogInventory {
+		inventory := daemon.LogInventory{}
+		for _, worker := range runtime.EffectiveWorkers() {
+			var status daemon.WorkerStatus
+			addWorkerRepositoryStatus(&status, worker)
+			role := worker.Config.RoleName
+			if role == "" {
+				role = string(worker.Config.Role)
+			}
+			inventory.Workers = append(inventory.Workers, executionlog.Worker{Name: worker.Name, Role: role, Harness: worker.Config.Harness, RepositoryID: status.RepositoryID})
+		}
+		for _, repository := range runtime.RepositoryStatuses() {
+			if ticketclient.ValidRepositoryID(repository.ID) {
+				inventory.RepositoryIDs = append(inventory.RepositoryIDs, repository.ID)
+			}
+		}
+		return inventory
+	}}
 }

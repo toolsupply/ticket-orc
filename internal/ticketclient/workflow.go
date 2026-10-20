@@ -7,9 +7,28 @@ import (
 	"strings"
 )
 
+// DeleteTicket permanently deletes one explicit ticket using Ticket's public
+// command. A receipt is required; a failed detail read is never deletion proof.
+func (c *Client) DeleteTicket(ctx context.Context, id string) (DeleteResult, error) {
+	if err := validateFullID(id); err != nil {
+		return DeleteResult{}, err
+	}
+	var result struct {
+		ID      string `json:"id"`
+		Changed *bool  `json:"changed"`
+	}
+	if err := c.invoke(ctx, []string{"delete", id}, &result); err != nil {
+		return DeleteResult{}, err
+	}
+	if result.ID != id || result.Changed == nil {
+		return DeleteResult{}, fmt.Errorf("%w: invalid delete receipt", ErrProtocol)
+	}
+	return DeleteResult{ID: result.ID, Changed: *result.Changed}, nil
+}
+
 // CreateTicket creates one ticket from the typed public input. The caller's
-// actor is bound to the Ticket process even though create has no ownership
-// transition of its own.
+// actor is bound to the Ticket process independently of the requested initial
+// assignee. Ticket validates and applies initial state and ownership atomically.
 func (c *Client) CreateTicket(ctx context.Context, input CreateInput) (MutationResult, error) {
 	data, err := json.Marshal(input)
 	if err != nil {

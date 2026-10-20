@@ -174,7 +174,7 @@ func TestRunSupervisorReportsUnexpectedCleanAndErrorExits(t *testing.T) {
 			runtimeState := &supervisor.RuntimeState[supervisor.RunWorker]{}
 			stateDir := t.TempDir()
 			done := startSupervisorTestRun(t, cancel, func() error {
-				return runSupervisor(ctx, RunConfig{ConfigPath: "config.json", StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, Runtime: runtimeState, startChild: starter}, os.Args[0], io.Discard, stderr)
+				return runSupervisor(ctx, RunConfig{ConfigPath: "config.json", StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, StartupWorkers: []string{worker.Name}, Runtime: runtimeState, startChild: starter}, os.Args[0], io.Discard, stderr)
 			})
 			awaitSupervisorSignal(t, startupSignal, "managed worker startup")
 			childDone <- test.err
@@ -232,7 +232,7 @@ func TestRunSupervisorUsesChildFailureEnvelope(t *testing.T) {
 	runtimeState := &supervisor.RuntimeState[supervisor.RunWorker]{}
 	stateDir := t.TempDir()
 	done := startSupervisorTestRun(t, cancel, func() error {
-		return runSupervisor(ctx, RunConfig{ConfigPath: "config.json", StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, Runtime: runtimeState, startChild: starter}, os.Args[0], io.Discard, stderr)
+		return runSupervisor(ctx, RunConfig{ConfigPath: "config.json", StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, StartupWorkers: []string{worker.Name}, Runtime: runtimeState, startChild: starter}, os.Args[0], io.Discard, stderr)
 	})
 	awaitSupervisorSignal(t, startupSignal, "managed worker startup")
 	childDone <- errors.New("ticket JSONL failed: bearer-token=secret prompt=opaque")
@@ -390,7 +390,7 @@ func TestRunSupervisorDeliberateStopIgnoresStaleExit(t *testing.T) {
 		match: "Managed workers:", seen: ready,
 	}
 	done := startSupervisorTestRun(t, cancel, func() error {
-		return runSupervisor(ctx, RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, Runtime: runtimeState, control: control}, os.Args[0], io.Discard, stderrWriter)
+		return runSupervisor(ctx, RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, StartupWorkers: []string{worker.Name}, Runtime: runtimeState, control: control}, os.Args[0], io.Discard, stderrWriter)
 	})
 	awaitSupervisorSignal(t, ready, "managed worker startup")
 	if control.StopWorker == nil {
@@ -466,9 +466,10 @@ func TestRunSupervisorExecutableFailureIsolationAndHooks(t *testing.T) {
 	hooks := make(chan supervisor.WorkerTransition, 16)
 	config := RunConfig{
 		ConfigPath: configPath, StateDir: stateDir,
-		Workers: []supervisor.RunWorker{supervisorTestWorker("running", stateDir), supervisorTestWorker("failed", stateDir)},
-		Runtime: NewRuntimeState([]supervisor.RunWorker{supervisorTestWorker("running", stateDir), supervisorTestWorker("failed", stateDir)}),
-		Hooks:   supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }},
+		Workers:        []supervisor.RunWorker{supervisorTestWorker("running", stateDir), supervisorTestWorker("failed", stateDir)},
+		StartupWorkers: []string{"running", "failed"},
+		Runtime:        NewRuntimeState([]supervisor.RunWorker{supervisorTestWorker("running", stateDir), supervisorTestWorker("failed", stateDir)}),
+		Hooks:          supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }},
 	}
 	done := startSupervisorTestRun(t, cancel, func() error {
 		return runSupervisor(ctx, config, os.Args[0], &output, &diagnostics)
@@ -559,7 +560,7 @@ func TestRunSupervisorClassifiesWorkerLeaseConflict(t *testing.T) {
 		t.Fatal("exit helper unexpectedly succeeded")
 	}
 	done := startSupervisorTestRun(t, cancel, func() error {
-		return runSupervisor(ctx, RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, Runtime: runtimeState, startChild: func(_ context.Context, _ string, _ string, candidate supervisor.RunWorker, _, _ io.Writer, _, _ *sync.Mutex) (*runChild, error) {
+		return runSupervisor(ctx, RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, StartupWorkers: []string{worker.Name}, Runtime: runtimeState, startChild: func(_ context.Context, _ string, _ string, candidate supervisor.RunWorker, _, _ io.Writer, _, _ *sync.Mutex) (*runChild, error) {
 			child := &runChild{worker: candidate, cmd: &exec.Cmd{}, done: make(chan error, 1), waited: make(chan struct{})}
 			child.done <- conflictErr
 			return child, nil
@@ -610,7 +611,8 @@ func TestRunSupervisorExecutableIdentityCancellationAndNoRespawn(t *testing.T) {
 	var output, diagnostics bytes.Buffer
 	config := RunConfig{
 		ConfigPath: configPath, StateDir: stateDir,
-		Workers: []supervisor.RunWorker{supervisorTestWorker("alpha", stateDir), supervisorTestWorker("beta", stateDir)},
+		Workers:        []supervisor.RunWorker{supervisorTestWorker("alpha", stateDir), supervisorTestWorker("beta", stateDir)},
+		StartupWorkers: []string{"alpha", "beta"},
 	}
 	done := startSupervisorTestRun(t, cancel, func() error {
 		return runSupervisor(ctx, config, os.Args[0], &output, &diagnostics)
@@ -890,7 +892,7 @@ func TestRunSupervisorIsolatesTicketPreflightFailure(t *testing.T) {
 	started := make(chan string, 2)
 	hooks := make(chan supervisor.WorkerTransition, 4)
 	config := RunConfig{
-		StateDir: t.TempDir(), Workers: []supervisor.RunWorker{bad, good},
+		StateDir: t.TempDir(), Workers: []supervisor.RunWorker{bad, good}, StartupWorkers: []string{"bad", "good"},
 		ticketProbe: func(_ context.Context, worker supervisor.RunWorker) (ticketclient.RepositoryInfo, error) {
 			if worker.Name == "bad" {
 				return ticketclient.RepositoryInfo{}, &ticketclient.ProbeError{Code: "unknown_scope", Message: "scope was not found"}
@@ -937,7 +939,7 @@ func TestRunSupervisorRejectsJSONMultiplexing(t *testing.T) {
 	second := supervisorTestWorker("two", t.TempDir())
 	first.Config.Output = OutputJSON
 	second.Config.Output = OutputJSON
-	err := runSupervisor(context.Background(), RunConfig{StateDir: t.TempDir(), Workers: []supervisor.RunWorker{first, second}}, os.Args[0], io.Discard, io.Discard)
+	err := runSupervisor(context.Background(), RunConfig{StateDir: t.TempDir(), Workers: []supervisor.RunWorker{first, second}, StartupWorkers: []string{"one", "two"}}, os.Args[0], io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "cannot multiplex json") {
 		t.Fatalf("JSON multiplexing error = %v", err)
 	}
@@ -971,7 +973,7 @@ func TestRunSupervisorPartialStartFailureCleansAllChildren(t *testing.T) {
 		}
 		return child, err
 	}
-	config := RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: workers, Runtime: runtimeState, startChild: starter, Hooks: supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }}}
+	config := RunConfig{ConfigPath: configPath, StateDir: stateDir, Workers: workers, StartupWorkers: []string{"exited", "forced", "fail"}, Runtime: runtimeState, startChild: starter, Hooks: supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }}}
 	started := time.Now()
 	err := runSupervisor(context.Background(), config, os.Args[0], &output, &diagnostics)
 	if err == nil || !strings.Contains(err.Error(), "deterministic later child start failure") {

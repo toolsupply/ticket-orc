@@ -249,7 +249,16 @@ func (s *dynamicSteerStatus) replace(items []daemon.SteerStatus) {
 		if found && reflect.DeepEqual(old, item) {
 			continue
 		}
-		publish(daemon.Event{Type: "steer.status", Role: item.Role, Actor: item.Actor, Harness: item.Harness, Session: shortIdentity(item.Session), State: item.State, Code: item.Code, Ticket: item.Ticket, RepositoryID: item.RepositoryID, RepositoryName: item.RepositoryName})
+		event := daemon.Event{Type: "steer.status", Role: item.Role, Actor: item.Actor, Harness: item.Harness, Session: shortIdentity(item.Session), State: item.State, Code: item.Code, Failure: item.Failure, Ticket: item.Ticket, RepositoryID: item.RepositoryID, RepositoryName: item.RepositoryName}
+		if found && old.Failure != nil && item.Failure == nil {
+			// A successful current observation clears the diagnostic. Other
+			// failures (for example unavailable Orc state) are not recovery.
+			switch item.Code {
+			case "", "ready", "busy", "idle", "consumed", "awaiting_claim", "awaiting_signoff_outcome", "signoff_resolved", "human_handoff", "assigned_elsewhere":
+				event.Phase = "ticket_observation_recovered"
+			}
+		}
+		publish(event)
 	}
 	for _, old := range previous {
 		found := false
@@ -607,6 +616,7 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 		if err != nil {
 			runner.recordSignoffObservationError(reg, err)
 			status.State, status.Code = delivery.State, "ticket_observation_failed"
+			status.Failure = steerObservationFailure(err)
 			return status
 		}
 		switch orc.ClassifySignoffTarget(ticket.State, ticket.Assignee) {
@@ -649,6 +659,7 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 	if err != nil {
 		runner.recordSignoffObservationError(reg, err)
 		status.State, status.Code = string(deliveryState), "ticket_observation_failed"
+		status.Failure = steerObservationFailure(err)
 		return status
 	}
 	status.Ticket = active
@@ -788,10 +799,12 @@ func signoffBootstrapPlan() steerNotificationPlan {
 func (runner *dynamicSteerRunner) selectAndSendSignoff(ctx context.Context, reg state.SteerRegistration, policy steerRolePolicy, reader steerSignoffClient, generation uint64, status daemon.SteerStatus, bootstrap bool) daemon.SteerStatus {
 	frontierCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 	frontier, err := reader.SignoffFrontier(frontierCtx, policy.QueueFilters, 1, 0)
+	err = steerObservationError("signoff frontier", err)
 	cancel()
 	if err != nil {
 		runner.recordSignoffObservationError(reg, err)
 		status.State, status.Code = string(orc.SteerIdle), "ticket_observation_failed"
+		status.Failure = steerObservationFailure(err)
 		return status
 	}
 	if len(frontier.Items) == 0 {
@@ -806,6 +819,7 @@ func (runner *dynamicSteerRunner) selectAndSendSignoff(ctx context.Context, reg 
 	if err != nil {
 		runner.recordSignoffObservationError(reg, err)
 		status.State, status.Code = string(orc.SteerIdle), "ticket_observation_failed"
+		status.Failure = steerObservationFailure(err)
 		return status
 	}
 	if !orc.EligibleSignoffEntry(ticket, policy.QueueFilters) {
@@ -908,6 +922,7 @@ func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg sta
 		if stageCode == "ticket_observation_failed" {
 			runner.recordSignoffObservationError(reg, err)
 			status.State, status.Code = string(orc.SteerIdle), stageCode
+			status.Failure = steerObservationFailure(err)
 		} else {
 			runner.writeFailures[key] = "runtime_state_write_failed"
 			status.State, status.Code = string(orc.SteerSending), "runtime_state_write_failed"
@@ -961,10 +976,10 @@ func showSignoffTarget(ctx context.Context, client steerSignoffClient, ticketID 
 	defer cancel()
 	ticket, err := client.Show(readCtx, ticketID)
 	if err != nil {
-		return ticketclient.Ticket{}, err
+		return ticketclient.Ticket{}, steerObservationError("show signoff target", err)
 	}
 	if ticket.ID != ticketID || strings.TrimSpace(ticket.State) == "" {
-		return ticketclient.Ticket{}, ticketclient.ErrProtocol
+		return ticketclient.Ticket{}, steerObservationError("show signoff target", ticketclient.ErrProtocol)
 	}
 	ticket.State = ticketclient.NormalizeLifecycleState(ticket.State)
 	return ticket, nil
@@ -1180,6 +1195,9 @@ func (runner *dynamicSteerRunner) observeRegistrations(ctx context.Context) (boo
 	readCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 	observation := runner.observer.Observe(readCtx)
 	cancel()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return false, steerDirtySnapshot{}
+	}
 	if observation.Code != "" {
 		closeSteerClients(runner.connections)
 		items := registrationFailureStatuses(observation, runner.policies.Snapshot())
@@ -1229,6 +1247,9 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 	policySnapshot := runner.policies.Snapshot()
 	observation := runner.latestObservation
 	if err := runner.persistence.Reconcile(ctx, observation.Registrations); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
 		closeSteerClients(runner.connections)
 		items := steerFailureStatuses(observation.Registrations, "runtime_state_unavailable", runner.policies.Snapshot())
 		for i := range items {
@@ -1326,6 +1347,7 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 				failedTicketObservations[regKey] = true
 				status.State = stateName
 				status.Code = "ticket_client_failed"
+				status.Failure = steerObservationFailure(steerObservationError("client startup", err))
 				applySteerWriteFailure(&status, reg, runner.writeFailures, runner.lastPersistedStates)
 				currentStatus = append(currentStatus, status)
 				continue
@@ -1361,6 +1383,7 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 			failedTicketObservations[regKey] = true
 			status.State = stateName
 			status.Code = "ticket_observation_failed"
+			status.Failure = steerObservationFailure(observeErr)
 			applySteerWriteFailure(&status, reg, runner.writeFailures, runner.lastPersistedStates)
 			currentStatus = append(currentStatus, status)
 			continue
@@ -1381,6 +1404,7 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 				failedTicketObservations[regKey] = true
 				status.State = stateName
 				status.Code = "ticket_observation_failed"
+				status.Failure = steerObservationFailure(steerObservationError("show active ticket", readErr))
 				currentStatus = append(currentStatus, status)
 				continue
 			}
@@ -1447,6 +1471,7 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 			failedTicketObservations[regKey] = true
 			status.State = stateName
 			status.Code = "ticket_observation_failed"
+			status.Failure = steerObservationFailure(observeErr)
 			applySteerWriteFailure(&status, reg, runner.writeFailures, runner.lastPersistedStates)
 			currentStatus = append(currentStatus, status)
 			continue
@@ -1550,6 +1575,11 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 			status.Code = code
 		}
 		currentStatus = append(currentStatus, status)
+	}
+	// Shutdown cancellation is not a failed observation or a recovery. Keep
+	// the last completed status and do not schedule another read.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
 	}
 	reconciledAt := steerRetryBaseTime(now, time.Now())
 	runner.retries.Reconcile(work, observation.Registrations, failedTicketObservations, successfulTicketObservations, reconciledAt)
@@ -1747,6 +1777,7 @@ func boundedActorActive(parent context.Context, client steerClient) (string, err
 	ctx, cancel := context.WithTimeout(parent, steerOperationTimeout)
 	defer cancel()
 	active, err := client.ActiveClaims(ctx, "open", 1)
+	err = steerObservationError("active claims open", err)
 	if err != nil || len(active.Items) > 0 {
 		if len(active.Items) > 0 {
 			return active.Items[0].ID, nil
@@ -1754,6 +1785,7 @@ func boundedActorActive(parent context.Context, client steerClient) (string, err
 		return "", err
 	}
 	active, err = client.ActiveClaims(ctx, "review", 1)
+	err = steerObservationError("active claims review", err)
 	if err != nil || len(active.Items) == 0 {
 		return "", err
 	}
@@ -1764,6 +1796,7 @@ func boundedReady(parent context.Context, client steerClient, queue string, filt
 	ctx, cancel := context.WithTimeout(parent, steerOperationTimeout)
 	defer cancel()
 	frontier, err := client.ReadyFrontier(ctx, queue, filters, 1)
+	err = steerObservationError("ready frontier", err)
 	if err != nil || len(frontier.Items) == 0 {
 		return "", err
 	}

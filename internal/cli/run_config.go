@@ -27,7 +27,8 @@ type RunConfig struct {
 	Interactive        bool
 	Doctor             bool
 	Repositories       supervisor.RepositoryRegistry
-	Workers            []supervisor.RunWorker
+	Workers            []supervisor.RunWorker // Full configured inventory, including dormant workers.
+	StartupWorkers     []string               // Names selected for initial launch only.
 	Diagnostics        []ConfigDiagnostic
 	steerPolicies      *steerPolicyStore
 	steerStatus        *dynamicSteerStatus
@@ -215,8 +216,13 @@ func parseRunConfig(args []string, lookupEnv envLookup) (RunConfig, bool, error)
 		return RunConfig{}, false, err
 	}
 
-	resolved := make([]supervisor.RunWorker, 0, len(selected))
-	for _, name := range selected {
+	names := make([]string, 0, len(allWorkers))
+	for name := range allWorkers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	resolved := make([]supervisor.RunWorker, 0, len(names))
+	for _, name := range names {
 		resolved = append(resolved, allWorkers[name])
 	}
 	selectedSet := make(map[string]bool, len(selected))
@@ -234,7 +240,7 @@ func parseRunConfig(args []string, lookupEnv envLookup) (RunConfig, bool, error)
 	if err != nil {
 		return RunConfig{}, false, err
 	}
-	return RunConfig{ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, InstanceID: loaded.Config.ID, LocalDirConfigured: loaded.Instance.LocalDirConfigured, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, Diagnostics: diagnostics, steerPolicies: newSteerPolicyStore(steerRoles), steerStatus: &dynamicSteerStatus{}}, false, nil
+	return RunConfig{ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, InstanceID: loaded.Config.ID, LocalDirConfigured: loaded.Instance.LocalDirConfigured, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, StartupWorkers: selected, Diagnostics: diagnostics, steerPolicies: newSteerPolicyStore(steerRoles), steerStatus: &dynamicSteerStatus{}}, false, nil
 }
 
 func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[string]steerRolePolicy, error) {
@@ -310,6 +316,11 @@ func workerResolutionDiagnostic(name string, err error) ConfigDiagnostic {
 }
 
 func selectRunWorkers(config FileConfig, workerNames, groupNames []string, all bool) ([]string, error) {
+	explicit := all || len(workerNames) > 0 || len(groupNames) > 0
+	if !explicit {
+		groupNames = config.Supervisor.StartupGroups
+		all = len(groupNames) == 0
+	}
 	selected := make(map[string]struct{})
 	ordered := make([]string, 0)
 	addWorker := func(name string) error {
@@ -324,19 +335,10 @@ func selectRunWorkers(config FileConfig, workerNames, groupNames []string, all b
 		return nil
 	}
 	addGroup := func(group string) error {
-		matches := make([]string, 0)
-		for name := range config.Workers {
-			for _, candidate := range effectiveWorkerGroups(config, name) {
-				if candidate == group {
-					matches = append(matches, name)
-					break
-				}
-			}
+		matches, err := configuredGroupWorkers(config, group)
+		if err != nil {
+			return err
 		}
-		if len(matches) == 0 {
-			return fmt.Errorf("group %q has no configured workers", group)
-		}
-		sort.Strings(matches)
 		for _, name := range matches {
 			if err := addWorker(name); err != nil {
 				return err
@@ -367,14 +369,7 @@ func selectRunWorkers(config FileConfig, workerNames, groupNames []string, all b
 			return nil, err
 		}
 	}
-	if len(workerNames) == 0 && len(groupNames) == 0 && !all {
-		for _, group := range config.Supervisor.StartupGroups {
-			if err := addGroup(group); err != nil {
-				return nil, fmt.Errorf("startup group: %w", err)
-			}
-		}
-	}
-	if (all || len(workerNames) > 0 || len(groupNames) > 0) && len(ordered) == 0 {
+	if explicit && len(ordered) == 0 {
 		return nil, errors.New("run selection produced no workers")
 	}
 	return ordered, nil

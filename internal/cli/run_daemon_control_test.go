@@ -36,9 +36,10 @@ func TestRunSupervisorLoadsControlBeforeStartupDispatch(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
 			err := runSupervisor(ctx, RunConfig{
-				StateDir: stateDir,
-				Workers:  []supervisor.RunWorker{worker},
-				Runtime:  NewRuntimeState([]supervisor.RunWorker{worker}),
+				StateDir:       stateDir,
+				Workers:        []supervisor.RunWorker{worker},
+				StartupWorkers: []string{worker.Name},
+				Runtime:        NewRuntimeState([]supervisor.RunWorker{worker}),
 				startChild: func(context.Context, string, string, supervisor.RunWorker, io.Writer, io.Writer, *sync.Mutex, *sync.Mutex) (*runChild, error) {
 					starts.Add(1)
 					return nil, errors.New("unexpected child start")
@@ -62,9 +63,10 @@ func TestRunSupervisorRejectsMalformedControlBeforeDispatch(t *testing.T) {
 	var starts atomic.Int32
 	worker := supervisorTestWorker("coder", stateDir)
 	err := runSupervisor(context.Background(), RunConfig{
-		StateDir: stateDir,
-		Workers:  []supervisor.RunWorker{worker},
-		Runtime:  NewRuntimeState([]supervisor.RunWorker{worker}),
+		StateDir:       stateDir,
+		Workers:        []supervisor.RunWorker{worker},
+		StartupWorkers: []string{worker.Name},
+		Runtime:        NewRuntimeState([]supervisor.RunWorker{worker}),
 		startChild: func(context.Context, string, string, supervisor.RunWorker, io.Writer, io.Writer, *sync.Mutex, *sync.Mutex) (*runChild, error) {
 			starts.Add(1)
 			return nil, errors.New("unexpected child start")

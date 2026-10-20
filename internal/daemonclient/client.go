@@ -37,11 +37,13 @@ const (
 
 // Error is a bounded client failure classified for operator diagnostics.
 type Error struct {
-	Kind          ErrorKind
-	Code          string
-	Message       string
-	StatusCode    int
-	Applied       bool
+	Kind       ErrorKind
+	Code       string
+	Message    string
+	StatusCode int
+	Applied    bool
+	// AppliedKnown distinguishes an explicit false outcome from uncertainty.
+	AppliedKnown  bool
 	Result        *daemon.MutationResult
 	Group         *daemon.GroupResult
 	DaemonControl *daemon.DaemonControlResult
@@ -263,6 +265,30 @@ func (c *Client) MutateRepositoryTicket(ctx context.Context, repositoryID, id, o
 	return result, err
 }
 
+// DeleteRepositoryTicket returns Ticket's deletion receipt without rereading
+// the removed ticket. Like other mutations, transport failures are not retried.
+func (c *Client) DeleteRepositoryTicket(ctx context.Context, repositoryID, id string, request daemon.RepositoryTicketDeleteRequest) (daemon.RepositoryTicketDeletion, error) {
+	var result daemon.RepositoryTicketDeletion
+	data, err := json.Marshal(request)
+	if err != nil {
+		return result, &Error{Kind: ErrorProtocol, Code: "encode_request", Message: "encode repository ticket delete request"}
+	}
+	path := "/v1/repositories/" + url.PathEscape(repositoryID) + "/tickets/" + url.PathEscape(id) + "/delete"
+	var receipt struct {
+		daemon.RepositoryTicketDeletion
+		Changed *bool `json:"changed"`
+	}
+	if err := c.do(ctx, http.MethodPost, path, bytes.NewReader(data), &receipt); err != nil {
+		return result, err
+	}
+	if receipt.RepositoryID != repositoryID || receipt.ID != id || receipt.Operation != "delete" || receipt.Changed == nil {
+		return result, &Error{Kind: ErrorProtocol, Message: "invalid repository ticket deletion receipt"}
+	}
+	result = receipt.RepositoryTicketDeletion
+	result.Changed = *receipt.Changed
+	return result, nil
+}
+
 func validRepositoryMutationOperation(operation string) bool {
 	switch operation {
 	case "claim", "release", "open", "hold", "submit", "review", "approve", "close", "reject", "bump":
@@ -367,9 +393,6 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 	if len(data) > maxResponseBytes {
 		return &Error{Kind: ErrorProtocol, Message: "daemon response is too large"}
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusNotFound {
-		return &Error{Kind: ErrorAuth, Code: "unauthorized", Message: c.discoveryMessage("daemon authentication failed"), StatusCode: response.StatusCode}
-	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return c.applicationError(response.StatusCode, data)
 	}
@@ -380,11 +403,14 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 }
 
 func (c *Client) applicationError(status int, data []byte) error {
+	if status == http.StatusUnauthorized {
+		return &Error{Kind: ErrorAuth, Code: "unauthorized", Message: c.discoveryMessage("daemon authentication failed"), StatusCode: status}
+	}
 	var envelope struct {
 		Error struct {
 			Code          string                      `json:"code"`
 			Message       string                      `json:"message"`
-			Applied       bool                        `json:"mutation_applied"`
+			Applied       *bool                       `json:"mutation_applied"`
 			State         string                      `json:"state"`
 			DaemonControl *daemon.DaemonControlResult `json:"daemon_control"`
 		} `json:"error"`
@@ -393,10 +419,13 @@ func (c *Client) applicationError(status int, data []byte) error {
 	if err := decodeOne(data, &envelope); err != nil {
 		return &Error{Kind: ErrorProtocol, Message: "decode daemon error", StatusCode: status, Cause: err}
 	}
-	if status == http.StatusUnauthorized {
-		return &Error{Kind: ErrorAuth, Code: "unauthorized", Message: "daemon authentication failed", StatusCode: status}
+	// Capability routing conceals a missing or wrong key with a generic 404.
+	// Resource-specific errors on authenticated routes retain their typed code.
+	if status == http.StatusNotFound && (envelope.Error.Code == "not_found" || envelope.Error.Code == "unauthorized") {
+		return &Error{Kind: ErrorAuth, Code: "unauthorized", Message: c.discoveryMessage("daemon authentication failed"), StatusCode: status}
 	}
-	result := daemon.MutationResult{State: envelope.Error.State, Applied: envelope.Error.Applied}
+	applied := envelope.Error.Applied != nil && *envelope.Error.Applied
+	result := daemon.MutationResult{State: envelope.Error.State, Applied: applied}
 	group := envelope.Group
 	var resultPtr *daemon.MutationResult
 	if result.Applied || result.State != "" {
@@ -406,7 +435,7 @@ func (c *Client) applicationError(status int, data []byte) error {
 	if group.Group != "" || len(group.Results) > 0 {
 		groupPtr = &group
 	}
-	return &Error{Kind: ErrorApplication, Code: envelope.Error.Code, Message: envelope.Error.Message, StatusCode: status, Applied: result.Applied, Result: resultPtr, Group: groupPtr, DaemonControl: envelope.Error.DaemonControl}
+	return &Error{Kind: ErrorApplication, Code: envelope.Error.Code, Message: envelope.Error.Message, StatusCode: status, Applied: result.Applied, AppliedKnown: envelope.Error.Applied != nil, Result: resultPtr, Group: groupPtr, DaemonControl: envelope.Error.DaemonControl}
 }
 
 func decodeOne(data []byte, output any) error {

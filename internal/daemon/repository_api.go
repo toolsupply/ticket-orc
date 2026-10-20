@@ -87,10 +87,27 @@ type RepositoryTicketMutationRequest struct {
 	Outcome string `json:"outcome,omitempty"`
 }
 
+// RepositoryTicketDeleteRequest accepts only the actor performing deletion.
+type RepositoryTicketDeleteRequest struct {
+	Actor string `json:"actor"`
+}
+
+// RepositoryTicketDeletion is a receipt, not a surviving ticket projection.
+type RepositoryTicketDeletion struct {
+	RepositoryID  string `json:"repository_id"`
+	RepositoryKey string `json:"repository_key,omitempty"`
+	ID            string `json:"id"`
+	Operation     string `json:"operation"`
+	Changed       bool   `json:"changed"`
+}
+
 // RepositoryTicketCreateRequest is the typed create surface used by the UI.
+// State and Assignee pointers preserve explicit empty values for Ticket validation.
 type RepositoryTicketCreateRequest struct {
 	Actor     string            `json:"actor"`
 	Title     string            `json:"title"`
+	State     *string           `json:"state,omitempty"`
+	Assignee  *string           `json:"assignee,omitempty"`
 	Priority  *int              `json:"priority,omitempty"`
 	Tags      []string          `json:"tags,omitempty"`
 	Parent    string            `json:"parent,omitempty"`
@@ -120,6 +137,7 @@ type RepositoryTicketMutation struct {
 // the daemon control plane. Implementations must resolve repository IDs
 // themselves and must never accept caller filesystem paths or arbitrary argv.
 type RepositoryGateway struct {
+	DeleteTicket func(context.Context, string, string, RepositoryTicketDeleteRequest) (RepositoryTicketDeletion, error)
 	ListTickets  func(context.Context, string, RepositoryTicketQuery) (RepositoryTicketList, error)
 	GetTicket    func(context.Context, string, string) (RepositoryTicketDetail, error)
 	CreateTicket func(context.Context, string, RepositoryTicketCreateRequest) (RepositoryTicketMutation, error)

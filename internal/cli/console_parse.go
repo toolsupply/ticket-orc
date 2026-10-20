@@ -6,8 +6,9 @@ import (
 )
 
 type consoleCommand struct {
-	name string
-	args []string
+	name  string
+	args  []string
+	watch watchOptions
 }
 
 // parseConsoleCommand accepts the deliberately small, completion-friendly
@@ -42,8 +43,13 @@ func parseConsoleCommand(line string) (consoleCommand, error) {
 	}
 	switch command.name {
 	case "watch":
-		if len(command.args) != 0 {
-			return consoleCommand{}, fmt.Errorf("usage: watch")
+		var err error
+		command.watch, err = parseWatchOptions(command.args)
+		if err != nil {
+			return consoleCommand{}, err
+		}
+		if command.watch.help {
+			return consoleCommand{name: "help", args: []string{"watch"}}, nil
 		}
 	case "exit", "quit", "q", "reload", "doctor":
 		if len(command.args) != 0 {

@@ -77,8 +77,8 @@ func (e *BounceLimitError) Error() string {
 }
 
 // RunCoder continuously claims implementation tickets until cancellation or a
-// state, harness, or lifecycle error occurs. A successful review or
-// terminal cleanup returns to Ticket work without spawning an extra harness turn.
+// state, harness, or lifecycle error occurs. A successful submission, confirmed
+// hold, or terminal cleanup returns to Ticket work without an extra harness turn.
 func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) error {
 	if config.RoleName == "" {
 		config.RoleName = "coder"
@@ -232,12 +232,13 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
 				if reconcileErr != nil {
-					return reconcileErr
+					return errors.Join(turnErr, reconcileErr)
 				}
 				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
 					if turnErr != nil {
-						logCoder(config.Diagnostics, "%s: circuit containment handled the completed ticket after a worker error: %v", claimed.ID, turnErr)
+						return fmt.Errorf("coder turn for %s: %w", claimed.ID, turnErr)
 					}
+					// A confirmed hold ends this ticket attempt, not the worker.
 					continue
 				}
 			}

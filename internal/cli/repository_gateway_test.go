@@ -70,7 +70,7 @@ func TestListRepositoryTicketsCombinesSearchFiltersBeforePagination(t *testing.T
 	priority := 2
 	reader := &repositoryTicketReaderStub{
 		candidates: ticketclient.ListResult{Items: []ticketclient.Ticket{{ID: "20260925-00001"}, {ID: "20260925-00002"}}},
-		listed:     ticketclient.ListResult{Items: []ticketclient.Ticket{{ID: "20260925-00002", Title: "match", State: "open", Priority: 2, Assignee: "coder", Parent: "20260924-00003", Tags: []string{"ui"}}}, More: true},
+		listed:     ticketclient.ListResult{Items: []ticketclient.Ticket{{ID: "20260925-00002", Title: "match", Modified: "2026-10-18T04:05:06.123456789+02:00", State: "open", Priority: 2, Assignee: "coder", Parent: "20260924-00003", Tags: []string{"ui"}}}, More: true},
 	}
 	query := daemon.RepositoryTicketQuery{
 		Search: "parent filter", States: []string{"open", "review"}, Priority: &priority,
@@ -89,8 +89,37 @@ func TestListRepositoryTicketsCombinesSearchFiltersBeforePagination(t *testing.T
 	}) {
 		t.Fatalf("Ticket query=%#v", got)
 	}
-	if result.RepositoryID != joinTestRepositoryID || result.RepositoryKey != "repo" || len(result.Items) != 1 || result.Items[0].ID != "20260925-00002" || result.Items[0].Parent != "20260924-00003" || !result.More {
+	if result.RepositoryID != joinTestRepositoryID || result.RepositoryKey != "repo" || len(result.Items) != 1 || result.Items[0].ID != "20260925-00002" || result.Items[0].Modified != "2026-10-18T04:05:06.123456789+02:00" || result.Items[0].Parent != "20260924-00003" || !result.More {
 		t.Fatalf("repository result=%#v", result)
+	}
+}
+
+func TestListRepositoryTicketsForwardsModifiedOnPlainAndFilteredPages(t *testing.T) {
+	for _, query := range []daemon.RepositoryTicketQuery{
+		{Limit: 2},
+		{States: []string{"review"}, Assignee: "coder", Tags: []string{"api"}, Limit: 2, Offset: 4},
+	} {
+		reader := &repositoryTicketReaderStub{listed: ticketclient.ListResult{Items: []ticketclient.Ticket{
+			{ID: "20260925-00002", Modified: "2026-10-18T04:05:06.123456789+02:00"},
+			{ID: "20260925-00001", Modified: "2026-10-17T01:02:03Z"},
+		}, More: true}}
+		result, err := listRepositoryTicketsFromClient(context.Background(), joinTestRepositoryID, "repo", query, reader, query.Limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reader.listCalls != 1 || reader.search != "" || !reflect.DeepEqual(reader.query, ticketclient.ListQuery{
+			States: query.States, Assignee: query.Assignee, Tags: query.Tags, Limit: query.Limit, Offset: query.Offset,
+		}) {
+			t.Fatalf("reader=%#v", reader)
+		}
+		if result.RepositoryID != joinTestRepositoryID || result.RepositoryKey != "repo" || !result.More || len(result.Items) != 2 {
+			t.Fatalf("result=%#v", result)
+		}
+		for i, item := range reader.listed.Items {
+			if result.Items[i].ID != item.ID || result.Items[i].Modified != item.Modified {
+				t.Fatalf("row %d lost ordering or modified: %#v", i, result.Items[i])
+			}
+		}
 	}
 }
 
@@ -125,12 +154,15 @@ func TestRepositoryTicketDetailViewMapsAuthoritativeDisplayFields(t *testing.T) 
 }
 
 func TestRepositoryTicketListViewOmitsDetailOnlyFields(t *testing.T) {
-	data, err := json.Marshal(repositoryTicketView(ticketclient.Ticket{ID: "20260925-00001", State: "open"}))
+	data, err := json.Marshal(repositoryTicketView(ticketclient.Ticket{ID: "20260925-00001", State: "open", Modified: "2026-10-18T04:05:06.123456789+02:00"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded := string(data)
-	for _, field := range []string{"readiness", "created", "modified", "body", "body_truncated"} {
+	if !strings.Contains(encoded, `"modified":"2026-10-18T04:05:06.123456789+02:00"`) {
+		t.Fatalf("list view lost modified: %s", encoded)
+	}
+	for _, field := range []string{"readiness", "created", "body", "body_truncated"} {
 		if strings.Contains(encoded, `"`+field+`"`) {
 			t.Fatalf("list view includes detail-only field %q: %s", field, encoded)
 		}

@@ -87,10 +87,11 @@ type SteerStatus struct {
 	EffectiveReviewSkipTags    []string `json:"effective_review_skip_tags,omitempty"`
 	State                      string   `json:"state"`
 	// Ticket identifies the active claim when one was observed.
-	Ticket          string `json:"ticket,omitempty"`
-	Code            string `json:"code,omitempty"`
-	PersistenceCode string `json:"persistence_code,omitempty"`
-	ManagedOwner    string `json:"managed_owner,omitempty"`
+	Ticket          string         `json:"ticket,omitempty"`
+	Code            string         `json:"code,omitempty"`
+	PersistenceCode string         `json:"persistence_code,omitempty"`
+	ManagedOwner    string         `json:"managed_owner,omitempty"`
+	Failure         *WorkerFailure `json:"failure,omitempty"`
 }
 
 // RepositoryStatus reports bounded health for one configured Ticket repository
@@ -126,25 +127,27 @@ type Config struct {
 	Control           *Control
 	ReadHeaderTimeout time.Duration
 	EventHeartbeat    time.Duration
+	Logs              *LogSource
 }
 
 // Server owns one listener, HTTP server, and private endpoint document.
 // It does not own the supervisor lock; callers acquire that lock before Start.
 type Server struct {
-	config          Config
-	listener        net.Listener
-	http            *http.Server
-	endpoint        Endpoint
-	endpointPath    string
-	startedAt       time.Time
-	done            chan error
-	shutdownDone    chan struct{}
-	events          *eventBroker
-	lifecycle       context.Context
-	lifecycleCancel context.CancelFunc
-	startOnce       sync.Once
-	startErr        error
-	mu              sync.Mutex
-	started         bool
-	stopped         bool
+	config           Config
+	listener         net.Listener
+	http             *http.Server
+	endpoint         Endpoint
+	endpointPath     string
+	startedAt        time.Time
+	done             chan error
+	shutdownDone     chan struct{}
+	events           *eventBroker
+	lifecycle        context.Context
+	lifecycleCancel  context.CancelFunc
+	startOnce        sync.Once
+	startErr         error
+	mu               sync.Mutex
+	started          bool
+	stopped          bool
+	logSubscriptions int
 }

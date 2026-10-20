@@ -124,7 +124,7 @@ type outputEvent struct {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		Command  string `json:"command"`
-		ExitCode int    `json:"exit_code"`
+		ExitCode *int   `json:"exit_code"`
 		Message  string `json:"message"`
 		Changes  []struct {
 			Kind string `json:"kind"`
@@ -133,61 +133,128 @@ type outputEvent struct {
 	} `json:"item"`
 }
 
-func (o *ExecutionOutput) renderLine(line []byte) error {
-	if len(bytes.TrimSpace(line)) == 0 {
-		return nil
+// InterpretEvent returns semantic records for one framed Codex JSON event.
+// Blank and unknown events produce no records; invalid or oversized JSON
+// returns ErrProtocol. Text is preserved without terminal display limits.
+func InterpretEvent(line []byte) ([]harness.LogRecord, error) {
+	if len(line) > harness.MaxEventBytes {
+		return nil, fmt.Errorf("%w: event exceeds %d bytes", ErrProtocol, harness.MaxEventBytes)
 	}
-	if len(line) > maxEventBytes {
-		return fmt.Errorf("%w: event exceeds %d bytes", ErrProtocol, maxEventBytes)
+	if len(bytes.TrimSpace(line)) == 0 {
+		return nil, nil
 	}
 	var event outputEvent
 	if err := json.Unmarshal(line, &event); err != nil {
-		return fmt.Errorf("%w: malformed JSONL output event: %v", ErrProtocol, err)
+		return nil, fmt.Errorf("%w: malformed JSONL output event: %v", ErrProtocol, err)
 	}
-
+	record := harness.LogRecord{}
 	switch {
 	case event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message":
-		return o.writeDisplay(truncateDisplay(event.Item.Text))
+		record = harness.LogRecord{Kind: "message", Text: event.Item.Text}
 	case event.Type == "item.completed" && event.Item != nil && event.Item.Type == "error":
-		return o.writeDiagnostic("[codex error] " + defaultText(event.Item.Message, "unknown error"))
+		record = harness.LogRecord{Kind: "diagnostic", Level: "error", Code: "item_error", Text: defaultText(event.Item.Message, "unknown error")}
 	case event.Type == "error":
-		return o.writeDiagnostic("[codex error] " + defaultText(event.Message, "unknown error"))
+		record = harness.LogRecord{Kind: "diagnostic", Level: "error", Code: "error", Text: defaultText(event.Message, "unknown error")}
 	case event.Type == "turn.failed":
 		message := "turn failed"
 		if event.Error != nil {
 			message = defaultText(event.Error.Message, message)
 		}
-		return o.writeDiagnostic("[codex failed] " + message)
+		record = harness.LogRecord{Kind: "diagnostic", Level: "error", Code: "turn_failed", Text: message}
 	case event.Type == "turn.completed":
-		message := "[codex] turn complete"
+		message := "turn complete"
 		if event.Usage != nil {
 			message += fmt.Sprintf(" (in=%d, cached=%d, out=%d)", event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.OutputTokens)
 		}
-		return o.writeDiagnostic(message)
-	case o.mode == OutputCompact && event.Type == "item.started" && event.Item != nil && event.Item.Type == "command_execution":
-		return o.writeDisplay("  $ " + truncateDisplay(defaultText(event.Item.Command, "(command)")))
-	case o.mode == OutputCompact && event.Type == "item.completed" && event.Item != nil && event.Item.Type == "command_execution" && event.Item.ExitCode != 0:
-		return o.writeDisplay(fmt.Sprintf("  [exit %d] %s", event.Item.ExitCode, truncateDisplay(defaultText(event.Item.Command, "(command)"))))
-	case o.mode == OutputCompact && event.Type == "item.completed" && event.Item != nil && event.Item.Type == "file_change":
-		changes := make([]string, 0, len(event.Item.Changes))
-		for _, change := range event.Item.Changes {
-			changes = append(changes, defaultText(change.Kind, "change")+" "+defaultText(change.Path, "?"))
+		record = harness.LogRecord{Kind: "diagnostic", Level: "info", Code: "turn_completed", Text: message}
+	case (event.Type == "item.started" || event.Type == "item.completed") && event.Item != nil && event.Item.Type == "command_execution":
+		phase := "started"
+		if event.Type == "item.completed" {
+			phase = "completed"
 		}
-		return o.writeDisplay("  [files] " + truncateDisplay(strings.Join(changes, ", ")))
+		record = harness.LogRecord{Kind: "command", Phase: phase, Command: event.Item.Command, ExitCode: event.Item.ExitCode}
+	case event.Type == "item.completed" && event.Item != nil && event.Item.Type == "file_change":
+		record.Kind = "file_change"
+		for _, change := range event.Item.Changes {
+			record.Changes = append(record.Changes, harness.FileChange{Kind: change.Kind, Path: change.Path})
+		}
 	default:
-		return nil
+		return nil, nil
 	}
+	return []harness.LogRecord{record}, nil
 }
 
-func (o *ExecutionOutput) writeDisplay(value string) error {
-	if value == "" {
-		return nil
+// RenderEvent renders one framed Codex event in compact or quiet mode.
+// It applies terminal formatting to the same records returned by InterpretEvent.
+func RenderEvent(mode OutputMode, line []byte, operator io.Writer) error {
+	if mode != OutputCompact && mode != OutputQuiet {
+		return fmt.Errorf("unknown Codex event output mode %q", mode)
 	}
-	return writeLine(o.operator, value)
+	if operator == nil {
+		operator = io.Discard
+	}
+	records, err := InterpretEvent(line)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := RenderRecord(mode, record, operator); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (o *ExecutionOutput) writeDiagnostic(value string) error {
-	return writeLine(o.operator, value)
+// RenderRecord formats one semantic record for terminal display.
+func RenderRecord(mode OutputMode, record harness.LogRecord, operator io.Writer) error {
+	if mode != OutputCompact && mode != OutputQuiet {
+		return fmt.Errorf("unknown Codex event output mode %q", mode)
+	}
+	if operator == nil {
+		operator = io.Discard
+	}
+
+	value := ""
+	switch record.Kind {
+	case "message":
+		value = truncateDisplay(record.Text)
+	case "diagnostic":
+		prefix := "[codex error] "
+		if record.Code == "turn_completed" {
+			prefix = "[codex] "
+		}
+		if record.Code == "turn_failed" {
+			prefix = "[codex failed] "
+		}
+		value = prefix + record.Text
+	case "command":
+		if mode == OutputCompact {
+			if record.Phase == "started" {
+				value = "  $ " + truncateDisplay(defaultText(record.Command, "(command)"))
+			}
+			if record.Phase == "completed" && record.ExitCode != nil && *record.ExitCode != 0 {
+				value = fmt.Sprintf("  [exit %d] %s", *record.ExitCode, truncateDisplay(defaultText(record.Command, "(command)")))
+			}
+		}
+	case "file_change":
+		if mode == OutputCompact {
+			changes := make([]string, 0, len(record.Changes))
+			for _, change := range record.Changes {
+				changes = append(changes, defaultText(change.Kind, "change")+" "+defaultText(change.Path, "?"))
+			}
+			value = "  [files] " + truncateDisplay(strings.Join(changes, ", "))
+		}
+	}
+	if value != "" {
+		if err := writeLine(operator, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *ExecutionOutput) renderLine(line []byte) error {
+	return RenderEvent(o.mode, line, o.operator)
 }
 
 func writeLine(writer io.Writer, value string) error {

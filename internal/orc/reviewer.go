@@ -49,7 +49,8 @@ type ReviewerTickets interface {
 }
 
 // RunReviewer continuously claims review tickets until cancellation or a
-// state, harness, or lifecycle error occurs.
+// state, harness, or lifecycle error occurs. A confirmed hold after a successful
+// turn ends the ticket attempt and returns to Ticket queue selection.
 func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) error {
 	if config.RoleName == "" {
 		config.RoleName = "reviewer"
@@ -190,12 +191,13 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
 				if reconcileErr != nil {
-					return reconcileErr
+					return errors.Join(turnErr, reconcileErr)
 				}
 				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
 					if turnErr != nil {
-						logReviewer(config.Diagnostics, "%s: circuit containment handled the completed ticket after a worker error: %v", claimed.ID, turnErr)
+						return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, turnErr)
 					}
+					// A confirmed hold ends this ticket attempt, not the worker.
 					continue
 				}
 			}

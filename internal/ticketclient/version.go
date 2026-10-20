@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-const MinimumSupportedVersion = "0.2.5"
+const MinimumSupportedVersion = "0.2.6"
 
 var minimumVersionChecks sync.Map // absolute executable path -> *versionCheck
 

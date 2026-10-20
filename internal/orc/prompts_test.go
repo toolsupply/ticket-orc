@@ -150,7 +150,17 @@ func TestReviewerPromptRequiresExactOwnedTicket(t *testing.T) {
 			t.Errorf("reviewer prompt %q contains routing or identity text %q", prompt, unwanted)
 		}
 	}
-	if len(prompt) > 440 {
-		t.Fatalf("reviewer prompt length = %d, want at most 440", len(prompt))
+	if len(prompt) > 720 {
+		t.Fatalf("reviewer prompt length = %d, want at most 720", len(prompt))
+	}
+}
+
+func TestManagedPromptsAllowOwnedBlockedOutcome(t *testing.T) {
+	for _, prompt := range []string{CoderPrompt("20261017-01957"), ReviewerPrompt("20261017-01957")} {
+		for _, want := range []string{"Ticket Skill", "concrete blocker", "action needed to resume", "Handoff", "hold this ticket while you still own it", "verify hold", "Do not release it first", "Do not select or work another ticket"} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("prompt %q missing %q", prompt, want)
+			}
+		}
 	}
 }

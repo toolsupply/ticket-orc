@@ -72,15 +72,19 @@ func (c *integratedSteerClient) setReady(ticket string) {
 func (*integratedSteerClient) Close() error { return nil }
 
 type integratedRepositoryWatchProcess struct {
-	done chan error
-	once sync.Once
+	done       chan error
+	waitExited chan struct{}
+	once       sync.Once
 }
 
 func newIntegratedRepositoryWatchProcess() *integratedRepositoryWatchProcess {
-	return &integratedRepositoryWatchProcess{done: make(chan error, 1)}
+	return &integratedRepositoryWatchProcess{done: make(chan error, 1), waitExited: make(chan struct{})}
 }
 
-func (p *integratedRepositoryWatchProcess) Wait() error { return <-p.done }
+func (p *integratedRepositoryWatchProcess) Wait() error {
+	defer close(p.waitExited)
+	return <-p.done
+}
 func (p *integratedRepositoryWatchProcess) Stop() error {
 	p.once.Do(func() { p.done <- context.Canceled })
 	return nil
@@ -353,6 +357,18 @@ func TestRepositoryReadyForcesPostStartupTargetedSteerReconciliation(t *testing.
 }
 
 func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *testing.T) {
+	for _, readyBeforeStartup := range []bool{true, false} {
+		name := "ready_after_startup"
+		if readyBeforeStartup {
+			name = "ready_before_startup"
+		}
+		t.Run(name, func(t *testing.T) {
+			testDynamicSteerIdleIntegration(t, readyBeforeStartup)
+		})
+	}
+}
+
+func testDynamicSteerIdleIntegration(t *testing.T, readyBeforeStartup bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stateDir := t.TempDir()
@@ -411,11 +427,16 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	}
 	watchRuntime := NewRuntimeState(nil)
 	var watcherMu sync.Mutex
-	watcherStarted := make(chan struct{}, 1)
 	watcherStarts := make(map[string][]*integratedRepositoryWatchProcess)
 	watchFixtures := make(map[string]*ticketWatchMetadataFixture)
+	releaseReady := make(chan struct{})
 	watch := newRepositoryWatchManagerWithStarter(ctx, watchRuntime, nil, nil,
-		func(_ context.Context, repository supervisor.ConfiguredRepository, notify func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+		func(ctx context.Context, repository supervisor.ConfiguredRepository, notify func(supervisor.RepositoryWatchEvent)) (supervisor.RepositoryWatchProcess, error) {
+			select {
+			case <-releaseReady:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			process := newIntegratedRepositoryWatchProcess()
 			var fixture *ticketWatchMetadataFixture
 			if repository.ID == joinTestRepositoryID {
@@ -431,13 +452,25 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 				watchFixtures[repository.Key] = fixture
 			}
 			watcherMu.Unlock()
-			select {
-			case watcherStarted <- struct{}{}:
-			default:
-			}
 			return process, nil
 		})
-	defer watch.StopObservers()
+	t.Cleanup(func() {
+		cancel() // Unblock any starter still waiting for the test's READY gate.
+		watch.StopObservers()
+		watcherMu.Lock()
+		var processes []*integratedRepositoryWatchProcess
+		for _, started := range watcherStarts {
+			processes = append(processes, started...)
+		}
+		watcherMu.Unlock()
+		for _, process := range processes {
+			select {
+			case <-process.waitExited:
+			case <-time.After(10 * time.Second):
+				t.Error("repository watch process did not exit during test cleanup")
+			}
+		}
+	})
 
 	runtimeState := NewRuntimeState(nil)
 	controlStore := state.NewDaemonControlStore(stateDir)
@@ -470,11 +503,28 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 		config.steerDirty.MarkRepository(repositoryID)
 		watchReady <- repositoryID
 	})
+	waitReady := func() {
+		t.Helper()
+		readyRepositories := make(map[string]bool, 2)
+		for range 2 {
+			select {
+			case repositoryID := <-watchReady:
+				readyRepositories[repositoryID] = true
+			case <-time.After(2 * time.Second):
+				t.Fatal("repository observers did not report READY")
+			}
+		}
+		if len(readyRepositories) != 2 || !readyRepositories[joinTestRepositoryID] || !readyRepositories[joinOtherRepositoryID] {
+			t.Fatalf("repository READY notifications=%#v", readyRepositories)
+		}
+	}
 	watch.StartObservers()
-	waitIntegratedObserverStarts(t, &watcherMu, watcherStarts, map[string]int{
-		dynamicRepositoryKey(joinTestRepositoryID):  1,
-		dynamicRepositoryKey(joinOtherRepositoryID): 1,
-	}, watcherStarted)
+	if readyBeforeStartup {
+		close(releaseReady)
+		// The READY sink has marked both repositories dirty before bootstrap
+		// drains the dirty set, so startup needs exactly one read per actor.
+		waitReady()
+	}
 
 	registrationTicks := make(chan time.Time)
 	passCompleted := make(chan struct{}, 1)
@@ -514,6 +564,9 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 	if items := statuses.snapshot(); len(items) != 4 {
 		t.Fatalf("initial steer statuses=%#v, want four", items)
 	}
+	// A status publication alone does not prove that the scheduler pass has
+	// finished. No further READY can arrive in either controlled ordering yet.
+	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	initialCalls := snapshotIntegratedSteerCalls(clients)
 	wantInitial := map[string]integratedSteerCalls{
 		"a-one": {active: 2, ready: 1}, "a-two": {active: 2, ready: 1},
@@ -524,21 +577,16 @@ func TestDynamicSteerIdleIntegrationUsesTargetedAuthoritativeObservations(t *tes
 			t.Fatalf("initial authoritative calls for %s=%#v, want %#v", actor, got, want)
 		}
 	}
-	readyRepositories := make(map[string]bool, 2)
-	for range 2 {
-		select {
-		case repositoryID := <-watchReady:
-			readyRepositories[repositoryID] = true
-		case <-time.After(2 * time.Second):
-			t.Fatal("repository observers did not report READY")
-		}
+	if !readyBeforeStartup {
+		close(releaseReady)
+		waitReady()
+		// READY arrived after the baseline: it must force exactly one more
+		// authoritative reconciliation for each repository's actors.
+		settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
+		assertIntegratedSteerCallDelta(t, clients, initialCalls,
+			map[string]int32{"a-one": 2, "a-two": 2, "b-one": 2, "b-two": 2},
+			map[string]int32{"a-one": 1, "a-two": 1, "b-one": 1, "b-two": 1}, callsChanged)
 	}
-	if len(readyRepositories) != 2 || !readyRepositories[joinTestRepositoryID] || !readyRepositories[joinOtherRepositoryID] {
-		t.Fatalf("repository READY notifications=%#v", readyRepositories)
-	}
-	// Consume any reconciliation triggered by observer readiness before
-	// measuring whether unchanged registration ticks cause further Ticket calls.
-	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	settledCalls := snapshotIntegratedSteerCalls(clients)
 	settleIntegratedSteerSchedule(t, registrationTicks, passCompleted)
 	if got := snapshotIntegratedSteerCalls(clients); !equalIntegratedSteerCalls(got, settledCalls) {
@@ -731,37 +779,6 @@ func seedIdleSteerRegistration(t *testing.T, runtime *state.SteerRuntimeStore, r
 	updated, err := runtime.CompleteDelivery(context.Background(), registration, string(orc.SteerIdle), true, false)
 	if err != nil || !updated {
 		t.Fatalf("seed idle delivery for %s: updated=%t err=%v", registration.Actor, updated, err)
-	}
-}
-
-func waitIntegratedObserverStarts(t *testing.T, mu *sync.Mutex, starts map[string][]*integratedRepositoryWatchProcess, want map[string]int, changed <-chan struct{}) {
-	t.Helper()
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for {
-		mu.Lock()
-		ready := true
-		for key, count := range want {
-			if len(starts[key]) < count {
-				ready = false
-				break
-			}
-		}
-		mu.Unlock()
-		if ready {
-			return
-		}
-		select {
-		case <-changed:
-		case <-deadline.C:
-			mu.Lock()
-			counts := make(map[string]int, len(starts))
-			for key, processes := range starts {
-				counts[key] = len(processes)
-			}
-			mu.Unlock()
-			t.Fatalf("repository observer starts=%#v, want at least %#v", counts, want)
-		}
 	}
 }
 

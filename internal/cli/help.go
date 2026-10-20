@@ -35,6 +35,7 @@ Worker management:
 
 Queue control:
   queue	Forecast work for configured and registered owners
+  watch	Watch Orc activity and local managed-worker output (default: all)
 
 Daemon control:
   endpoint	Print the local daemon capability URL
@@ -279,8 +280,9 @@ const runCommandHelp = `
 Usage:
   ticket-orc run [options]
 
-Run the selected named workers as a foreground supervisor. A bare run may
-remain idle when no startup groups are configured; it never means --all.
+Run the selected named workers as a foreground supervisor. Without explicit
+selectors, start supervisor.startup_groups, or all configured workers when
+that list is omitted or empty. With no configured workers, run remains idle.
 
 Options:
   --worker NAME             Select a worker (repeatable)
@@ -354,6 +356,9 @@ Usage:
 Validate the complete configuration without claiming tickets, launching a
 harness, contacting Ticket, or changing orchestration state.
 
+Every supervisor.startup_groups entry must have configured worker members,
+including membership inherited from roles.
+
 Role configuration may set roles.<name>.ticket_tags; every listed tag is
 required. roles.<name>.ticket_without_tags excludes tickets carrying any listed
 tag. review.skip_tags also excludes review tickets and retains its review
@@ -418,7 +423,7 @@ Worker management:
 
 Queue control:
   queue   	Show the current scheduling forecast
-  watch   	Show live Orc activity until Ctrl-C
+  watch   	Show live Orc activity and managed-worker output (default: all)
 
 Daemon control:
   daemon  	Pause, resume, or abort daemon-wide work dispatch
@@ -471,6 +476,8 @@ func writeHelpTopic(topic []string, out io.Writer) bool {
 			fmt.Fprint(out, versionHelp)
 		case "status", "worker", "group", "pause", "resume", "abort", "reload", "shutdown":
 			writeDaemonHelp(out, topic[0])
+		case "watch":
+			fmt.Fprint(out, watchHelp)
 		default:
 			return false
 		}
@@ -547,7 +554,7 @@ func writeConsoleTopicHelp(w io.Writer, topic string) {
 	case "start", "stop", "restart", "pause", "resume":
 		fmt.Fprintf(w, "\nInteractive console help: %s\n\n  %s NAME  Operate on one worker; NAME may be all.\n", topic, topic)
 	case "watch":
-		fmt.Fprint(w, "\nInteractive console help: watch\n\n  watch  Show live Orc activity until Ctrl-C returns to the console.\n")
+		fmt.Fprint(w, "\nInteractive console help: watch\n\n  watch [orc|all|WORKER] [--verbose]  Default: all Orc activity and local worker output; WORKER selects one worker.\n  Rows use [repo:orc] or [repo:actor] (worker name if no actor); instance-wide events use [orc].\n  Explicit watch orc keeps the legacy Orc-only table and supports remote endpoints.\n  All rows use local viewer observation time. Default output shows messages, diagnostics and turn summaries.\n  --verbose also shows readable commands and file changes.\n  Ctrl-C returns to the console without stopping workers.\n")
 	case "doctor":
 		fmt.Fprint(w, "\nInteractive console help: doctor\n\n  doctor  Reload configuration and start every safely recoverable configured worker. Reports workers that still need manual action.\n")
 	case "reload":

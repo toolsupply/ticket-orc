@@ -314,3 +314,23 @@ func TestRenderRoleFailureOmitsRawCommandDetails(t *testing.T) {
 		t.Fatalf("raw command details leaked: %q", text)
 	}
 }
+
+func TestRuntimeLogSourceIncludesStoppedWorkersAndAuthoritativeIdentity(t *testing.T) {
+	worker := supervisor.RunWorker{Name: "stable.worker", Config: supervisor.RoleConfig{Role: RoleCoder, RoleName: "backend", Harness: "pi", RepositoryIdentity: joinOtherRepositoryID}, TicketInfo: &ticketclient.RepositoryInfo{ID: joinTestRepositoryID}}
+	runtime := NewRuntimeState([]supervisor.RunWorker{worker})
+	source := runtimeLogSource(t.TempDir(), runtime)
+	first := source.Inventory()
+	if len(first.Workers) != 1 || first.Workers[0].Name != worker.Name || first.Workers[0].Role != "backend" || first.Workers[0].Harness != "pi" || first.Workers[0].RepositoryID != joinTestRepositoryID {
+		t.Fatalf("catalog=%+v", first)
+	}
+	worker.Config.Model = "new-model"
+	runtime.SetEffectiveWorker(worker)
+	if !reflect.DeepEqual(source.Inventory(), first) {
+		t.Fatal("model changed log identity")
+	}
+	worker.Config.Harness = "claude"
+	runtime.SetEffectiveWorker(worker)
+	if got := source.Inventory().Workers[0].Harness; got != "claude" {
+		t.Fatalf("stale runtime harness=%s", got)
+	}
+}

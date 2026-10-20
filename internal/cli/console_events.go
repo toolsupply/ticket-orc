@@ -127,6 +127,7 @@ func renderConsoleEvent(out io.Writer, event daemon.Event) {
 }
 
 type consoleWatchRenderer struct {
+	unified      bool
 	date         string
 	repositories map[string]daemon.RepositoryStatus
 }
@@ -149,7 +150,10 @@ func (renderer *consoleWatchRenderer) hasRepository(id string) bool {
 	return ok
 }
 
-func (renderer *consoleWatchRenderer) render(out io.Writer, event daemon.Event, at time.Time) {
+func (renderer *consoleWatchRenderer) render(out io.Writer, event daemon.Event, at time.Time) error {
+	if renderer.unified {
+		return writeWatchLines(out, at, renderer.orcLabel(event), unifiedEventMessage(event))
+	}
 	var output strings.Builder
 	date := at.Local().Format("2006-01-02")
 	if renderer.date != "" && renderer.date != date {
@@ -157,7 +161,7 @@ func (renderer *consoleWatchRenderer) render(out io.Writer, event daemon.Event, 
 	}
 	renderer.date = date
 	renderConsoleEventAt(&output, event, at, renderer.repositories)
-	_, _ = io.WriteString(out, output.String())
+	return writeWatchOutput(out, output.String())
 }
 
 func renderConsoleEventAt(out io.Writer, event daemon.Event, at time.Time, repositories map[string]daemon.RepositoryStatus) {
@@ -237,11 +241,19 @@ func newConsoleEventTracker() *consoleEventTracker {
 	return &consoleEventTracker{states: make(map[string]string), repositories: make(map[string]string), workers: make(map[string]consoleWatchWorker), steerSessions: make(map[string]steerWatchIdentity)}
 }
 
+func (tracker *consoleEventTracker) refreshWorkers(status daemon.Status) {
+	for _, worker := range status.Workers {
+		if worker.Name != "" {
+			tracker.workers[worker.Name] = consoleWatchWorker{Role: worker.Role, Actor: worker.TicketActor, RepositoryID: worker.RepositoryID, RepositoryName: worker.RepositoryName}
+		}
+	}
+}
+
 func (tracker *consoleEventTracker) seed(status daemon.Status) {
+	tracker.refreshWorkers(status)
 	for _, worker := range status.Workers {
 		if worker.Name != "" {
 			tracker.states[worker.Name] = worker.State
-			tracker.workers[worker.Name] = consoleWatchWorker{Role: worker.Role, Actor: worker.TicketActor, RepositoryID: worker.RepositoryID, RepositoryName: worker.RepositoryName}
 		}
 	}
 	for _, repository := range status.Repositories {
@@ -293,7 +305,7 @@ func (tracker *consoleEventTracker) prepare(event daemon.Event) daemon.Event {
 		return event
 	}
 	previous, found := tracker.steerSessions[key]
-	if event.Code == "" || event.Code == "ready" || event.Code == "busy" || event.Code == "idle" || event.Code == "consumed" || event.Code == "awaiting_claim" {
+	if event.Phase == "" && (event.Code == "" || event.Code == "ready" || event.Code == "busy" || event.Code == "idle" || event.Code == "consumed" || event.Code == "awaiting_claim") {
 		switch {
 		case !found:
 			event.Phase = "session_joined"
@@ -421,7 +433,16 @@ func consoleEventMessage(event daemon.Event) string {
 	case "doctor.failed":
 		return "worker recovery failed"
 	case "steer.status":
+		if event.Failure != nil {
+			return consoleSteerSessionActivity(daemon.SteerStatus{State: event.State, Code: event.Code, Failure: event.Failure})
+		}
 		switch event.Phase {
+		case "ticket_observation_recovered":
+			activity := consoleSteerActivity(event.State, event.Code)
+			if event.State == "consumed" || event.Code == "busy" || event.Code == "consumed" {
+				activity = watchTicketMessage("claimed", event)
+			}
+			return "Ticket observation recovered; " + activity
 		case "session_joined":
 			if event.Code == "ready" {
 				return "session joined; ready work available"
@@ -464,7 +485,7 @@ func consoleEventMessage(event daemon.Event) string {
 		}
 		switch event.State {
 		case "none":
-			return "session joined; no work available"
+			return "no work available"
 		case "sending":
 			return watchNotificationMessage("sending", event)
 		case "queued":

@@ -48,6 +48,10 @@ func writeDaemonHelp(out io.Writer, command string) {
 }
 
 func parseDaemonCommandOptions(args []string, lookupEnv envLookup, allowOutput bool) (daemonCommandOptions, []string, bool, error) {
+	return parseDaemonOptions(args, lookupEnv, allowOutput, false)
+}
+
+func parseDaemonOptions(args []string, lookupEnv envLookup, allowOutput, allowWatch bool) (daemonCommandOptions, []string, bool, error) {
 	options := daemonCommandOptions{output: OutputCompact}
 	options.environmentURL, _ = lookupEnv("TICKET_ORC_ENDPOINT")
 	if value, ok := lookupEnv("TICKET_ORC_OUTPUT"); ok && value != "" {
@@ -58,6 +62,8 @@ func parseDaemonCommandOptions(args []string, lookupEnv envLookup, allowOutput b
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case allowWatch && arg == "--verbose":
+			positionals = append(positionals, arg)
 		case arg == "-h" || arg == "--help":
 			help = true
 		case arg == "--endpoint" || strings.HasPrefix(arg, "--endpoint="):
@@ -120,6 +126,11 @@ func parseDaemonCommandOptions(args []string, lookupEnv envLookup, allowOutput b
 		}
 	}
 	if help {
+		if allowWatch {
+			if _, err := parseWatchOptions(positionals); err != nil {
+				return daemonCommandOptions{}, nil, false, err
+			}
+		}
 		return options, nil, true, nil
 	}
 	if options.configPath != "" && options.endpoint == "" {

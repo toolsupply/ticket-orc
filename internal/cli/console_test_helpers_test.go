@@ -34,6 +34,7 @@ type consoleWatchStartWriter struct {
 	stopped    chan struct{}
 	prompted   chan struct{}
 	detached   chan struct{}
+	startMatch string
 	matched    chan struct{}
 	match      string
 	once       sync.Once
@@ -45,7 +46,7 @@ type consoleWatchStartWriter struct {
 func (writer *consoleWatchStartWriter) Write(data []byte) (int, error) {
 	text := string(data)
 	n, err := writer.Buffer.Write(data)
-	if writer.started != nil && strings.Contains(text, "Watching activity.") {
+	if writer.started != nil && (strings.Contains(text, "Watching activity.") || writer.startMatch != "" && strings.Contains(text, writer.startMatch)) {
 		writer.once.Do(func() { close(writer.started) })
 	}
 	if writer.stopped != nil && strings.Contains(text, "watch stopped") {

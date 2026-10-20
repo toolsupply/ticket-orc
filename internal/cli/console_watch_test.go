@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/harness"
 )
 
 func TestConsoleWatchHeaderMovesSessionAndRemovesTicketColumn(t *testing.T) {
@@ -220,7 +222,7 @@ func TestConsoleWatchRefreshesUnknownRepositoryFromStatus(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/v1/status"):
 			status := daemon.Status{Workers: []daemon.WorkerStatus{}}
-			if statusCalls.Add(1) > 1 {
+			if statusCalls.Add(1) > 2 {
 				status.Repositories = []daemon.RepositoryStatus{{ID: repositoryID, Name: "New Project", Path: "/work/new-project/tickets", State: "healthy"}}
 			}
 			_ = json.NewEncoder(w).Encode(status)
@@ -264,6 +266,9 @@ func TestConsoleWatchRefreshesUnknownRepositoryFromStatus(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("console did not stop after cancellation")
+	}
+	if statusCalls.Load() < 3 {
+		t.Fatalf("unknown repository did not refresh status: calls=%d", statusCalls.Load())
 	}
 	var eventRow string
 	for _, line := range strings.Split(watchOutput.String(), "\n") {
@@ -312,7 +317,7 @@ func TestConsoleWatchReturnsToPromptOnInterrupt(t *testing.T) {
 	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/status":
-			_ = json.NewEncoder(w).Encode(daemon.Status{Workers: []daemon.WorkerStatus{{Name: "coder", State: "running"}}})
+			_ = json.NewEncoder(w).Encode(daemon.Status{Workers: []daemon.WorkerStatus{{Name: "coder", Role: "coder", Harness: "codex", RepositoryID: joinTestRepositoryID, State: "running"}}})
 		case "/v1/events":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, ": connected\n\n")
@@ -334,7 +339,7 @@ func TestConsoleWatchReturnsToPromptOnInterrupt(t *testing.T) {
 		done <- runConsoleLoopWithSelectionPolicy(context.Background(), stateDir, reader, watchOutput, &errorsOut, interrupts, "", false, nil)
 	}()
 	waitConsoleMilestone(t, prompts, "initial prompt")
-	_, _ = io.WriteString(writer, "watch\n")
+	_, _ = io.WriteString(writer, "watch orc\n")
 	waitConsoleMilestone(t, watchStarted, "watch mode")
 	interrupts <- os.Interrupt
 	waitConsoleMilestone(t, watchStopped, "watch stop notice")
@@ -361,6 +366,109 @@ func TestConsoleWatchReturnsToPromptOnInterrupt(t *testing.T) {
 	headerIndex := strings.Index(text, consoleWatchHeader())
 	if headerIndex < 0 || !strings.HasPrefix(text[headerIndex+len(consoleWatchHeader()):], "\nwatch stopped") {
 		t.Fatalf("watch header should be followed directly by activity, then stop notice: %q", text)
+	}
+}
+
+func TestConsoleWorkerWatchReadsOutputAndStopsWithoutStoppingDaemon(t *testing.T) {
+	for _, verbose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verbose=%t", verbose), func(t *testing.T) {
+			eventReady := make(chan struct{})
+			eventDone := make(chan struct{})
+			var readyOnce, doneOnce sync.Once
+			var shutdownCalls atomic.Int32
+			server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/status":
+					_ = json.NewEncoder(w).Encode(daemon.Status{Workers: []daemon.WorkerStatus{{Name: "coder", Role: "coder", Harness: "codex", RepositoryID: joinTestRepositoryID, State: "running"}}})
+				case "/v1/events":
+					defer doneOnce.Do(func() { close(eventDone) })
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "id: 0\nevent: stream.sync\ndata: {\"seq\":0,\"type\":\"stream.sync\"}\n\n")
+					w.(http.Flusher).Flush()
+					readyOnce.Do(func() { close(eventReady) })
+					<-r.Context().Done()
+				case "/v1/shutdown":
+					shutdownCalls.Add(1)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			reader, writer := io.Pipe()
+			interrupts := make(chan os.Signal, 1)
+			var errorsOut bytes.Buffer
+			watchStarted := make(chan struct{})
+			watchStopped := make(chan struct{})
+			prompts := make(chan struct{}, 3)
+			outputMatched := make(chan struct{})
+			watchOutput := &consoleWatchStartWriter{started: watchStarted, startMatch: "Watching worker coder output", stopped: watchStopped, prompted: prompts, matched: outputMatched, match: "[11111111…:coder] hello from worker"}
+			exited := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				done <- runConsoleLoopWithSelectionPolicy(context.Background(), stateDir, reader, watchOutput, &errorsOut, interrupts, "", false, nil)
+				close(exited)
+			}()
+			t.Cleanup(func() {
+				_ = writer.Close()
+				_ = reader.Close()
+				select {
+				case <-exited:
+				case <-time.After(time.Second):
+					t.Errorf("console goroutine did not stop during cleanup")
+				}
+				select {
+				case <-eventReady:
+					select {
+					case <-eventDone:
+					case <-time.After(time.Second):
+						t.Errorf("event stream did not stop during cleanup")
+					}
+				default:
+				}
+				server.CloseClientConnections()
+			})
+			waitConsoleMilestone(t, prompts, "initial prompt")
+			command := "watch coder"
+			if verbose {
+				command += " --verbose"
+			}
+			_, _ = io.WriteString(writer, command+"\n")
+			waitConsoleMilestone(t, watchStarted, "worker watch mode")
+			waitConsoleMilestone(t, eventReady, "event stream readiness")
+			log, err := harness.OpenRawLog("Codex", stateDir, "20261017-00001", "coder", time.Now(), "codex", "coder")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(log, watchDetailEvents+`{"type":"item.completed","item":{"type":"agent_message","text":"hello from worker"}}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Close(); err != nil {
+				t.Fatal(err)
+			}
+			waitConsoleMilestone(t, outputMatched, "worker output")
+			interrupts <- os.Interrupt
+			waitConsoleMilestone(t, watchStopped, "worker watch stop notice")
+			waitConsoleMilestone(t, prompts, "prompt after worker watch stop")
+			_, _ = io.WriteString(writer, "quit\n")
+			_ = writer.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("console did not exit")
+			}
+			if shutdownCalls.Load() != 0 {
+				t.Fatal("stopping the viewer requested daemon shutdown")
+			}
+			if !strings.Contains(watchOutput.String(), "Watching worker coder output") || !strings.Contains(watchOutput.String(), "[11111111…:coder] hello from worker") || !strings.Contains(watchOutput.String(), "watch stopped") {
+				t.Fatalf("worker watch output=%q errors=%q", watchOutput.String(), errorsOut.String())
+			}
+			if strings.Contains(watchOutput.String(), "noisy-command") != verbose || strings.Contains(watchOutput.String(), "changed.go") != verbose {
+				t.Fatalf("console verbosity=%t output=%q", verbose, watchOutput.String())
+			}
+		})
 	}
 }
 

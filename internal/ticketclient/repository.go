@@ -88,12 +88,17 @@ func (c *Client) ListTickets(ctx context.Context, query ListQuery) (ListResult, 
 		}
 		args = append(args, "--tag", tag)
 	}
-	args = append(args, "--limit", fmt.Sprint(query.Limit), "--offset", fmt.Sprint(query.Offset), "--fields", "id,title,state,priority,assignee,tags,parent,depends_on")
+	args = append(args, "--limit", fmt.Sprint(query.Limit), "--offset", fmt.Sprint(query.Offset), "--fields", "id,title,state,priority,assignee,tags,parent,depends_on,modified")
 	if err := c.invoke(ctx, args, &response); err != nil {
 		return ListResult{}, err
 	}
 	if err := normalizeListResult(&response); err != nil {
 		return ListResult{}, err
+	}
+	for _, item := range response.Items {
+		if _, err := time.Parse(time.RFC3339, item.Modified); err != nil {
+			return ListResult{}, fmt.Errorf("%w: list item %q has missing or invalid modified timestamp; Ticket must support list --fields modified", ErrProtocol, item.ID)
+		}
 	}
 	return response, nil
 }

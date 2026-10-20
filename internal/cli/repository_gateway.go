@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,8 +27,60 @@ func (m *workerManager) repositoryGateway() daemon.RepositoryGateway {
 		CreateTicket:          m.createRepositoryTicket,
 		UpdateTicket:          m.updateRepositoryTicket,
 		MutateTicket:          m.mutateRepositoryTicket,
+		DeleteTicket:          m.deleteRepositoryTicket,
 		TicketBodyBudgetBytes: ticketclient.RepositoryDetailBodyBudgetBytes,
 	}
+}
+
+func (m *workerManager) deleteRepositoryTicket(ctx context.Context, repositoryID, id string, request daemon.RepositoryTicketDeleteRequest) (daemon.RepositoryTicketDeletion, error) {
+	if err := ticketclient.ValidateActor(request.Actor); err != nil {
+		return daemon.RepositoryTicketDeletion{}, repositoryMutationError("invalid_actor", 400, "ticket actor is invalid", false, err)
+	}
+	if err := ticketclient.ValidateFullID(id); err != nil {
+		return daemon.RepositoryTicketDeletion{}, repositoryMutationError("invalid_ticket", 400, "ticket ID is invalid", false, err)
+	}
+	repository, err := m.repositoryTarget(repositoryID)
+	if err != nil {
+		return daemon.RepositoryTicketDeletion{}, err
+	}
+	client, err := ticketclient.NewWithTarget(request.Actor, ticketTargetFromConfiguredRepository(repository))
+	if err != nil {
+		return daemon.RepositoryTicketDeletion{}, repositoryMutationNotAppliedFailure(err)
+	}
+	defer client.Close()
+	result, err := supervisor.DeleteRepositoryTicket(ctx, m.lifecycle, client, m.localDir, repository.ID, id)
+	if err != nil {
+		return daemon.RepositoryTicketDeletion{}, repositoryDeletionFailure(err)
+	}
+	return daemon.RepositoryTicketDeletion{RepositoryID: repository.ID, RepositoryKey: repository.Key, ID: result.ID, Operation: "delete", Changed: result.Changed}, nil
+}
+
+func repositoryDeletionFailure(err error) error {
+	if errors.Is(err, supervisor.ErrRepositoryWorkersRunning) {
+		return repositoryMutationError("repository_workers_running", 409, supervisor.ErrRepositoryWorkersRunning.Error(), false, err)
+	}
+	var cleanupErr *supervisor.TicketDeletionCleanupError
+	if errors.As(err, &cleanupErr) {
+		return repositoryMutationError("deletion_cleanup_failed", 502, "Ticket deletion applied; Orc bookkeeping cleanup failed", true, err)
+	}
+	failure := repositoryMutationFailure(err).(*daemon.RepositoryMutationError)
+	var commandErr *ticketclient.CommandError
+	if errors.As(err, &commandErr) {
+		var applied *bool
+		// JSON null is not evidence that a destructive mutation was rejected.
+		if raw, ok := commandErr.Details["mutation_applied"]; ok && json.Unmarshal(raw, &applied) == nil && applied != nil {
+			failure.Applied, failure.AppliedKnown = *applied, true
+		}
+		// Only stable public codes cross the boundary; raw Ticket messages may
+		// include private storage paths or command output.
+		switch commandErr.Code {
+		case "not_found":
+			failure.Code, failure.Status, failure.Message = "ticket_not_found", 404, "Ticket deletion target was not found"
+		case "archived":
+			failure.Code, failure.Status, failure.Message = "ticket_archived", 409, "Ticket deletion target is archived"
+		}
+	}
+	return failure
 }
 
 func (m *workerManager) repositoryTarget(repositoryID string) (supervisor.ConfiguredRepository, error) {
@@ -138,7 +192,7 @@ func (m *workerManager) createRepositoryTicket(ctx context.Context, repositoryID
 		return daemon.RepositoryTicketMutation{}, repositoryMutationNotAppliedFailure(err)
 	}
 	defer client.Close()
-	input := ticketclient.CreateInput{Title: request.Title, Priority: request.Priority, Tags: request.Tags, Parent: request.Parent, DependsOn: request.DependsOn, Sections: request.Sections}
+	input := ticketclient.CreateInput{Title: request.Title, State: request.State, Assignee: request.Assignee, Priority: request.Priority, Tags: request.Tags, Parent: request.Parent, DependsOn: request.DependsOn, Sections: request.Sections}
 	mutation, err := client.CreateTicket(ctx, input)
 	if err != nil {
 		return daemon.RepositoryTicketMutation{}, repositoryMutationFailure(err)
@@ -273,7 +327,7 @@ func validRepositoryMutation(operation string) bool {
 }
 
 func repositoryTicketView(ticket ticketclient.Ticket) daemon.RepositoryTicket {
-	return daemon.RepositoryTicket{ID: ticket.ID, Title: ticket.Title, State: ticket.State, Priority: ticket.Priority, Assignee: ticket.Assignee, Parent: ticket.Parent, Tags: append([]string(nil), ticket.Tags...), DependsOn: append([]string(nil), ticket.DependsOn...)}
+	return daemon.RepositoryTicket{ID: ticket.ID, Modified: ticket.Modified, Title: ticket.Title, State: ticket.State, Priority: ticket.Priority, Assignee: ticket.Assignee, Parent: ticket.Parent, Tags: append([]string(nil), ticket.Tags...), DependsOn: append([]string(nil), ticket.DependsOn...)}
 }
 
 func repositoryTicketDetailView(ticket ticketclient.TicketDetail) daemon.RepositoryTicket {

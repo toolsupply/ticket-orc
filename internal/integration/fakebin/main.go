@@ -48,7 +48,7 @@ func runClaude() {
 
 func runTicket() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Fprintln(os.Stdout, "ticket 0.2.5 (api 2, storage 3)")
+		fmt.Fprintln(os.Stdout, "ticket 0.2.6 (api 2, storage 3)")
 		return
 	}
 	logPath := os.Getenv("TICKET_ORC_FAKE_TICKET_LOG")

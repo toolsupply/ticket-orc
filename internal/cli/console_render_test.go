@@ -44,7 +44,7 @@ func TestRenderConsoleEventPrefixesTimestampAndTicket(t *testing.T) {
 	}
 }
 
-func TestConsoleWorkersRendersOnlySessionTable(t *testing.T) {
+func TestConsoleWorkersSteerOnlyRendersSessionTable(t *testing.T) {
 	var output bytes.Buffer
 	status := daemon.Status{
 		Steer: []daemon.SteerStatus{

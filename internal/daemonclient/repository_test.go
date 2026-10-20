@@ -53,7 +53,7 @@ func TestRepositoryClientUsesInventoryIDAndTypedComposedFilters(t *testing.T) {
 			if query.Get("q") != "parent parser" || !reflect.DeepEqual(query["state"], []string{"open", "review"}) || !reflect.DeepEqual(priorityValues, []string{"1"}) || query.Get("assignee") != "coder" || !reflect.DeepEqual(query["tag"], []string{"ui", "api"}) || query.Get("limit") != "17" || query.Get("offset") != "6" {
 				t.Errorf("repository ticket query=%#v raw=%q", query, request.URL.RawQuery)
 			}
-			return repositoryResponse(request, http.StatusOK, "application/json", `{"repository_id":"`+testRepositoryID+`","repository_key":"repo-42","items":[{"id":"20260925-00001","title":"matches","state":"open","priority":1,"assignee":"coder","parent":"20260924-00002","tags":["ui"]}],"more":true}`), nil
+			return repositoryResponse(request, http.StatusOK, "application/json", `{"repository_id":"`+testRepositoryID+`","repository_key":"repo-42","items":[{"id":"20260925-00001","title":"matches","state":"open","priority":1,"assignee":"coder","parent":"20260924-00002","modified":"2026-10-18T04:05:06.123456789+02:00","tags":["ui"]}],"more":true}`), nil
 		default:
 			t.Errorf("unexpected request %s %s", request.Method, request.URL)
 			return repositoryResponse(request, http.StatusNotFound, "application/json", `{"error":{"code":"not_found","message":"unexpected path"}}`), nil
@@ -74,7 +74,7 @@ func TestRepositoryClientUsesInventoryIDAndTypedComposedFilters(t *testing.T) {
 		Search: "parent parser", States: []string{"open", "review"}, Priority: &priority,
 		Assignee: "coder", Tags: []string{"ui", "api"}, Limit: 17, Offset: 6,
 	})
-	if err != nil || len(result.Items) != 1 || result.Items[0].Parent != "20260924-00002" || !result.More {
+	if err != nil || len(result.Items) != 1 || result.Items[0].Modified != "2026-10-18T04:05:06.123456789+02:00" || result.Items[0].Parent != "20260924-00002" || !result.More {
 		t.Fatalf("repository tickets=%#v err=%v", result, err)
 	}
 	if !reflect.DeepEqual(paths, []string{"/capability/v1/repositories", "/capability/v1/repositories/" + testRepositoryID, "/capability/v1/repositories/" + testRepositoryID + "/tickets"}) {

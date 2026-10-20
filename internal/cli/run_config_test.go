@@ -297,6 +297,43 @@ func TestSelectRunWorkersUsesConfiguredStartupGroups(t *testing.T) {
 	}
 }
 
+func TestSelectRunWorkersStartupGroupsAndExplicitPrecedence(t *testing.T) {
+	config := FileConfig{
+		Workers: map[string]WorkerFileConfig{
+			"alpha": {Groups: []string{"coding", "shared"}},
+			"beta":  {Groups: []string{"reviewing", "shared"}},
+			"gamma": {Groups: []string{"other"}},
+		},
+		Supervisor: SupervisorFileConfig{StartupGroups: []string{"shared", "coding"}},
+	}
+	for _, test := range []struct {
+		name            string
+		workers, groups []string
+		all             bool
+		want            []string
+	}{
+		{name: "startup union", want: []string{"alpha", "beta"}},
+		{name: "worker overrides", workers: []string{"gamma"}, want: []string{"gamma"}},
+		{name: "group overrides", groups: []string{"other"}, want: []string{"gamma"}},
+		{name: "explicit union", workers: []string{"gamma", "gamma"}, groups: []string{"coding", "other"}, want: []string{"gamma", "alpha"}},
+		{name: "all overrides", all: true, want: []string{"alpha", "beta", "gamma"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := selectRunWorkers(config, test.workers, test.groups, test.all)
+			if err != nil || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("selected=%v err=%v, want %v", got, err, test.want)
+			}
+		})
+	}
+	for _, selectors := range []struct{ workers, groups []string }{
+		{workers: []string{"missing"}}, {groups: []string{"missing"}},
+	} {
+		if _, err := selectRunWorkers(config, selectors.workers, selectors.groups, true); err == nil {
+			t.Fatal("--all hid an unknown explicit selector")
+		}
+	}
+}
+
 func TestSelectRunWorkersUsesAdditiveRoleGroups(t *testing.T) {
 	config := FileConfig{
 		DefaultRole: "coder",

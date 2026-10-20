@@ -9,6 +9,7 @@ type Capabilities struct {
 	WorkerActions []string               `json:"worker_actions"`
 	GroupActions  []string               `json:"group_actions"`
 	Repositories  RepositoryCapabilities `json:"repositories"`
+	Logs          LogCapabilities        `json:"logs"`
 }
 
 // RepositoryCapabilities describes the repository HTTP surface and its
@@ -19,6 +20,7 @@ type RepositoryCapabilities struct {
 	TicketDetail          bool     `json:"ticket_detail"`
 	TicketCreate          bool     `json:"ticket_create"`
 	TicketUpdate          bool     `json:"ticket_update"`
+	TicketDelete          bool     `json:"ticket_delete"`
 	TicketActions         []string `json:"ticket_actions"`
 	MaxPageSize           int      `json:"max_page_size"`
 	MaxSearchBytes        int      `json:"max_search_bytes"`
@@ -38,16 +40,23 @@ func (s *Server) capabilities() Capabilities {
 			TicketDetail:   gateway.GetTicket != nil,
 			TicketCreate:   gateway.CreateTicket != nil,
 			TicketUpdate:   gateway.UpdateTicket != nil,
+			TicketDelete:   gateway.DeleteTicket != nil,
 			TicketActions:  []string{},
 			MaxPageSize:    repositoryTicketMaxPageSize,
 			MaxSearchBytes: repositoryTicketMaxSearchBytes,
 		},
+	}
+	if s.config.Logs != nil && s.config.Logs.Inventory != nil {
+		capabilities.Logs = LogCapabilities{Stream: true, SchemaVersion: 1, Kinds: logKinds(), DefaultKinds: logDefaultKinds(), Harnesses: []string{"codex", "claude", "pi"}, MaxRecordBytes: MaxLogRecordBytes}
 	}
 	if gateway.GetTicket != nil {
 		capabilities.Repositories.TicketBodyBudgetBytes = gateway.TicketBodyBudgetBytes
 	}
 	if gateway.MutateTicket != nil {
 		capabilities.Repositories.TicketActions = repositoryMutationOperations()
+	}
+	if gateway.DeleteTicket != nil {
+		capabilities.Repositories.TicketActions = append(capabilities.Repositories.TicketActions, "delete")
 	}
 	control := s.config.Control
 	if control == nil {

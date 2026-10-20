@@ -100,6 +100,7 @@ func TestMainPageCommandsHaveHelpPaths(t *testing.T) {
 		{"resume", []string{"help", "resume"}, "ticket-orc resume"},
 		{"abort", []string{"help", "abort"}, "ticket-orc abort"},
 		{"queue", []string{"help", "queue"}, "ticket-orc queue"},
+		{"watch", []string{"help", "watch"}, "ticket-orc watch"},
 		{"endpoint", []string{"help", "endpoint"}, "ticket-orc endpoint"},
 		{"attach", []string{"help", "attach"}, "ticket-orc attach"},
 		{"reload", []string{"help", "reload"}, "ticket-orc reload"},
@@ -179,7 +180,7 @@ func TestConfigCheckHelpDescribesRoleTagRouting(t *testing.T) {
 	if code := run([]string{"help", "config", "check"}, &stdout, &stderr, emptyEnv, rejectExecution); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("config check help: code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"roles.<name>.ticket_tags", "every listed tag is", "review.skip_tags", "committed reload", "running managed workers", "one unassigned signoff entry", "one exact unclaimed ticket per wake", "atomic human handoff", "Overlapping signoff selectors"} {
+	for _, want := range []string{"supervisor.startup_groups", "must have configured worker members", "membership inherited from roles", "roles.<name>.ticket_tags", "every listed tag is", "review.skip_tags", "committed reload", "running managed workers", "one unassigned signoff entry", "one exact unclaimed ticket per wake", "atomic human handoff", "Overlapping signoff selectors"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("config check help omitted %q: %q", want, stdout.String())
 		}
@@ -673,7 +674,7 @@ func TestRunCommandHelpAndIdleConfiguration(t *testing.T) {
 	if code := runWithExecutors([]string{"run", "--help"}, &stdout, &stderr, emptyEnv, rejectingExecutors()); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("run help code = %d, stderr = %q", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "--group NAME") || !strings.Contains(stdout.String(), "never means --all") {
+	if !strings.Contains(stdout.String(), "--group NAME") || !strings.Contains(stdout.String(), "all configured workers") || !strings.Contains(stdout.String(), "omitted or empty") {
 		t.Fatalf("run help = %q", stdout.String())
 	}
 
@@ -832,6 +833,7 @@ func TestRunCommandFailureDiagnosticsHaveCauseWithoutPhasePreamble(t *testing.T)
 			setup: func(t *testing.T, config RunConfig) RunConfig {
 				worker := supervisorTestWorker("worker", config.StateDir)
 				config.Workers = []supervisor.RunWorker{worker}
+				config.StartupWorkers = []string{worker.Name}
 				config.Runtime = NewRuntimeState(config.Workers)
 				config.startChild = func(context.Context, string, string, supervisor.RunWorker, io.Writer, io.Writer, *sync.Mutex, *sync.Mutex) (*runChild, error) {
 					return nil, errors.New("injected worker start failure")

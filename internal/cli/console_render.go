@@ -84,11 +84,11 @@ func renderConsoleSteerStatus(out io.Writer, sessions []daemon.SteerStatus, repo
 			fmt.Fprintf(out, "Role: %s\n", consoleField(session.Role))
 			fmt.Fprintf(out, "Ticket actor: %s\n", consoleField(session.Actor))
 			fmt.Fprintf(out, "State: %s\n", consoleSteerState(session.State))
-			fmt.Fprintf(out, "Activity: %s\n", consoleSteerActivity(session.State, session.Code))
+			fmt.Fprintf(out, "Activity: %s\n", consoleSteerSessionActivity(session))
 			if session.ManagedOwner != "" {
 				fmt.Fprintf(out, "  Conflict: actor %s is owned by managed worker %s\n", consoleField(session.Actor), consoleField(session.ManagedOwner))
 			}
-			if session.Code != "" {
+			if session.Code != "" && session.Failure == nil {
 				fmt.Fprintf(out, "  Detail: %s\n", consoleField(humanDeliveryCode(session.Code)))
 			}
 			fmt.Fprintln(out)
@@ -99,13 +99,17 @@ func renderConsoleSteerStatus(out io.Writer, sessions []daemon.SteerStatus, repo
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, renderColumnRow([]string{"Repository", "Session", "Role", "Ticket actor", "State", "Activity"}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
 	for _, session := range sessions {
-		fmt.Fprintln(out, renderColumnRow([]string{sessionRepositoryLabel(session, repositories), shortIdentity(session.Session), session.Role, session.Actor, consoleSteerState(session.State), consoleSteerActivity(session.State, session.Code)}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
+		fmt.Fprintln(out, renderColumnRow([]string{sessionRepositoryLabel(session, repositories), shortIdentity(session.Session), session.Role, session.Actor, consoleSteerState(session.State), consoleSteerSessionActivity(session)}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
 	}
 	fmt.Fprintln(out)
 }
 
 func renderConsoleWorkers(out io.Writer, status daemon.Status) {
 	fmt.Fprintln(out)
+	renderConsoleManagedWorkers(out, status.Workers)
+	if len(status.Steer) == 0 && len(status.Workers) > 0 {
+		return
+	}
 	sessions := append([]daemon.SteerStatus(nil), status.Steer...)
 	sort.SliceStable(sessions, func(i, j int) bool {
 		if sessions[i].RepositoryName != sessions[j].RepositoryName {
@@ -118,7 +122,7 @@ func renderConsoleWorkers(out io.Writer, status daemon.Status) {
 	})
 	fmt.Fprintln(out, renderColumnRow([]string{"Repository", "Session", "Role", "Ticket actor", "State", "Activity"}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
 	for _, session := range sessions {
-		fmt.Fprintln(out, renderColumnRow([]string{sessionRepositoryLabel(session, status.Repositories), shortIdentity(session.Session), session.Role, session.Actor, consoleSteerState(session.State), consoleSteerActivity(session.State, session.Code)}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
+		fmt.Fprintln(out, renderColumnRow([]string{sessionRepositoryLabel(session, status.Repositories), shortIdentity(session.Session), session.Role, session.Actor, consoleSteerState(session.State), consoleSteerSessionActivity(session)}, []int{consoleRepositoryLabelCol, consoleStatusSession, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusState, 0}))
 	}
 	fmt.Fprintln(out)
 }
@@ -130,6 +134,17 @@ func sessionRepositoryLabel(session daemon.SteerStatus, repositories []daemon.Re
 		}
 	}
 	return repositoryDisplayLabel(session.RepositoryName, "", session.RepositoryID)
+}
+
+func consoleSteerSessionActivity(session daemon.SteerStatus) string {
+	if session.Failure != nil {
+		detail := consoleSteerFailureDetail(session.Failure)
+		if session.Code != "" && session.Code != "ticket_observation_failed" && session.Code != "ticket_client_failed" {
+			detail += "; " + humanDeliveryCode(session.Code)
+		}
+		return detail
+	}
+	return consoleSteerActivity(session.State, session.Code)
 }
 
 func consoleSteerActivity(state, code string) string {

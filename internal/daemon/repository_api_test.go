@@ -83,7 +83,7 @@ func TestDynamicRepositoryHTTPContractUsesCapabilityAndStableID(t *testing.T) {
 		},
 		RepositoryGateway: RepositoryGateway{ListTickets: func(_ context.Context, repositoryID string, _ RepositoryTicketQuery) (RepositoryTicketList, error) {
 			gotRepositoryID = repositoryID
-			return RepositoryTicketList{RepositoryID: repositoryID, Items: []RepositoryTicket{{ID: "20260926-00001", State: "open"}}}, nil
+			return RepositoryTicketList{RepositoryID: repositoryID, Items: []RepositoryTicket{{ID: "20260926-00001", State: "open", Modified: "2026-10-18T04:05:06.123456789+02:00"}}}, nil
 		}},
 	})
 	if err != nil {
@@ -107,7 +107,7 @@ func TestDynamicRepositoryHTTPContractUsesCapabilityAndStableID(t *testing.T) {
 
 	tickets := httptest.NewRecorder()
 	handler.ServeHTTP(tickets, httptest.NewRequest(http.MethodGet, "/"+testEndpointKey+"/v1/repositories/"+testRepositoryID+"/tickets", nil))
-	if tickets.Code != http.StatusOK || gotRepositoryID != testRepositoryID || !bytes.Contains(tickets.Body.Bytes(), []byte(`"id":"20260926-00001"`)) {
+	if tickets.Code != http.StatusOK || gotRepositoryID != testRepositoryID || !bytes.Contains(tickets.Body.Bytes(), []byte(`"modified":"2026-10-18T04:05:06.123456789+02:00"`)) || !bytes.Contains(tickets.Body.Bytes(), []byte(`"id":"20260926-00001"`)) {
 		t.Fatalf("dynamic Ticket gateway status=%d repository=%q body=%q", tickets.Code, gotRepositoryID, tickets.Body.String())
 	}
 

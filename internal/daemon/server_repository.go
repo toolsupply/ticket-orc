@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
 const (
@@ -176,6 +178,10 @@ func (s *Server) repositoryCreateTicket(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) repositoryUpdateOrMutation(w http.ResponseWriter, r *http.Request, repositoryID, id, operation string) {
+	if operation == "delete" {
+		s.repositoryDeleteTicket(w, r, repositoryID, id)
+		return
+	}
 	// The explicit /update suffix is kept alongside the collection's POST
 	// form so typed daemon clients can use one stable mutation URL shape.
 	if operation == "" || operation == "update" {
@@ -232,6 +238,38 @@ func (s *Server) repositoryUpdateOrMutation(w http.ResponseWriter, r *http.Reque
 	result, callErr := s.config.RepositoryGateway.MutateTicket(ctx, repositoryID, id, operation, request)
 	if callErr != nil {
 		writeRepositoryMutationError(w, callErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) repositoryDeleteTicket(w http.ResponseWriter, r *http.Request, repositoryID, id string) {
+	if s.config.RepositoryGateway.DeleteTicket == nil {
+		writeError(w, http.StatusUnprocessableEntity, "capability_unavailable", "repository ticket deletion is unavailable")
+		return
+	}
+	if ticketclient.ValidateFullID(id) != nil || r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "delete requires a full ticket ID and no query fields")
+		return
+	}
+	var request RepositoryTicketDeleteRequest
+	if err := DecodeJSON(w, r, &request); err != nil {
+		writeRequestDecodeError(w, err)
+		return
+	}
+	if ticketclient.ValidateActor(request.Actor) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_actor", "ticket actor is invalid")
+		return
+	}
+	ctx, cancel, err := s.MutationContext(r.Context(), defaultShutdownTimeout)
+	if err != nil {
+		writeError(w, http.StatusConflict, "daemon_stopping", "daemon is stopping")
+		return
+	}
+	defer cancel()
+	result, err := s.config.RepositoryGateway.DeleteTicket(ctx, repositoryID, id, request)
+	if err != nil {
+		writeRepositoryMutationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

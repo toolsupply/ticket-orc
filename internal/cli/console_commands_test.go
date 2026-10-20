@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -37,6 +38,10 @@ func TestParseConsoleCommandGrammarAndBounds(t *testing.T) {
 		{line: "help group", want: "help"},
 		{line: "quit", want: "quit"},
 		{line: "watch", want: "watch"},
+		{line: "watch orc", want: "watch"},
+		{line: "watch all", want: "watch"},
+		{line: "watch coder", want: "watch"},
+		{line: "watch coder all", err: true},
 		{line: "watch --full", err: true},
 		{line: "watch -f", err: true},
 		{line: "watch --follow", err: true},
@@ -143,6 +148,73 @@ func TestConsoleStatusShowsGlobalDaemonMode(t *testing.T) {
 	}
 }
 
+func TestConsoleWorkersIncludesConfiguredManagedWorkers(t *testing.T) {
+	workers := []daemon.WorkerStatus{
+		{Name: "orc-coder", RepositoryName: "ticket-orc", Role: "coder", TicketActor: "coder-actor", State: "stopped"},
+		{Name: "orc-reviewer", RepositoryName: "ticket-orc", Role: "reviewer", TicketActor: "review-actor", State: "running"},
+		{Name: "orc-paused", RepositoryName: "ticket-orc", Role: "coder", TicketActor: "paused-actor", State: "paused"},
+		{Name: "orc-failed", RepositoryName: "ticket-orc", Role: "reviewer", TicketActor: "failed-actor", State: "failed"},
+	}
+	sessions := []daemon.SteerStatus{
+		{RepositoryName: "ticket-ui", Role: "coder", Actor: "ui-coder", Session: "01a0dcb8-6a64-4b9b-95c9-d5598a150e86", State: "none"},
+		{RepositoryName: "ticket-ui", Role: "reviewer", Actor: "ui-reviewer", Session: "01a0dcb4-6a64-4b9b-95c9-d5598a150e86", State: "queued", Code: "awaiting_claim"},
+	}
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+			status := daemon.Status{Workers: workers}
+			if mixed {
+				status.Steer = sessions
+			}
+			server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/status" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(status)
+			}))
+			defer server.Close()
+			client, err := daemonclient.New(stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range []string{"workers", "list", "ls"} {
+				command, err := parseConsoleCommand(line)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var output, errorsOut bytes.Buffer
+				if done, ok := executeConsoleCommandResult(context.Background(), client, command, &output, &errorsOut); done || !ok || errorsOut.Len() != 0 {
+					t.Fatalf("%s: done=%t ok=%t errors=%q", line, done, ok, errorsOut.String())
+				}
+				text := output.String()
+				for _, worker := range workers {
+					var rows [][]string
+					for _, row := range strings.Split(text, "\n") {
+						fields := strings.Fields(row)
+						if len(fields) > 0 && fields[0] == worker.Name {
+							rows = append(rows, fields)
+						}
+					}
+					want := []string{worker.Name, worker.RepositoryName, worker.Role, worker.TicketActor, "—", worker.State}
+					if len(rows) != 1 || len(rows[0]) < len(want) || !reflect.DeepEqual(rows[0][:len(want)], want) {
+						t.Fatalf("%s: want exactly one row starting %q; got %q", line, want, text)
+					}
+				}
+				if mixed {
+					for _, want := range []string{"ticket-ui", "01a0dcb8…", "01a0dcb4…", "ui-coder", "ui-reviewer", "no work", "waiting for Ticket claim"} {
+						if !strings.Contains(text, want) {
+							t.Fatalf("%s: missing steer field %q: %q", line, want, text)
+						}
+					}
+				} else if strings.Contains(text, "Activity\n\n") {
+					t.Fatalf("%s: empty session table: %q", line, text)
+				}
+			}
+		})
+	}
+}
+
 func TestConsoleDaemonNamespaceRoutesTypedControls(t *testing.T) {
 	var routes []string
 	server, stateDir := newConsoleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +280,7 @@ func TestConsoleHelpCommandDescriptionsShareShutdownWidth(t *testing.T) {
 		"Control worker groups",
 		"Diagnose and recover workers",
 		"Show the current scheduling forecast",
-		"Show live Orc activity until Ctrl-C",
+		"Show live Orc activity and managed-worker output",
 		"Reload worker configuration",
 		"Stop the daemon",
 		"End this interactive session; leave the daemon running in attach mode; stop the foreground supervisor in run --interactive mode",
@@ -295,7 +367,7 @@ func TestConsoleHelpAdvertisesAcceptedConsoleGrammar(t *testing.T) {
 		{"pause", "pause NAME", "pause coder"},
 		{"resume", "resume NAME", "resume coder"},
 		{"queue", "queue  Show", "queue"},
-		{"watch", "watch  Show", "watch"},
+		{"watch", "watch [orc|all|WORKER]", "watch orc"},
 		{"doctor", "doctor  Reload", "doctor"},
 		{"reload", "reload  Apply", "reload"},
 		{"shutdown", "shutdown confirm", "shutdown confirm"},

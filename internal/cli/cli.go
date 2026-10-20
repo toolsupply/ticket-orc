@@ -322,6 +322,8 @@ func runWithExecutors(args []string, stdout, stderr io.Writer, lookupEnv envLook
 			return 1
 		}
 		return 0
+	case "watch":
+		return executeWatchCommand(args[1:], stdout, stderr, lookupEnv)
 	case "status", "worker", "group", "pause", "resume", "abort", "reload", "shutdown":
 		return executeDaemonCommand(args, stdout, stderr, lookupEnv)
 	default:

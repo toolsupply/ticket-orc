@@ -925,6 +925,37 @@ func TestShowNormalizesLegacyCompletedState(t *testing.T) {
 	}
 }
 
+func TestListTicketsRequiresAuthoritativeModified(t *testing.T) {
+	for _, value := range []string{"", "null", `""`, `"yesterday"`} {
+		t.Run("modified="+value, func(t *testing.T) {
+			item := `{"id":"` + testID + `","state":"open"`
+			if value != "" {
+				item += `,"modified":` + value
+			}
+			t.Setenv(helperScenarioEnv, "single-response")
+			t.Setenv(helperResponseEnv, `{"items":[`+item+`}],"more":false}`)
+			client := startHelperClient(t, "worker")
+			defer client.Close()
+			result, err := client.ListTickets(context.Background(), ListQuery{Limit: 1})
+			if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "modified") || len(result.Items) != 0 {
+				t.Fatalf("result=%#v err=%v, want explicit projection failure without partial rows", result, err)
+			}
+		})
+	}
+}
+
+func TestListTicketsPreservesUnsupportedProjectionError(t *testing.T) {
+	t.Setenv(helperScenarioEnv, "single-response")
+	t.Setenv(helperResponseEnv, `{"error":{"code":"invalid_fields","message":"unknown field modified"}}`)
+	client := startHelperClient(t, "worker")
+	defer client.Close()
+	_, err := client.ListTickets(context.Background(), ListQuery{Limit: 1})
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) || commandErr.Code != "invalid_fields" {
+		t.Fatalf("error=%v, want Ticket projection error", err)
+	}
+}
+
 func TestListTicketsDelegatesBoundedProjectionAndNormalizesState(t *testing.T) {
 	t.Setenv(helperScenarioEnv, "repository-list")
 	client := startHelperClient(t, "worker")
@@ -933,7 +964,7 @@ func TestListTicketsDelegatesBoundedProjectionAndNormalizesState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Items) != 1 || result.Items[0].ID != testID || result.Items[0].State != StateClosed || !result.More {
+	if len(result.Items) != 1 || result.Items[0].ID != testID || result.Items[0].State != StateClosed || result.Items[0].Modified != "2026-10-18T04:05:06.123456789+02:00" || !result.More {
 		t.Fatalf("list result=%#v", result)
 	}
 }
@@ -950,7 +981,7 @@ func TestListTicketsDelegatesSearchCandidateFiltersAndParentProjection(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Items) != 1 || result.Items[0].ID != "20260919-10002" || result.Items[0].Parent != "20260920-00100" || len(result.Items[0].Tags) != 2 || !result.More {
+	if len(result.Items) != 1 || result.Items[0].ID != "20260919-10002" || result.Items[0].Modified != "2026-10-18T04:05:06.123456789+02:00" || result.Items[0].Parent != "20260920-00100" || len(result.Items[0].Tags) != 2 || !result.More {
 		t.Fatalf("filtered list result=%#v", result)
 	}
 }
@@ -964,7 +995,7 @@ func TestListTicketsUsesAllStateForFilteredHintEnumeration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Items) != 1 || result.Items[0].Parent != "20260920-00100" || !result.More {
+	if len(result.Items) != 1 || result.Items[0].Modified != "2026-10-18T04:05:06.123456789+02:00" || result.Items[0].Parent != "20260920-00100" || !result.More {
 		t.Fatalf("all-state filtered list=%#v", result)
 	}
 }
@@ -2028,12 +2059,12 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 	case "target":
 		writeHelperJSON(map[string]any{"id": testID, "title": os.Getenv("TICKET_REPOSITORY") + "|" + os.Getenv("TICKET_SCOPE") + "|" + os.Getenv("TICKET_ACTOR"), "state": "open"})
 	case "repository-list":
-		want := []string{"list", "--state", "open", "--state", StateClosed, "--limit", "2", "--offset", "1", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on"}
+		want := []string{"list", "--state", "open", "--state", StateClosed, "--limit", "2", "--offset", "1", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on,modified"}
 		if !reflect.DeepEqual(args, want) {
 			writeHelperError("bad_args", fmt.Sprintf("list args = %q", args), nil)
 			return -1
 		}
-		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": testID, "title": "closed", "state": StateLegacyCompleted}}, "more": true})
+		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": testID, "title": "closed", "state": StateLegacyCompleted, "modified": "2026-10-18T04:05:06.123456789+02:00"}}, "more": true})
 	case "signoff-frontier":
 		want := []string{"list", "--state", "signoff", "--unassigned", "--tag", "backend", "--tag", "urgent", "--without-tag", "blocked", "--without-tag", "draft", "--limit", "2", "--offset", "4", "--fields", "id,state,assignee"}
 		if !reflect.DeepEqual(args, want) {
@@ -2090,19 +2121,19 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 		}
 		writeHelperJSON(payload)
 	case "repository-list-filtered":
-		want := []string{"list", testID, "20260919-10002", "--state", "open", "--state", "review", "--priority", "1", "--assignee", "coder", "--tag", "api", "--tag", "ticket-ui", "--limit", "2", "--offset", "1", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on"}
+		want := []string{"list", testID, "20260919-10002", "--state", "open", "--state", "review", "--priority", "1", "--assignee", "coder", "--tag", "api", "--tag", "ticket-ui", "--limit", "2", "--offset", "1", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on,modified"}
 		if !reflect.DeepEqual(args, want) {
 			writeHelperError("bad_args", fmt.Sprintf("filtered list args = %q", args), nil)
 			return -1
 		}
-		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": "20260919-10002", "title": "filtered", "state": "review", "priority": 1, "assignee": "coder", "tags": []string{"api", "ticket-ui"}, "parent": "20260920-00100"}}, "more": true})
+		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": "20260919-10002", "title": "filtered", "modified": "2026-10-18T04:05:06.123456789+02:00", "state": "review", "priority": 1, "assignee": "coder", "tags": []string{"api", "ticket-ui"}, "parent": "20260920-00100"}}, "more": true})
 	case "repository-list-all-filtered":
-		want := []string{"list", "--state", "all", "--priority", "0", "--tag", "api", "--limit", "10", "--offset", "20", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on"}
+		want := []string{"list", "--state", "all", "--priority", "0", "--tag", "api", "--limit", "10", "--offset", "20", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on,modified"}
 		if !reflect.DeepEqual(args, want) {
 			writeHelperError("bad_args", fmt.Sprintf("all filtered list args = %q", args), nil)
 			return -1
 		}
-		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": testID, "state": "closed", "parent": "20260920-00100"}}, "more": true})
+		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": testID, "state": "closed", "modified": "2026-10-18T04:05:06.123456789+02:00", "parent": "20260920-00100"}}, "more": true})
 	case "repository-grep":
 		if !reflect.DeepEqual(args, []string{"grep", "--", "parser"}) {
 			writeHelperError("bad_args", fmt.Sprintf("grep args = %q", args), nil)

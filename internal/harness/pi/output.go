@@ -96,23 +96,30 @@ func (o *ExecutionOutput) Close() error {
 }
 
 func (o *ExecutionOutput) renderLine(line []byte) error {
+	return RenderEvent(o.mode, line, o.operator)
+}
+
+// InterpretEvent returns semantic records for one framed Pi JSON event.
+// Blank and unknown events produce no records; malformed or oversized events
+// return ErrProtocol. Tool names are retained separately from shell commands.
+func InterpretEvent(line []byte) ([]harness.LogRecord, error) {
+	if len(line) > harness.MaxEventBytes {
+		return nil, fmt.Errorf("%w: event exceeds %d bytes", ErrProtocol, harness.MaxEventBytes)
+	}
 	if len(bytes.TrimSpace(line)) == 0 {
-		return nil
+		return nil, nil
 	}
 	var event struct {
-		Type      string          `json:"type"`
-		Message   json.RawMessage `json:"message"`
-		Error     json.RawMessage `json:"error"`
-		Assistant struct {
-			Type  string `json:"type"`
-			Delta string `json:"delta"`
-		} `json:"assistantMessageEvent"`
-		ToolName string `json:"toolName"`
-		IsError  bool   `json:"isError"`
+		Type     string          `json:"type"`
+		Message  json.RawMessage `json:"message"`
+		Error    json.RawMessage `json:"error"`
+		ToolName string          `json:"toolName"`
+		IsError  bool            `json:"isError"`
 	}
 	if err := json.Unmarshal(line, &event); err != nil {
-		return fmt.Errorf("%w: malformed JSONL output event: %v", ErrProtocol, err)
+		return nil, fmt.Errorf("%w: malformed JSONL output event: %v", ErrProtocol, err)
 	}
+	var records []harness.LogRecord
 	switch event.Type {
 	case "message_end":
 		var message struct {
@@ -122,40 +129,100 @@ func (o *ExecutionOutput) renderLine(line []byte) error {
 				Text string `json:"text"`
 			} `json:"content"`
 		}
-		if err := json.Unmarshal(event.Message, &message); err == nil && message.Role == "assistant" {
+		if err := json.Unmarshal(event.Message, &message); err != nil {
+			return nil, fmt.Errorf("%w: malformed assistant message: %v", ErrProtocol, err)
+		}
+		if message.Role == "assistant" {
 			for _, content := range message.Content {
 				if content.Type == "text" && content.Text != "" {
-					return writeLine(o.operator, truncateDisplay(content.Text))
+					records = append(records, harness.LogRecord{Kind: "message", Text: content.Text})
 				}
 			}
 		}
 	case "turn_end", "agent_end":
-		return writeLine(o.operator, "[pi] turn complete")
+		records = append(records, harness.LogRecord{Kind: "diagnostic", Level: "info", Code: "turn_completed", Text: "turn complete"})
 	case "tool_execution_start":
-		if o.mode == OutputCompact && event.ToolName != "" {
-			return writeLine(o.operator, "  $ "+truncateDisplay(event.ToolName))
-		}
+		records = append(records, harness.LogRecord{Kind: "command", Phase: "started", ToolName: event.ToolName})
 	case "tool_execution_end":
-		if o.mode == OutputCompact && event.IsError {
-			return writeLine(o.operator, "  [tool error] "+truncateDisplay(event.ToolName))
+		records = append(records, harness.LogRecord{Kind: "command", Phase: "completed", ToolName: event.ToolName})
+		if event.IsError {
+			records = append(records, harness.LogRecord{Kind: "diagnostic", Level: "error", Code: "tool_error", Text: event.ToolName})
 		}
 	case "error":
 		message := ""
 		var text string
 		if json.Unmarshal(event.Error, &text) == nil {
-			message = strings.TrimSpace(text)
+			message = text
 		} else {
 			var detail struct {
 				Message string `json:"message"`
 			}
 			if json.Unmarshal(event.Error, &detail) == nil {
-				message = strings.TrimSpace(detail.Message)
+				message = detail.Message
 			}
 		}
-		if message == "" {
+		if strings.TrimSpace(message) == "" {
 			message = "Pi stream error"
 		}
-		return writeLine(o.operator, "[pi error] "+message)
+		records = append(records, harness.LogRecord{Kind: "diagnostic", Level: "error", Code: "error", Text: message})
+	}
+	return records, nil
+}
+
+// RenderEvent renders one framed Pi event in compact or quiet mode using
+// InterpretEvent, applying terminal visibility, sanitization and display limits.
+func RenderEvent(mode OutputMode, line []byte, operator io.Writer) error {
+	if mode != OutputCompact && mode != OutputQuiet {
+		return fmt.Errorf("unknown Pi event output mode %q", mode)
+	}
+	if operator == nil {
+		operator = io.Discard
+	}
+	records, err := InterpretEvent(line)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := RenderRecord(mode, record, operator); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RenderRecord formats one semantic record for terminal display.
+func RenderRecord(mode OutputMode, record harness.LogRecord, operator io.Writer) error {
+	if mode != OutputCompact && mode != OutputQuiet {
+		return fmt.Errorf("unknown Pi event output mode %q", mode)
+	}
+	if operator == nil {
+		operator = io.Discard
+	}
+
+	value := ""
+	switch record.Kind {
+	case "message":
+		value = truncateDisplay(record.Text)
+	case "command":
+		if mode == OutputCompact && record.Phase == "started" && record.ToolName != "" {
+			value = "  $ " + truncateDisplay(record.ToolName)
+		}
+	case "diagnostic":
+		switch record.Code {
+		case "turn_completed":
+			value = "[pi] " + record.Text
+		case "tool_error":
+			if mode == OutputCompact {
+				value = "  [tool error] " + truncateDisplay(record.Text)
+			}
+		default:
+			value = "[pi error] " + strings.TrimSpace(record.Text)
+		}
+	}
+	if value != "" {
+		if err := writeLine(operator, value); err != nil {
+			return err
+		}
 	}
 	return nil
 }

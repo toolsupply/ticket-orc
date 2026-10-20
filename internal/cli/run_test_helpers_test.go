@@ -26,6 +26,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("ORC_TEST_DELETE") == "1" {
+		os.Exit(runRepositoryDeleteTicket())
+	}
+	if os.Getenv("ORC_TEST_CREATE") == "1" {
+		os.Exit(runRepositoryCreateTicket())
+	}
 	if os.Getenv("TICKET_ORC_TEST_FAKE_TICKET") == "1" {
 		os.Exit(runTestFakeTicket())
 	}
@@ -414,7 +420,7 @@ func runSupervisedFailureEnvelope(t *testing.T, envelope *orc.Failure) (supervis
 	var outputMu sync.Mutex
 	done := startSupervisorTestRun(t, cancel, func() error {
 		return runSupervisor(ctx, RunConfig{
-			ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, Runtime: runtimeState,
+			ConfigPath: configPath, StateDir: stateDir, Workers: []supervisor.RunWorker{worker}, StartupWorkers: []string{worker.Name}, Runtime: runtimeState,
 			startChild: func(_ context.Context, _ string, _ string, candidate supervisor.RunWorker, _, _ io.Writer, _, _ *sync.Mutex) (*runChild, error) {
 				child := &runChild{worker: candidate, done: make(chan error, 1), waited: make(chan struct{})}
 				child.captureFailure(orc.Event{Type: "worker.failure", Worker: candidate.Name, Role: "reviewer", Failure: envelope})
@@ -490,11 +496,12 @@ func runSupervisedRoleFailure(t *testing.T, configPath string, worker supervisor
 	var outputMu sync.Mutex
 	done := startSupervisorTestRun(t, cancel, func() error {
 		return runSupervisor(ctx, RunConfig{
-			ConfigPath: configPath,
-			StateDir:   worker.Config.StateDir,
-			Workers:    []supervisor.RunWorker{worker},
-			Runtime:    runtimeState,
-			Hooks:      supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }},
+			ConfigPath:     configPath,
+			StateDir:       worker.Config.StateDir,
+			Workers:        []supervisor.RunWorker{worker},
+			StartupWorkers: []string{worker.Name},
+			Runtime:        runtimeState,
+			Hooks:          supervisor.SupervisorHooks{WorkerState: func(event supervisor.WorkerTransition) { hooks <- event }},
 		}, os.Args[0], io.Discard, &lockedWriter{dst: &diagnostics, mu: &outputMu})
 	})
 	deadline := time.NewTimer(3 * time.Second)

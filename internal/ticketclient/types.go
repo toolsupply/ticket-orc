@@ -32,6 +32,7 @@ type Ticket struct {
 	Parent    string   `json:"parent,omitempty"`
 	Tags      []string `json:"tags,omitempty"`
 	DependsOn []string `json:"depends_on,omitempty"`
+	Modified  string   `json:"modified,omitempty"`
 }
 
 // TicketSection is the bounded public Markdown section returned by Ticket's
@@ -96,9 +97,13 @@ type ListResult struct {
 	More  bool     `json:"more"`
 }
 
-// MutationResult is the bounded result shared by Ticket's typed mutation
-// commands. Commands that return a narrower shape are normalized into this
-// projection by Client.
+// DeleteResult is Ticket's authoritative single-ticket deletion receipt.
+type DeleteResult struct {
+	ID      string `json:"id"`
+	Changed bool   `json:"changed"`
+}
+
+// MutationResult is the bounded result shared by Ticket's typed mutations.
 type MutationResult struct {
 	ID            string   `json:"id"`
 	Changed       bool     `json:"changed"`
@@ -117,8 +122,11 @@ type MutationOptions struct {
 }
 
 // CreateInput is the typed public input accepted by Ticket create --input -.
+// State and Assignee pointers preserve explicit empty values for Ticket validation.
 type CreateInput struct {
 	Title     string            `json:"title"`
+	State     *string           `json:"state,omitempty"`
+	Assignee  *string           `json:"assignee,omitempty"`
 	Priority  *int              `json:"priority,omitempty"`
 	Tags      []string          `json:"tags,omitempty"`
 	Parent    string            `json:"parent,omitempty"`

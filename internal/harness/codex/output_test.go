@@ -201,6 +201,45 @@ func TestExecutionOutputMalformedEventIsLoggedAndReported(t *testing.T) {
 	assertRawLog(t, output.Path(), raw)
 }
 
+func TestRenderEventMatchesLiveCompactOutput(t *testing.T) {
+	long := strings.Repeat("x", displayLimit+20)
+	events := []string{
+		`{"type":"item.completed","item":{"type":"reasoning","text":"private thought"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"ansi\u001b[31mred\u001b[0m"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"` + long + `"}}`,
+		`{"type":"item.started","item":{"type":"command_execution","command":"go test"}}`,
+	}
+	var callable bytes.Buffer
+	var live bytes.Buffer
+	output, err := OpenExecutionOutput(t.TempDir(), "ticket", "coder", OutputCompact, &live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if err := RenderEvent(OutputCompact, []byte(event), &callable); err != nil {
+			t.Fatalf("RenderEvent: %v", err)
+		}
+		if _, err := io.WriteString(output, event+"\n"); err != nil {
+			t.Fatalf("live Write: %v", err)
+		}
+	}
+	if err := output.Close(); err != nil {
+		t.Fatalf("live Close: %v", err)
+	}
+	if callable.String() != live.String() {
+		t.Fatalf("callable output differs from live output\ncallable: %q\nlive: %q", callable.String(), live.String())
+	}
+	if strings.Contains(callable.String(), "private thought") || strings.Contains(callable.String(), "item.completed") || !strings.Contains(callable.String(), "ansi[31mred[0m") || !strings.Contains(callable.String(), strings.Repeat("x", displayLimit)+"…") {
+		t.Fatalf("unexpected rendered output: %q", callable.String())
+	}
+}
+
+func TestRenderEventReportsMalformedJSON(t *testing.T) {
+	if err := RenderEvent(OutputCompact, []byte("{not-json}"), io.Discard); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("RenderEvent error = %v, want protocol error", err)
+	}
+}
+
 func TestExecutionOutputPathsPermissionsAndCollisions(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	now := time.Date(2026, 9, 19, 12, 30, 45, 123, time.UTC)

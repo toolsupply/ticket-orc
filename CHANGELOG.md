@@ -2,6 +2,17 @@
 
 All notable user-facing changes to `ticket-orc` are documented here.
 
+## [0.1.4] - 2026-10-20
+
+### Added
+
+- Added ticket-orc watch [all|orc|WORKER]
+- Added /v1/logs streaming API
+
+### Changed
+
+- Managed workers now start by default
+
 ## [0.1.3] - 2026-10-17
 
 ### Added
@@ -41,6 +52,7 @@ All notable user-facing changes to `ticket-orc` are documented here.
 
 - Initial release
 
+[0.1.4]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.4
 [0.1.3]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.3
 [0.1.2]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.2
 [0.1.1]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.1

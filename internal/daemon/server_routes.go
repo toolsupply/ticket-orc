@@ -14,6 +14,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/v1/repositories", s.handleRepositories)
 	mux.HandleFunc("/v1/repositories/", s.handleRepositories)
 	mux.HandleFunc("/v1/events", s.handleEvents)
+	mux.HandleFunc("/v1/logs", s.handleLogs)
 	mux.HandleFunc("/v1/pause", s.handleDaemonPause)
 	mux.HandleFunc("/v1/resume", s.handleDaemonResume)
 	mux.HandleFunc("/v1/abort", s.handleDaemonAbort)

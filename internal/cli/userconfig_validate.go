@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -158,6 +159,11 @@ func validateAndNormalizeFileConfig(config *FileConfig, configDir string) error 
 	}
 	if err := validateGroups("supervisor.startup_groups", config.Supervisor.StartupGroups); err != nil {
 		return err
+	}
+	for i, group := range config.Supervisor.StartupGroups {
+		if _, err := configuredGroupWorkers(*config, group); err != nil {
+			return fmt.Errorf("supervisor.startup_groups[%d]: %w; assign this group to a configured worker or its role, or remove the entry", i, err)
+		}
 	}
 	if _, err := daemon.NormalizeListenAddress(config.Supervisor.ListenAddress); err != nil {
 		return fmt.Errorf("supervisor.listen: %w", err)
@@ -336,6 +342,25 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// configuredGroupWorkers resolves both launch selectors and declarative startup
+// groups against the same effective worker memberships.
+func configuredGroupWorkers(config FileConfig, group string) ([]string, error) {
+	names := make([]string, 0)
+	for name := range config.Workers {
+		for _, candidate := range effectiveWorkerGroups(config, name) {
+			if candidate == group {
+				names = append(names, name)
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("group %q has no configured workers", group)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // effectiveWorkerGroups returns role memberships followed by worker-specific

@@ -100,13 +100,16 @@ func fullCapabilityGateway() RepositoryGateway {
 		MutateTicket: func(context.Context, string, string, string, RepositoryTicketMutationRequest) (RepositoryTicketMutation, error) {
 			return RepositoryTicketMutation{}, nil
 		},
+		DeleteTicket: func(context.Context, string, string, RepositoryTicketDeleteRequest) (RepositoryTicketDeletion, error) {
+			return RepositoryTicketDeletion{}, nil
+		},
 		TicketBodyBudgetBytes: 256 << 10,
 	}
 }
 
 func TestStatusAdvertisesFullDaemonCapabilities(t *testing.T) {
 	status, raw := statusForCapabilities(t, fullCapabilityControl(), fullCapabilityGateway(), []WorkerStatus{{Name: "coder", State: "running"}})
-	want := `{"events":true,"daemon_actions":["pause","resume","abort","reload","doctor","shutdown"],"worker_actions":["start","stop","pause","resume","restart"],"group_actions":["start","stop"],"repositories":{"inventory":true,"ticket_list":true,"ticket_detail":true,"ticket_create":true,"ticket_update":true,"ticket_actions":["claim","release","open","hold","submit","review","approve","close","reject","bump"],"max_page_size":256,"max_search_bytes":256,"ticket_body_budget_bytes":262144}}`
+	want := `{"events":true,"daemon_actions":["pause","resume","abort","reload","doctor","shutdown"],"worker_actions":["start","stop","pause","resume","restart"],"group_actions":["start","stop"],"repositories":{"inventory":true,"ticket_list":true,"ticket_detail":true,"ticket_create":true,"ticket_update":true,"ticket_delete":true,"ticket_actions":["claim","release","open","hold","submit","review","approve","close","reject","bump","delete"],"max_page_size":256,"max_search_bytes":256,"ticket_body_budget_bytes":262144},"logs":{"stream":false,"replay":false,"external_steer":false}}`
 	capabilityJSON, err := json.Marshal(status.Capabilities)
 	if err != nil {
 		t.Fatal(err)
@@ -128,10 +131,10 @@ func TestStatusAdvertisesRepositoryOnlyCapabilitiesWithoutWorkers(t *testing.T) 
 	if !capabilities.Events || len(capabilities.DaemonActions) != 0 || len(capabilities.WorkerActions) != 0 || len(capabilities.GroupActions) != 0 {
 		t.Fatalf("zero-worker capabilities = %#v", capabilities)
 	}
-	if !capabilities.Repositories.Inventory || !capabilities.Repositories.TicketList || !capabilities.Repositories.TicketDetail || !capabilities.Repositories.TicketCreate || !capabilities.Repositories.TicketUpdate || len(capabilities.Repositories.TicketActions) != 10 {
+	if !capabilities.Repositories.Inventory || !capabilities.Repositories.TicketList || !capabilities.Repositories.TicketDetail || !capabilities.Repositories.TicketCreate || !capabilities.Repositories.TicketUpdate || len(capabilities.Repositories.TicketActions) != 11 {
 		t.Fatalf("repository-only capabilities = %#v", capabilities.Repositories)
 	}
-	want := `"capabilities":{"events":true,"daemon_actions":[],"worker_actions":[],"group_actions":[],"repositories":{"inventory":true,"ticket_list":true,"ticket_detail":true,"ticket_create":true,"ticket_update":true,"ticket_actions":["claim","release","open","hold","submit","review","approve","close","reject","bump"],"max_page_size":256,"max_search_bytes":256,"ticket_body_budget_bytes":262144}}`
+	want := `"capabilities":{"events":true,"daemon_actions":[],"worker_actions":[],"group_actions":[],"repositories":{"inventory":true,"ticket_list":true,"ticket_detail":true,"ticket_create":true,"ticket_update":true,"ticket_delete":true,"ticket_actions":["claim","release","open","hold","submit","review","approve","close","reject","bump","delete"],"max_page_size":256,"max_search_bytes":256,"ticket_body_budget_bytes":262144},"logs":{"stream":false,"replay":false,"external_steer":false}}`
 	if !strings.Contains(string(raw), want) {
 		t.Fatalf("repository-only status JSON = %s, want literal capabilities %s", raw, want)
 	}
@@ -195,7 +198,10 @@ func TestStatusOmitsCapabilitiesForMissingCallbacks(t *testing.T) {
 		{name: "detail", remove: func(g *RepositoryGateway) { g.GetTicket = nil }, check: func(c RepositoryCapabilities) bool { return !c.TicketDetail && c.TicketBodyBudgetBytes == 0 }},
 		{name: "create", remove: func(g *RepositoryGateway) { g.CreateTicket = nil }, check: func(c RepositoryCapabilities) bool { return !c.TicketCreate }},
 		{name: "update", remove: func(g *RepositoryGateway) { g.UpdateTicket = nil }, check: func(c RepositoryCapabilities) bool { return !c.TicketUpdate }},
-		{name: "ticket actions", remove: func(g *RepositoryGateway) { g.MutateTicket = nil }, check: func(c RepositoryCapabilities) bool { return len(c.TicketActions) == 0 }},
+		{name: "delete", remove: func(g *RepositoryGateway) { g.DeleteTicket = nil }, check: func(c RepositoryCapabilities) bool {
+			return !c.TicketDelete && !strings.Contains(strings.Join(c.TicketActions, ","), "delete")
+		}},
+		{name: "ticket actions", remove: func(g *RepositoryGateway) { g.MutateTicket = nil }, check: func(c RepositoryCapabilities) bool { return equalStrings(c.TicketActions, []string{"delete"}) }},
 	}
 	for _, test := range repositoryCases {
 		t.Run("repository "+test.name, func(t *testing.T) {

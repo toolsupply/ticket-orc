@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/toolsupply/ticket-orc/internal/daemon"
-	"github.com/toolsupply/ticket-orc/internal/daemonclient"
 	"io"
 	"os"
 	"time"
+
+	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/daemonclient"
+	"github.com/toolsupply/ticket-orc/internal/terminaltext"
 )
 
 func executeAttach(args []string, stdout, stderr io.Writer, lookupEnv envLookup) int {
@@ -83,6 +85,15 @@ func runConsoleLoopWithEndpointOptions(ctx context.Context, options daemonComman
 	renderer.promptLine()
 	selectedWorker := initialSelection
 	watching := false
+	watchMode := "all"
+	var workerWatch *workerLogWatch
+	workerTicker := time.NewTicker(workerWatchPollInterval)
+	defer workerTicker.Stop()
+	defer func() {
+		if workerWatch != nil {
+			workerWatch.Close()
+		}
+	}()
 	var pendingErrors []string
 	var lastInterrupt time.Time
 	for {
@@ -92,6 +103,10 @@ func runConsoleLoopWithEndpointOptions(ctx context.Context, options daemonComman
 		case <-interrupts:
 			if watching {
 				watching = false
+				if workerWatch != nil {
+					workerWatch.Close()
+					workerWatch = nil
+				}
 				lastInterrupt = time.Time{}
 				fmt.Fprintln(renderer.writer(), "watch stopped")
 				renderer.promptLine()
@@ -108,21 +123,45 @@ func runConsoleLoopWithEndpointOptions(ctx context.Context, options daemonComman
 				renderer.interruptPrompt(message)
 			}
 		case event := <-events:
-			event = tracker.prepare(event)
-			if watching && (event.Type == "config.reloaded" || (event.RepositoryID != "" && !watchRenderer.hasRepository(event.RepositoryID))) {
+			repositoryID := event.RepositoryID
+			if repositoryID == "" && event.Worker != "" {
+				repositoryID = tracker.workers[event.Worker].RepositoryID
+			}
+			if watching && (event.Type == "config.reloaded" || (repositoryID != "" && !watchRenderer.hasRepository(repositoryID)) || (event.Worker != "" && tracker.workers[event.Worker].RepositoryID == "")) {
 				if status, statusErr := client.Status(consoleCtx); statusErr == nil {
 					watchRenderer.seedRepositories(status.Repositories)
+					tracker.refreshWorkers(status)
+					if workerWatch != nil {
+						workerWatch.refresh(status)
+					}
 				}
 			}
+			event = tracker.prepare(event)
 			accepted := tracker.accept(event)
-			if watching && accepted && consoleWatchEvent(event) {
-				renderConsoleWatchActivity(renderer.asyncWriter(), watchRenderer, options.localDir, event, time.Now())
+			if watching && (watchMode == "orc" || watchMode == "all") && accepted && consoleWatchEvent(event) {
+				if err := renderConsoleWatchActivity(renderer.asyncWriter(), watchRenderer, options.localDir, event, time.Now()); err != nil {
+					return err
+				}
+			}
+		case now := <-workerTicker.C:
+			if watching && workerWatch != nil {
+				if watchErr := workerWatch.poll(now); watchErr != nil {
+					if err := writeWatchLines(renderer.errorWriter(), time.Now(), "orc", "worker output: "+boundedWatchDiagnostic(watchErr.Error())); err != nil {
+						return err
+					}
+					workerWatch.Close()
+					workerWatch = nil
+					watching = false
+					renderer.promptLine()
+				}
 			}
 		case eventErr := <-eventErrors:
 			if eventErr != nil && !errors.Is(eventErr, context.Canceled) && !errors.Is(eventErr, io.EOF) {
 				message := "event stream: " + safeConsoleError(eventErr)
 				if watching {
-					fmt.Fprintf(renderer.asyncWriter(), "%s\n", message)
+					if err := writeWatchLines(renderer.asyncWriter(), time.Now(), "orc", message); err != nil {
+						return err
+					}
 				} else {
 					// Canonical terminals do not expose partially typed bytes until
 					// Enter. Queue stream failures until the next command boundary so
@@ -160,12 +199,41 @@ func runConsoleLoopWithEndpointOptions(ctx context.Context, options daemonComman
 				continue
 			}
 			if command.name == "watch" {
+				watchMode = command.watch.selector
+				if watchMode != "orc" {
+					if options.endpoint != "" || options.environmentURL != "" || options.localDir == "" {
+						fmt.Fprintln(renderer.errorWriter(), "error: "+remoteWorkerWatchError)
+						renderer.promptLine()
+						continue
+					}
+					status, statusErr := client.Status(consoleCtx)
+					if statusErr != nil {
+						writeConsoleError(renderer.errorWriter(), statusErr)
+						renderer.promptLine()
+						continue
+					}
+					tracker.refreshWorkers(status)
+					watchRenderer.seedRepositories(status.Repositories)
+					workerWatch, statusErr = newWorkerLogWatch(options.localDir, status, command.watch, renderer.asyncWriter())
+					if statusErr != nil {
+						writeConsoleError(renderer.errorWriter(), statusErr)
+						renderer.promptLine()
+						continue
+					}
+				}
 				watching = true
 				watchRenderer.date = ""
+				watchRenderer.unified = watchMode == "all"
 				fmt.Fprintln(renderer.writer())
-				fmt.Fprintln(renderer.writer(), "Watching activity. Press Ctrl-C to return.")
-				fmt.Fprintln(renderer.writer())
-				fmt.Fprintln(renderer.writer(), consoleWatchHeader())
+				if watchMode != "all" && watchMode != "orc" {
+					fmt.Fprintf(renderer.writer(), "Watching worker %s output. Press Ctrl-C to return.\n\n", terminaltext.Sanitize(watchMode, false))
+				} else {
+					fmt.Fprintln(renderer.writer(), "Watching activity. Press Ctrl-C to return.")
+					fmt.Fprintln(renderer.writer())
+					if watchMode == "orc" {
+						fmt.Fprintln(renderer.writer(), consoleWatchHeader())
+					}
+				}
 				continue
 			}
 			done, actionOK := executeConsoleCommandResultWithConfig(consoleCtx, client, command, options.configPath, renderer.writer(), renderer.errorWriter())

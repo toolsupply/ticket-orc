@@ -115,9 +115,15 @@ func appendConsoleWatchActivityLocked(stateDir string, event daemon.Event) error
 	return nil
 }
 
-func renderConsoleWatchActivity(out io.Writer, renderer *consoleWatchRenderer, stateDir string, event daemon.Event, at time.Time) {
+func renderConsoleWatchActivity(out io.Writer, renderer *consoleWatchRenderer, stateDir string, event daemon.Event, at time.Time) error {
 	if err := appendConsoleWatchActivity(stateDir, event); err != nil {
-		fmt.Fprintln(out, "activity log: failed to append watch event")
+		if renderer.unified {
+			if err := writeWatchLines(out, at, renderer.orcLabel(event), "activity log: failed to append watch event"); err != nil {
+				return err
+			}
+		} else if err := writeWatchOutput(out, "activity log: failed to append watch event\n"); err != nil {
+			return err
+		}
 	}
-	renderer.render(out, event, at)
+	return renderer.render(out, event, at)
 }
