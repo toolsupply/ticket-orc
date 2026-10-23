@@ -12,7 +12,7 @@ func validateConfigJSONFields(data []byte) error {
 	if err := json.Unmarshal(data, &root); err != nil {
 		return err
 	}
-	if err := validateObjectFields(root, "config", map[string]struct{}{"version": {}, "id": {}, "local_dir": {}, "default_role": {}, "defaults": {}, "roles": {}, "review": {}, "repositories": {}, "workers": {}, "supervisor": {}}); err != nil {
+	if err := validateObjectFields(root, "config", map[string]struct{}{"version": {}, "id": {}, "local_dir": {}, "default_role": {}, "defaults": {}, "roles": {}, "review": {}, "repositories": {}, "workers": {}, "supervisor": {}, "conversations": {}}); err != nil {
 		return err
 	}
 	if raw := root["review"]; raw != nil {
@@ -78,6 +78,11 @@ func validateConfigJSONFields(data []byte) error {
 			return err
 		}
 	}
+	if raw := root["conversations"]; raw != nil {
+		if err := validateConversationConfigFields(raw); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -107,6 +112,7 @@ func validateNestedConfigObject(raw json.RawMessage, path string, allowed map[st
 			switch nested {
 			case "codex":
 				fields["sandbox"] = struct{}{}
+				fields["service_tier"] = struct{}{}
 			case "pi":
 				fields["provider"] = struct{}{}
 			case "claude":

@@ -206,6 +206,7 @@ Options:
   --session-cleanup POLICY  delete|archive|keep (Codex default: delete; Pi/Claude: keep)
   --minimum-reuse-context-percent N  0-100; default: 20
   --review-completion MODE  signoff|close (reviewer default: signoff)
+  --codex-service-tier TIER default|fast (omitted/empty: inherit Codex config)
   --codex-sandbox MODE      Codex-specific sandbox setting
   --pi-provider NAME        Pi-specific provider setting
   --claude-permission-mode MODE  Claude-specific permission setting
@@ -226,6 +227,7 @@ Environment:
   TICKET_ORC_MINIMUM_REUSE_CONTEXT_PERCENT
   TICKET_ORC_REVIEW_COMPLETION
   TICKET_ORC_CODEX_SANDBOX
+  TICKET_ORC_CODEX_SERVICE_TIER
   TICKET_ORC_PI_PROVIDER
   TICKET_ORC_CLAUDE_PERMISSION_MODE
   TICKET_ORC_OUTPUT

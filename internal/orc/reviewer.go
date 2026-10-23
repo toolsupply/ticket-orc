@@ -31,6 +31,7 @@ type ReviewerConfig struct {
 	ReviewCompletion           string
 	QueueFilters               ticketclient.QueueFilters
 	CodexSandbox               string
+	CodexServiceTier           string
 	PiProvider                 string
 	ClaudePermissionMode       string
 	TicketPrompt               string
@@ -88,6 +89,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		SessionCleanup:       harness.CleanupPolicy(config.SessionCleanup),
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 	}); err != nil {
@@ -286,6 +288,7 @@ func runReviewerTurn(ctx context.Context, config ReviewerConfig, ticketID string
 		StateDir:             config.StateDir,
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 		Operator:             config.Operator,

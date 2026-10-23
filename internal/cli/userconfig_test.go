@@ -660,7 +660,7 @@ func TestLoadFileConfigValidatesRoleTicketQueueAndNudgePrompt(t *testing.T) {
 		want string
 	}{
 		{name: "invalid ticket queue", role: `"ticket_queue":"closed","nudge_prompt":"work"`, want: "roles.coder.ticket_queue must be open, review, or signoff"},
-		{name: "empty nudge prompt", role: `"ticket_queue":"open","nudge_prompt":"  "`, want: "roles.coder.nudge_prompt must not be empty"},
+		{name: "whitespace nudge prompt", role: `"ticket_queue":"open","nudge_prompt":"  "`, want: "roles.coder.nudge_prompt must not be empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

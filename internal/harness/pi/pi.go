@@ -180,6 +180,9 @@ func validateContext(ctx context.Context) error {
 }
 
 func validateRequest(request harness.RunRequest) error {
+	if request.Events != nil {
+		return harness.ErrOutputUnsupported
+	}
 	for name, value := range map[string]string{"working directory": request.WorkingDir, "state directory": request.StateDir, "role": request.Role, "actor": request.Actor, "ticket ID": request.TicketID, "prompt": request.Prompt} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("Pi %s must not be empty", name)

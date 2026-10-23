@@ -56,10 +56,23 @@ func NewWithExecutable(executable string) (*Adapter, error) {
 	return newAdapter(executable, os.Environ, runProcess)
 }
 
+// NewManaged uses an explicit managed-child environment and process lifecycle.
+// The caller owns containment and must wait for all owned output before returning.
+func NewManaged(executable string, env []string, run func(context.Context, harness.ProcessRequest) (harness.ProcessResult, error)) (*Adapter, error) {
+	if run == nil {
+		return nil, fmt.Errorf("managed Codex runner is required")
+	}
+	captured := append([]string(nil), env...)
+	return newAdapter(executable, func() []string { return append([]string(nil), captured...) }, func(ctx context.Context, req processRequest) (processResult, error) {
+		result, err := run(ctx, harness.ProcessRequest{Executable: req.executable, Args: req.args, Dir: req.dir, Env: req.env, Stdout: req.stdout, StderrLimit: maxDiagnosticBytes})
+		return processResult{exitCode: result.ExitCode, stderr: result.Stderr}, err
+	})
+}
+
 // Capabilities reports the static Codex session and cleanup operations Orc
 // currently relies on.
 func (a *Adapter) Capabilities() harness.Capabilities {
-	return harness.Capabilities{Resume: true, Fresh: true, CleanupDelete: true, CleanupArchive: true}
+	return harness.Capabilities{OutputGranularity: harness.OutputCompleteMessages, Resume: true, Fresh: true, CleanupDelete: true, CleanupArchive: true}
 }
 
 // Validate checks generic invocation settings that Codex can reject without a
@@ -78,8 +91,18 @@ func (a *Adapter) Validate(config harness.PreflightConfig) error {
 	if config.OutputMode != "compact" && config.OutputMode != "quiet" && config.OutputMode != "json" {
 		return fmt.Errorf("Codex output mode %q is not supported", config.OutputMode)
 	}
+	if err := validateServiceTier(config.CodexServiceTier); err != nil {
+		return err
+	}
 	if config.CodexSandbox != "" && !oneOf(config.CodexSandbox, "read-only", "workspace-write", "danger-full-access") {
 		return fmt.Errorf("Codex sandbox mode %q is not supported", config.CodexSandbox)
+	}
+	return nil
+}
+
+func validateServiceTier(tier string) error {
+	if tier != "" && !oneOf(tier, "default", "fast") {
+		return fmt.Errorf("Codex service tier %q is not supported; choose default or fast, or leave empty to inherit Codex configuration", tier)
 	}
 	return nil
 }
@@ -210,8 +233,14 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 	if request.Reasoning != "" {
 		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.Reasoning))
 	}
+	if request.CodexServiceTier != "" {
+		args = append(args, "-c", fmt.Sprintf("service_tier=%q", request.CodexServiceTier))
+	}
 	if request.CodexSandbox != "" {
 		args = append(args, "-s", request.CodexSandbox)
+	}
+	if request.Workspace != "" && request.Workspace != request.WorkingDir {
+		args = append(args, "--add-dir", request.Workspace)
 	}
 	if sessionID != "" {
 		args = append(args, "resume", sessionID)
@@ -219,6 +248,7 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 	args = append(args, request.Prompt)
 
 	parser := newStreamParser(output, sessionID)
+	parser.events = request.Events
 	process, processErr := a.run(ctx, processRequest{
 		executable: a.executable,
 		args:       args,
@@ -317,6 +347,9 @@ func validateContext(ctx context.Context) error {
 }
 
 func validateRequest(request harness.RunRequest) error {
+	if err := harness.ValidateOutputEvents(request.Events); err != nil {
+		return err
+	}
 	for name, value := range map[string]string{
 		"working directory": request.WorkingDir,
 		"state directory":   request.StateDir,
@@ -340,6 +373,9 @@ func validateRequest(request harness.RunRequest) error {
 	}
 	if strings.ContainsRune(request.Model, '\x00') || strings.ContainsRune(request.Reasoning, '\x00') {
 		return fmt.Errorf("Codex model and reasoning must not contain NUL")
+	}
+	if err := validateServiceTier(request.CodexServiceTier); err != nil {
+		return err
 	}
 	if request.CodexSandbox != "" && !oneOf(request.CodexSandbox, "read-only", "workspace-write", "danger-full-access") {
 		return fmt.Errorf("Codex sandbox mode %q is not supported", request.CodexSandbox)

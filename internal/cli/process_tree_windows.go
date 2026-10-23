@@ -19,9 +19,20 @@ type childContainment struct {
 	handle syscall.Handle
 }
 
-// Windows job objects terminate descendants after the leader is reaped, so
-// the Unix pre-reap identity window has no work to do on this platform.
-func waitForChildExitBeforeReap(_ *os.Process) bool { return false }
+// Observe leader exit without closing its stdout pipe. Conversation execution
+// can then stop the job descendants before draining output and calling cmd.Wait.
+func waitForChildExitBeforeReap(process *os.Process) bool {
+	if process == nil {
+		return false
+	}
+	handle, err := syscall.OpenProcess(syscall.SYNCHRONIZE, false, uint32(process.Pid))
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(handle)
+	event, err := syscall.WaitForSingleObject(handle, syscall.INFINITE)
+	return err == nil && event == syscall.WAIT_OBJECT_0
+}
 
 // processAlive is only reached from the Darwin-specific fallback branch in
 // startRunChild. The runtime guard is not enough to hide the symbol from the

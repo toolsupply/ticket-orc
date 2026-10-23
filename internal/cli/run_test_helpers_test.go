@@ -255,7 +255,7 @@ func runSupervisorTestChild() int {
 			break
 		}
 	}
-	resolvedLine := fmt.Sprintf("resolved_actor=%s\nresolved_ticket_prompt=%s\nresolved_sandbox=%s\n", resolved.Actor, resolved.TicketPrompt, resolved.Codex.Sandbox)
+	resolvedLine := fmt.Sprintf("resolved_actor=%s\nresolved_ticket_prompt=%s\nresolved_sandbox=%s\nresolved_service_tier=%s\n", resolved.Actor, resolved.TicketPrompt, resolved.Codex.Sandbox, resolved.Codex.ServiceTier)
 	if resolveErr != nil {
 		resolvedLine = "resolved_error=" + strings.ReplaceAll(resolveErr.Error(), "\n", " ") + "\n"
 	}

@@ -12,7 +12,7 @@ import (
 func TestAcceptancePromptDefinesAtomicHumanHandoff(t *testing.T) {
 	const id = "20261007-12345"
 	got := AcceptancePrompt(id)
-	for _, want := range []string{"ticket query -j id:" + id + " state:signoff unclaimed :: reassign --to user", "assignee=user", "changed=false", "mutation_applied=true", "Do not process a second signoff ticket"} {
+	for _, want := range []string{"ticket query -j id:" + id + " state:signoff unclaimed :: reassign --to user", "assignee=user", "changed=false", "mutation_applied=true", "Do not select, claim, implement, review, or make an acceptance decision for a second ticket"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt %q missing %q", got, want)
 		}
@@ -20,6 +20,44 @@ func TestAcceptancePromptDefinesAtomicHumanHandoff(t *testing.T) {
 	for _, unwanted := range []string{"@user", "leave it in signoff and explain"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("acceptance prompt retains obsolete guidance %q", unwanted)
+		}
+	}
+}
+
+func TestAcceptancePromptsPermitPlanningWithoutSecondAcceptance(t *testing.T) {
+	const id = "20261007-12345"
+	const custom = "  Assess {{ticket}} against the API spec.\nCreate related follow-up tickets.  "
+	for _, template := range []string{"", custom} {
+		prompt, err := composeAcceptancePrompt(template, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(prompt, SignoffTurnPrompt(id)) {
+			t.Fatal("managed turn lost the shared signoff boundary")
+		}
+		for _, required := range []string{
+			"Related planning maintenance is permitted",
+			"does not count as accepting a second ticket",
+			"Do not select, claim, implement, review, or make an acceptance decision for a second ticket",
+			"ownership, and lifecycle safety constraints",
+			"they do not prohibit authorized related planning maintenance",
+		} {
+			if !strings.Contains(prompt, required) {
+				t.Errorf("acceptance turn missing %q", required)
+			}
+		}
+		for _, obsolete := range []string{"Resolve only selected", "no authority to claim, reopen, reassign or mutate related tickets", "Do not process a second signoff ticket"} {
+			if strings.Contains(prompt, obsolete) {
+				t.Errorf("acceptance turn retains ambiguous or prohibitive instruction %q", obsolete)
+			}
+		}
+		if template == "" {
+			if !strings.Contains(prompt, ArchitectPrompt) {
+				t.Fatal("managed default lost shared architectural guidance")
+			}
+			assertAcceptanceHoldGuidance(t, prompt)
+		} else if !strings.HasPrefix(prompt, strings.ReplaceAll(custom, "{{ticket}}", id)+"\n\n") || strings.Contains(prompt, ArchitectPrompt) {
+			t.Fatal("custom managed instructions were changed or replaced by the default")
 		}
 	}
 }

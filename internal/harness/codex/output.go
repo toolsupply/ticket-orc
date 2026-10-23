@@ -121,6 +121,7 @@ type outputEvent struct {
 		OutputTokens      int64 `json:"output_tokens"`
 	} `json:"usage"`
 	Item *struct {
+		ID       string `json:"id"`
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		Command  string `json:"command"`
@@ -180,6 +181,9 @@ func InterpretEvent(line []byte) ([]harness.LogRecord, error) {
 		}
 	default:
 		return nil, nil
+	}
+	if event.Item != nil {
+		record.ItemID = event.Item.ID
 	}
 	return []harness.LogRecord{record}, nil
 }

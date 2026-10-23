@@ -311,8 +311,11 @@ func assertInitTopology(t *testing.T, loaded LoadedFileConfig, architect bool) {
 		t.Fatalf("generated reviewer role=%#v, want completion %q", reviewer, wantReviewerCompletion)
 	}
 	architectRole, found := loaded.Config.Roles["architect"]
-	if architect && (!found || architectRole.TicketQueue != "signoff" || !strings.Contains(architectRole.NudgePrompt, "final acceptance")) {
+	if architect && (!found || architectRole.TicketQueue != "signoff" || architectRole.NudgePrompt != architectNudgePrompt) {
 		t.Fatalf("generated architect role=%#v found=%v", architectRole, found)
+	}
+	if architect {
+		assertSeriousHoldGuidance(t, architectRole.NudgePrompt)
 	}
 	if !architect && found {
 		t.Fatalf("default topology unexpectedly includes architect: %#v", architectRole)

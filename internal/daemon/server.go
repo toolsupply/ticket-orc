@@ -124,6 +124,7 @@ type Config struct {
 	Version           string
 	Status            func() Status
 	RepositoryGateway RepositoryGateway
+	Conversations     *ConversationAPI
 	Control           *Control
 	ReadHeaderTimeout time.Duration
 	EventHeartbeat    time.Duration

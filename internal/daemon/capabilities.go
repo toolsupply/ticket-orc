@@ -4,12 +4,13 @@ package daemon
 // computed from the callbacks used by the HTTP handlers rather than from
 // operations merely supported by the binary.
 type Capabilities struct {
-	Events        bool                   `json:"events"`
-	DaemonActions []string               `json:"daemon_actions"`
-	WorkerActions []string               `json:"worker_actions"`
-	GroupActions  []string               `json:"group_actions"`
-	Repositories  RepositoryCapabilities `json:"repositories"`
-	Logs          LogCapabilities        `json:"logs"`
+	Conversations *ConversationCapabilities `json:"conversations,omitempty"`
+	Events        bool                      `json:"events"`
+	DaemonActions []string                  `json:"daemon_actions"`
+	WorkerActions []string                  `json:"worker_actions"`
+	GroupActions  []string                  `json:"group_actions"`
+	Repositories  RepositoryCapabilities    `json:"repositories"`
+	Logs          LogCapabilities           `json:"logs"`
 }
 
 // RepositoryCapabilities describes the repository HTTP surface and its
@@ -31,6 +32,7 @@ func (s *Server) capabilities() Capabilities {
 	gateway := s.config.RepositoryGateway
 	capabilities := Capabilities{
 		Events:        s.events != nil,
+		Conversations: s.conversationCapabilities(),
 		DaemonActions: []string{},
 		WorkerActions: []string{},
 		GroupActions:  []string{},

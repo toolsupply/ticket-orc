@@ -21,6 +21,7 @@ const (
 type RunRequest struct {
 	WorkerName           string
 	WorkingDir           string
+	Workspace            string
 	Role                 string
 	Actor                string
 	TicketID             string
@@ -31,9 +32,13 @@ type RunRequest struct {
 	StateDir             string
 	OutputMode           string
 	CodexSandbox         string
+	CodexServiceTier     string
 	PiProvider           string
 	ClaudePermissionMode string
-	Operator             io.Writer
+	// Events optionally receives live semantic output. See OutputEvent for the
+	// ownership and bounded delivery contract. Only advertised adapters support it.
+	Events   chan<- OutputEvent
+	Operator io.Writer
 }
 
 // OutputMode selects how a provider stream is rendered for the operator.
@@ -69,10 +74,12 @@ const (
 // starting a ticket turn. Unsupported requested combinations must be rejected
 // during startup rather than after a queue claim.
 type Capabilities struct {
-	Resume         bool
-	Fresh          bool
-	CleanupDelete  bool
-	CleanupArchive bool
+	// OutputGranularity is empty when live output is unsupported.
+	OutputGranularity OutputGranularity
+	Resume            bool
+	Fresh             bool
+	CleanupDelete     bool
+	CleanupArchive    bool
 }
 
 // PreflightConfig contains the generic settings an adapter must validate
@@ -84,6 +91,7 @@ type PreflightConfig struct {
 	SessionCleanup       CleanupPolicy
 	OutputMode           string
 	CodexSandbox         string
+	CodexServiceTier     string
 	PiProvider           string
 	ClaudePermissionMode string
 }

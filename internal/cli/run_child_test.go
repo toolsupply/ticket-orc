@@ -234,9 +234,11 @@ func TestStartRunChildUsesEachWorkersWorkingDirectory(t *testing.T) {
 	t.Setenv("TICKET_ORC_STATE_DIR", "inherited-state-root")
 	var output, diagnostics bytes.Buffer
 	first := supervisorTestWorker("first", t.TempDir())
+	first.Config.Codex.ServiceTier = "fast"
 	first.Config.WorkingDir = firstDir
 	first.Config.StateDir = filepath.Join(t.TempDir(), "first-state")
 	second := supervisorTestWorker("second", t.TempDir())
+	second.Config.Codex.ServiceTier = "default"
 	second.Config.WorkingDir = secondDir
 	second.Config.StateDir = filepath.Join(t.TempDir(), "second-state")
 	firstChild, err := startRunChild(context.Background(), configPath, os.Args[0], first, &output, &diagnostics, &sync.Mutex{}, &sync.Mutex{})
@@ -252,6 +254,9 @@ func TestStartRunChildUsesEachWorkersWorkingDirectory(t *testing.T) {
 	stopRunChildAtTestCleanup(t, secondChild)
 	firstReady := waitForSupervisorTestFile(t, filepath.Join(childDir, "first.ready"))
 	secondReady := waitForSupervisorTestFile(t, filepath.Join(childDir, "second.ready"))
+	if !strings.Contains(firstReady, "resolved_service_tier=fast\n") || !strings.Contains(secondReady, "resolved_service_tier=default\n") {
+		t.Fatalf("child service tiers missing: %q and %q", firstReady, secondReady)
+	}
 	firstWorkingDir, firstHasWorkingDir := supervisorTestReadyField(firstReady, "cwd")
 	secondWorkingDir, secondHasWorkingDir := supervisorTestReadyField(secondReady, "cwd")
 	if !firstHasWorkingDir || !secondHasWorkingDir {

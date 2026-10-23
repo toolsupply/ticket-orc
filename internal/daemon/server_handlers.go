@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -153,6 +152,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(defaultShutdownTimeout))
 	if _, err := w.Write(syncEvent); err != nil {
 		return
 	}
@@ -169,13 +169,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(defaultShutdownTimeout))
 			if _, err := w.Write(data); err != nil {
 				return
 			}
 			flusher.Flush()
 		case <-heartbeat.C:
-			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
-				return
+			for _, event := range s.events.checkpoint(id) {
+				data, err := encodeSSEEvent(event)
+				if err != nil {
+					return
+				}
+				_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(defaultShutdownTimeout))
+				if _, err := w.Write(data); err != nil {
+					return
+				}
 			}
 			flusher.Flush()
 		case <-r.Context().Done():

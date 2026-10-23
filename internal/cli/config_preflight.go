@@ -24,6 +24,7 @@ func preflightRoleHarness(config supervisor.RoleConfig, agent harness.Harness) e
 		SessionCleanup:       harness.CleanupPolicy(config.SessionCleanup),
 		OutputMode:           string(config.Output),
 		CodexSandbox:         config.Codex.Sandbox,
+		CodexServiceTier:     config.Codex.ServiceTier,
 		PiProvider:           config.Pi.Provider,
 		ClaudePermissionMode: config.Claude.PermissionMode,
 	}); err != nil {

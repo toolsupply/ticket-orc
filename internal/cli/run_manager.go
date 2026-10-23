@@ -51,6 +51,8 @@ type workerManager struct {
 	runtime                 *supervisor.RuntimeState[supervisor.RunWorker]
 	dispatchGate            *dispatchGate
 	steerPolicies           *steerPolicyStore
+	conversationProfiles    *orc.ConversationProfiles
+	conversationLimits      orc.ConversationLimits
 	steerDirty              *steerDirtySet
 	results                 chan struct {
 		child *runChild
@@ -80,18 +82,20 @@ func newWorkerManager(ctx context.Context, config RunConfig, executable string, 
 		ctx: ctx, configPath: config.ConfigPath, localDir: config.StateDir, instanceID: config.InstanceID, executable: executable,
 		starter: starter, stdout: stdout, stderr: stderr, childStdout: childStdout, childStderr: childStderr,
 		outputMu: &sync.Mutex{}, errorMu: &sync.Mutex{}, transition: transition,
-		ticketProbe:       config.ticketProbe,
-		repositoryProbe:   config.repositoryProbe,
-		repositories:      cloneRepositoryRegistry(config.Repositories),
-		repositoriesByID:  repositoryRegistryByID(config.Repositories),
-		dynamicReposByID:  make(map[string]supervisor.ConfiguredRepository),
-		dynamicStatusKeys: make(map[string]bool),
-		repositoryWatch:   newRepositoryWatchManager(ctx, config.Runtime, config.Repositories, config.repositoryProbe),
-		preflighted:       make(map[string]bool, len(config.Workers)),
-		runtime:           config.Runtime,
-		dispatchGate:      config.dispatchGate,
-		steerPolicies:     steerPolicies,
-		steerDirty:        config.steerDirty,
+		ticketProbe:          config.ticketProbe,
+		repositoryProbe:      config.repositoryProbe,
+		repositories:         cloneRepositoryRegistry(config.Repositories),
+		repositoriesByID:     repositoryRegistryByID(config.Repositories),
+		dynamicReposByID:     make(map[string]supervisor.ConfiguredRepository),
+		dynamicStatusKeys:    make(map[string]bool),
+		repositoryWatch:      newRepositoryWatchManager(ctx, config.Runtime, config.Repositories, config.repositoryProbe),
+		preflighted:          make(map[string]bool, len(config.Workers)),
+		runtime:              config.Runtime,
+		dispatchGate:         config.dispatchGate,
+		steerPolicies:        steerPolicies,
+		conversationProfiles: config.conversationProfiles,
+		conversationLimits:   config.conversationLimits,
+		steerDirty:           config.steerDirty,
 		results: make(chan struct {
 			child *runChild
 			err   error
@@ -239,6 +243,19 @@ func (m *workerManager) reload(ctx context.Context) (supervisor.ReloadResult, er
 	if err := validateResolvedRepositories(candidateRepositories); err != nil {
 		return supervisor.ReloadResult{}, &supervisor.LifecycleError{Code: "invalid_config", Message: "candidate repository configuration is invalid", Cause: err}
 	}
+	var candidateConversationProfiles []orc.ConversationProfile
+	if m.conversationProfiles != nil {
+		limits, err := conversationLimits(loaded.Config.Conversations)
+		if err != nil || limits != m.conversationLimits {
+			return supervisor.ReloadResult{}, &supervisor.LifecycleError{Code: "conversation_limits_changed", Message: "conversation storage limits require a daemon restart"}
+		}
+		candidateConversationProfiles, err = resolveConversationProfiles(ctx, loaded, candidateRepositories, func(_ context.Context, r supervisor.ConfiguredRepository) (ticketclient.RepositoryInfo, error) {
+			return *r.Info, nil
+		})
+		if err != nil {
+			return supervisor.ReloadResult{}, &supervisor.LifecycleError{Code: "invalid_config", Message: "candidate conversation profiles are invalid"}
+		}
+	}
 	type resolvedWorker struct {
 		name   string
 		worker supervisor.RunWorker
@@ -357,6 +374,9 @@ func (m *workerManager) reload(ctx context.Context) (supervisor.ReloadResult, er
 					}
 				}
 				m.runtime.SetRevision(revision)
+			}
+			if m.conversationProfiles != nil {
+				m.conversationProfiles.Replace(candidateConversationProfiles)
 			}
 			if m.steerPolicies != nil {
 				_, policyChanged := m.steerPolicies.Replace(candidateSteerPolicies)

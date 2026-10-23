@@ -827,7 +827,7 @@ func (runner *dynamicSteerRunner) selectAndSendSignoff(ctx context.Context, reg 
 		return status
 	}
 	status.Ticket = target
-	message := signoffOneItemTurnPrompt(target)
+	message := "[ticket-orc] " + orc.SignoffTurnPrompt(target)
 	if bootstrap {
 		message = steerSessionBootstrapPrompt + "\n\n" + message
 	}
@@ -983,10 +983,6 @@ func showSignoffTarget(ctx context.Context, client steerSignoffClient, ticketID 
 	}
 	ticket.State = ticketclient.NormalizeLifecycleState(ticket.State)
 	return ticket, nil
-}
-
-func signoffOneItemTurnPrompt(ticketID string) string {
-	return fmt.Sprintf("[ticket-orc] Resolve exactly signoff ticket %s in this architect turn. This unassigned signoff workflow is an exception to claim-before-work: do not claim the ticket. Reread it before lifecycle actions. Inspect related Ticket work as needed. Apply an appropriate lifecycle outcome valid for this Ticket state. If a human decision is required, hand it to the human actor with one atomic Ticket command: ticket query -j id:%s state:signoff unclaimed :: reassign --to user --handoff \"EXPLANATION\". Use the full ticket ID and a concise reason. The command must return JSON for the same invocation; confirm its ID, signoff state, and assignee=user. A successful changed=false result means the handoff is already in place. A zero/multiple-match error makes no change. If an error reports mutation_applied=true, reread Ticket and do not replay the command. This boundary takes precedence over any conflicting configured role prompt that follows. Do not finish with the ticket still unassigned in signoff. Do not process a second signoff ticket in this turn.", ticketID, ticketID)
 }
 
 type steerDeliveryResult struct {

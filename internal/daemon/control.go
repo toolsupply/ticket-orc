@@ -69,16 +69,18 @@ type DaemonControlResult struct {
 	Targets []DaemonAbortTargetResult `json:"targets,omitempty"`
 }
 
-// DaemonAbortTargetResult is a bounded outcome for one managed or steer abort
+// DaemonAbortTargetResult is a bounded outcome for one managed, steer, or conversation abort
 // target. It intentionally has no field for paths, prompts, process arguments,
 // environment values, or session content.
 type DaemonAbortTargetResult struct {
-	Kind         string `json:"kind"`
-	Worker       string `json:"worker,omitempty"`
-	RepositoryID string `json:"repository_id,omitempty"`
-	Actor        string `json:"actor,omitempty"`
-	Outcome      string `json:"outcome"`
-	Code         string `json:"code,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	TurnID         string `json:"turn_id,omitempty"`
+	Kind           string `json:"kind"`
+	Worker         string `json:"worker,omitempty"`
+	RepositoryID   string `json:"repository_id,omitempty"`
+	Actor          string `json:"actor,omitempty"`
+	Outcome        string `json:"outcome"`
+	Code           string `json:"code,omitempty"`
 }
 
 // DoctorWorkerResult is a bounded operator-facing recovery outcome. It names

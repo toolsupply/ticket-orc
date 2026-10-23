@@ -170,7 +170,8 @@ func TestRunAcceptanceSweepsBeyondFirstBoundedFrontierWithoutRepeat(t *testing.T
 		if request.TicketID == "" || request.Actor != "architect" || request.Role != "architect-api" {
 			t.Fatalf("acceptance request = %#v; want exact ticket and architect defaults", request)
 		}
-		for _, wantText := range []string{"exception to claim-before-work", request.TicketID, "do not claim the ticket", "Do not process a second signoff ticket"} {
+		assertAcceptanceHoldGuidance(t, request.Prompt)
+		for _, wantText := range []string{"exception to claim-before-work", request.TicketID, "do not claim the ticket", "Do not select, claim, implement, review, or make an acceptance decision for a second ticket", "one atomic Ticket command", "reassign --to user", "mutation_applied=true"} {
 			if !containsText(request.Prompt, wantText) {
 				t.Fatalf("acceptance prompt %q missing %q", request.Prompt, wantText)
 			}
@@ -196,15 +197,18 @@ func TestRunAcceptanceComposesConfiguredPromptWithRequiredBoundary(t *testing.T)
 		t.Fatalf("harness runs = %d, want one", len(harness.runs))
 	}
 	prompt := harness.runs[0].Prompt
+	if strings.Contains(prompt, "outstanding holds") {
+		t.Fatal("default guidance replaced the configured acceptance prompt")
+	}
 	for _, want := range []string{
 		"Check the API outcome for " + id,
 		"exception to claim-before-work",
 		"do not claim the ticket",
-		"Resolve only selected signoff ticket " + id,
+		"The dispatched signoff ticket is " + id,
 		"Reread it immediately before lifecycle actions",
 		"Ticket-valid lifecycle outcome",
 		"Do not treat leaving it unassigned in signoff as a successful resolution",
-		"Do not process a second signoff ticket",
+		"Do not select, claim, implement, review, or make an acceptance decision for a second ticket",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("composed prompt %q missing %q", prompt, want)
@@ -692,3 +696,39 @@ func acceptanceConfig() AcceptanceConfig {
 }
 
 func containsText(value, fragment string) bool { return strings.Contains(value, fragment) }
+
+func assertAcceptanceHoldGuidance(t *testing.T, prompt string) {
+	t.Helper()
+	for _, required := range []string{
+		"outstanding holds",
+		"in the ticket's repository through Ticket public interfaces",
+		"blocker/Handoff and dependencies",
+		"P0 holds",
+		"missing architectural decisions or permissions",
+		"cross-ticket coordination",
+		"held prerequisites of final integration",
+		"circular waits",
+		"without a clear responsible actor",
+		"not narrative similarity",
+		"affected full Ticket IDs",
+		"responsible actor if known, and concrete next action",
+		"assess whether it prevents acceptance",
+		"Do not approve final integration with incomplete prerequisites",
+		"routine external waits",
+		"hold does not itself mean permission is absent",
+		"do not ask again when it is established",
+		"create follow-up tickets",
+		"refine unowned related planning tickets",
+		"correct mistaken dependencies or split work",
+		"Do not remove a genuine prerequisite",
+		"do not take over owned work",
+		"do not require whole-project completion for every component",
+		"Escalate changes to approved scope or architecture",
+		"Record the acceptance decision, outstanding integration work, and planning changes made",
+		"explicit human handoff",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Errorf("acceptance guidance missing %q in %q", required, prompt)
+		}
+	}
+}

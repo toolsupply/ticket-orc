@@ -17,6 +17,7 @@ var roleFlags = map[string]struct{}{
 	"session-cleanup":               {},
 	"minimum-reuse-context-percent": {},
 	"review-completion":             {},
+	"codex-service-tier":            {},
 	"codex-sandbox":                 {},
 	"pi-provider":                   {},
 	"claude-permission-mode":        {},

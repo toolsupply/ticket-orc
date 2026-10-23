@@ -54,6 +54,7 @@ func TestLaunchSnapshotComparisonIncludesResolvedLaunchPolicy(t *testing.T) {
 		{name: "harness", change: func(worker *supervisor.RunWorker) { worker.Config.Harness = "pi" }},
 		{name: "model", change: func(worker *supervisor.RunWorker) { worker.Config.Model = "changed" }},
 		{name: "reasoning", change: func(worker *supervisor.RunWorker) { worker.Config.Reasoning = "high" }},
+		{name: "service tier", change: func(worker *supervisor.RunWorker) { worker.Config.Codex.ServiceTier = "fast" }},
 		{name: "sandbox", change: func(worker *supervisor.RunWorker) { worker.Config.Codex.Sandbox = "read-only" }},
 		{name: "ticket target", change: func(worker *supervisor.RunWorker) {
 			worker.Config.Ticket = supervisor.TicketTarget{Mode: TicketTargetRepository, Repository: "/changed/repository"}

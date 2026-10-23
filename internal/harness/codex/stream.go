@@ -15,6 +15,7 @@ const maxEventBytes = harness.MaxEventBytes
 
 type streamParser struct {
 	output             io.Writer
+	events             chan<- harness.OutputEvent
 	expected           string
 	session            string
 	sessionInvalidated bool
@@ -84,7 +85,7 @@ func (p *streamParser) parseLine(line []byte) error {
 		return fmt.Errorf("%w: malformed JSONL event: %v", ErrProtocol, err)
 	}
 	if event.Type != "thread.started" {
-		return nil
+		return p.publishLine(line)
 	}
 	if strings.TrimSpace(event.ThreadID) == "" {
 		return fmt.Errorf("%w: thread.started has no thread_id", ErrProtocol)
@@ -94,8 +95,28 @@ func (p *streamParser) parseLine(line []byte) error {
 		return fmt.Errorf("%w: resumed thread %q, expected %q", ErrProtocol, event.ThreadID, p.expected)
 	}
 	if p.session != "" && event.ThreadID != p.session {
+		p.sessionInvalidated = true
 		return fmt.Errorf("%w: stream changed thread from %q to %q", ErrProtocol, p.session, event.ThreadID)
 	}
 	p.session = event.ThreadID
+	return nil
+}
+
+// Publication shares the session parser's framing and runs only after the line
+// passes validation. The first failure stops publication, including Finish;
+// raw logging and ticket-worker rendering still receive the original bytes.
+func (p *streamParser) publishLine(line []byte) error {
+	if p.events == nil {
+		return nil
+	}
+	records, err := InterpretEvent(line)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := harness.PublishOutputEvent(p.events, record); err != nil {
+			return err
+		}
+	}
 	return nil
 }

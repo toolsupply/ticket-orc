@@ -5,6 +5,7 @@ package harness
 // are populated. Diagnostic levels are info, warning, or error; command phases
 // are started or completed. A nil ExitCode means the provider did not report it.
 type LogRecord struct {
+	ItemID   string       `json:"item_id,omitempty"`
 	Kind     string       `json:"kind"`
 	Text     string       `json:"text,omitempty"`
 	Level    string       `json:"level,omitempty"`

@@ -565,7 +565,7 @@ func TestRequestAndAdapterValidation(t *testing.T) {
 
 func TestCapabilitiesAndPreflight(t *testing.T) {
 	adapter := New()
-	want := harness.Capabilities{Resume: true, Fresh: true, CleanupDelete: true, CleanupArchive: true}
+	want := harness.Capabilities{OutputGranularity: harness.OutputCompleteMessages, Resume: true, Fresh: true, CleanupDelete: true, CleanupArchive: true}
 	if got := adapter.Capabilities(); got != want {
 		t.Fatalf("Capabilities = %#v, want %#v", got, want)
 	}
@@ -657,4 +657,60 @@ func countPrefix(values []string, prefix string) int {
 		}
 	}
 	return count
+}
+
+func TestServiceTierFreshAndResumeArguments(t *testing.T) {
+	for _, tier := range []string{"", "default", "fast"} {
+		for _, resume := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resume=%t", tier, resume), func(t *testing.T) {
+				runner := &fakeProcessRunner{chunks: [][]byte{[]byte(`{"type":"thread.started","thread_id":"thread-1"}`)}}
+				adapter := testAdapter(t, nil, runner)
+				request := validRequest(t, io.Discard)
+				request.WorkingDir = nonGitTestDirectory(t)
+				request.Model, request.Reasoning, request.CodexSandbox = "test-model", "high", "workspace-write"
+				request.CodexServiceTier = tier
+				want := []string{"exec", "--skip-git-repo-check", "--json", "-m", "test-model", "-c", `model_reasoning_effort="high"`}
+				if tier != "" {
+					want = append(want, "-c", fmt.Sprintf("service_tier=%q", tier))
+				}
+				want = append(want, "-s", "workspace-write")
+				var err error
+				if resume {
+					want = append(want, "resume", "thread-1")
+					_, err = adapter.Resume(context.Background(), "thread-1", request)
+				} else {
+					_, err = adapter.Run(context.Background(), request)
+				}
+				want = append(want, "implement ticket")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(runner.calls) != 1 || !reflect.DeepEqual(runner.calls[0].args, want) {
+					t.Fatalf("calls=%#v, want args=%q", runner.calls, want)
+				}
+			})
+		}
+	}
+}
+
+func TestServiceTierValidation(t *testing.T) {
+	adapter := testAdapter(t, nil, &fakeProcessRunner{})
+	for _, tier := range []string{"", "default", "fast", "priority", "invalid", " fast", "fast ", "\t", "fast\n", "fast\x00"} {
+		valid := tier == "" || tier == "default" || tier == "fast"
+		err := adapter.Validate(harness.PreflightConfig{CodexServiceTier: tier, OutputMode: "quiet"})
+		if (err == nil) != valid {
+			t.Fatalf("tier=%q preflight error=%v", tier, err)
+		}
+		if valid {
+			continue
+		}
+		request := validRequest(t, io.Discard)
+		request.CodexServiceTier = tier
+		if _, err := adapter.Run(context.Background(), request); err == nil || !strings.Contains(err.Error(), "service tier") {
+			t.Fatalf("tier=%q run error=%v", tier, err)
+		}
+		if _, err := adapter.Resume(context.Background(), "thread-1", request); err == nil || !strings.Contains(err.Error(), "service tier") {
+			t.Fatalf("tier=%q resume error=%v", tier, err)
+		}
+	}
 }

@@ -34,6 +34,7 @@ type CoderConfig struct {
 	StateDir                   string
 	OutputMode                 string
 	CodexSandbox               string
+	CodexServiceTier           string
 	PiProvider                 string
 	ClaudePermissionMode       string
 	ReviewCompletion           string
@@ -119,6 +120,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		SessionCleanup:       harness.CleanupPolicy(config.SessionCleanup),
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 	}); err != nil {
@@ -369,6 +371,7 @@ func runCoderTurn(ctx context.Context, config CoderConfig, ticketID string, agen
 		StateDir:             config.StateDir,
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 		Operator:             config.Operator,

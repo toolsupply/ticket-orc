@@ -2,6 +2,19 @@
 
 All notable user-facing changes to `ticket-orc` are documented here.
 
+## [0.1.5] - 2026-10-24
+
+### Added
+
+- Added managed Codex service-tier configuration (`default` or `fast`)
+
+### Changed
+
+- Role `nudge_prompt` is now optional
+- Architect acceptance now checks blockers and integration prerequisites.
+- Expanded architect guidance to cover overall progress, follow-up planning, and dependency corrections.
+- Unified architect guidance across managed workers, steered sessions, the worker skill, and `init --architect`.
+
 ## [0.1.4] - 2026-10-20
 
 ### Added
@@ -52,6 +65,7 @@ All notable user-facing changes to `ticket-orc` are documented here.
 
 - Initial release
 
+[0.1.5]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.5
 [0.1.4]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.4
 [0.1.3]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.3
 [0.1.2]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.2

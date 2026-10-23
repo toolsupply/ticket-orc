@@ -187,6 +187,45 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 		return fmt.Errorf("load daemon control state: %w", err)
 	}
 	config.dispatchGate = newDispatchGate(controlStore, controlState.Mode)
+	config.conversationLimits = orc.DefaultConversationLimits()
+	var profiles []orc.ConversationProfile
+	if config.conversationLoaded != nil {
+		config.conversationLimits, err = conversationLimits(config.conversationLoaded.Config.Conversations)
+		if err != nil {
+			return err
+		}
+		probe := config.repositoryProbe
+		if probe == nil {
+			probe = probeConfiguredRepository
+		}
+		profiles, err = resolveConversationProfiles(ctx, *config.conversationLoaded, config.Repositories, probe)
+		if err != nil {
+			return err
+		}
+	}
+	config.conversationProfiles = orc.NewConversationProfiles(profiles)
+	if config.conversationHooks.Run == nil {
+		config.conversationHooks = productionConversationHooks(config.ConfigPath, config.StateDir)
+	}
+	conversationPolicy, err := orc.NewConversations(state.NewConversationStore(config.StateDir), config.conversationLimits)
+	if err != nil {
+		return err
+	}
+	config.conversations = supervisor.NewConversationManager(conversationPolicy, config.conversationHooks)
+	if err := config.conversations.Reconcile(ctx); err != nil {
+		if !orc.IsConversationError(err, "execution_unreconciled") {
+			return fmt.Errorf("reconcile conversations: %w", err)
+		}
+		_, _ = fmt.Fprintln(stderr, "[ticket-orc] conversation execution is unreconciled; confirm surviving children stopped before resuming conversations")
+	}
+	if controlState.Mode == state.DaemonAborted {
+		config.conversations.Abort(ctx)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), runChildStopTimeout)
+		defer cancel()
+		config.conversations.Shutdown(stopCtx)
+	}()
 	config.steerDirty = newSteerDirtySet()
 	dispatchEnabled := controlState.Mode == state.DaemonRunning
 	if len(config.StartupWorkers) > 1 {
@@ -569,12 +608,15 @@ func wireSupervisorControlCallbacks(config *RunConfig, manager *workerManager, e
 			config.steerDirty.MarkAll()
 		}
 		reconcileErr := manager.reconcileDispatch(ctx)
+		if config.conversations != nil {
+			reconcileErr = errors.Join(reconcileErr, config.conversations.Resume(ctx))
+		}
 		emitEvent(supervisor.RuntimeEvent{Type: "daemon.resumed", State: string(mode.Mode), Applied: applied})
 		if reconcileErr != nil {
 			result := daemon.DaemonControlResult{Mode: string(mode.Mode), Applied: applied}
 			return result, &daemon.ControlError{
 				Code: "daemon_reconciliation_failed", Status: 503,
-				Message: "daemon resumed but worker reconciliation failed",
+				Message: "daemon resumed but execution reconciliation failed",
 				Applied: applied, Cause: reconcileErr, Daemon: &result,
 			}
 		}
@@ -586,10 +628,19 @@ func wireSupervisorControlCallbacks(config *RunConfig, manager *workerManager, e
 			return daemon.DaemonControlResult{}, err
 		}
 		result := daemon.DaemonControlResult{Mode: string(state.DaemonAborted), Applied: applied}
+		if config.conversations != nil {
+			config.conversations.BlockExecution()
+		}
 		result.Targets = collectDaemonAbortTargets(ctx,
 			func(ctx context.Context) ([]steerAbortResult, error) {
 				return requestConfiguredSteerAbort(ctx, *config, nil, nil)
 			}, manager.terminateActive)
+
+		if config.conversations != nil {
+			for _, target := range config.conversations.Abort(ctx) {
+				result.Targets = append(result.Targets, daemon.DaemonAbortTargetResult{Kind: "conversation", ConversationID: target.ConversationID, TurnID: target.TurnID, Outcome: target.Outcome})
+			}
+		}
 		emitEvent(supervisor.RuntimeEvent{Type: "daemon.aborted", State: result.Mode, Applied: result.Applied})
 		return result, nil
 	}
@@ -660,6 +711,9 @@ func wireSupervisorControlCallbacks(config *RunConfig, manager *workerManager, e
 	}
 	config.control.Shutdown = func(ctx context.Context) error {
 		emitEvent(supervisor.RuntimeEvent{Type: "daemon.stopping"})
+		if config.conversations != nil {
+			config.conversations.Shutdown(ctx)
+		}
 		manager.stopAll(ctx)
 		shutdownOnce.Do(func() { close(shutdownRequested) })
 		return nil
@@ -677,6 +731,11 @@ func startSupervisorDaemon(ctx context.Context, config RunConfig, manager *worke
 	}
 	if err := httpDaemon.SetRepositoryGateway(manager.repositoryGateway()); err != nil {
 		return nil, listenerAddress, fmt.Errorf("configure daemon repository gateway: %w", err)
+	}
+	if config.conversations != nil {
+		if err := httpDaemon.SetConversations(&daemon.ConversationAPI{Policy: config.conversations.Policy(), Profiles: config.conversationProfiles, Manager: config.conversations}); err != nil {
+			return nil, listenerAddress, err
+		}
 	}
 	if err := httpDaemon.Start(ctx); err != nil {
 		var listenErr *net.OpError

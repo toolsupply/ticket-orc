@@ -8,6 +8,9 @@ import (
 
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/conversation-profiles", s.handleConversations)
+	mux.HandleFunc("/v1/conversations", s.handleConversations)
+	mux.HandleFunc("/v1/conversations/", s.handleConversations)
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/workers", s.handleWorkers)
 	mux.HandleFunc("/v1/groups", s.handleGroups)

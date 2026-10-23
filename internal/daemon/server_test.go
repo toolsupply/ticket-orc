@@ -399,7 +399,7 @@ func TestServerPublishesAuthenticatedOrderedSSEEventsAndHeartbeat(t *testing.T) 
 	var eventFrame string
 	for {
 		eventFrame = readFrame()
-		if !strings.HasPrefix(eventFrame, ": heartbeat") {
+		if !strings.Contains(eventFrame, "event: stream.position") {
 			break
 		}
 	}
@@ -408,6 +408,9 @@ func TestServerPublishesAuthenticatedOrderedSSEEventsAndHeartbeat(t *testing.T) 
 	}
 	server.PublishEvent(Event{Type: "worker.state", Worker: "coder", State: "running"})
 	secondEvent := readFrame()
+	for strings.Contains(secondEvent, "event: stream.position") {
+		secondEvent = readFrame()
+	}
 	if !strings.Contains(secondEvent, "id: 2") || !strings.Contains(secondEvent, `"state":"running"`) {
 		t.Fatalf("second SSE event = %q", secondEvent)
 	}
@@ -417,7 +420,7 @@ func TestServerPublishesAuthenticatedOrderedSSEEventsAndHeartbeat(t *testing.T) 
 		}
 	}
 	for {
-		if frame := readFrame(); strings.HasPrefix(frame, ": heartbeat\n") {
+		if frame := readFrame(); strings.Contains(frame, "event: stream.position") {
 			break
 		}
 	}

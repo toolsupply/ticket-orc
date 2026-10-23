@@ -410,9 +410,12 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		Output:                     supervisor.OutputMode(value("output", "TICKET_ORC_OUTPUT", workerString(worker, func(w WorkerFileConfig) string { return w.Output }), roleDefaults.Output, loaded.Config.Defaults.Output, defaultOutput)),
 		TicketPrompt:               value("ticket-prompt", "TICKET_ORC_TICKET_PROMPT", workerString(worker, func(w WorkerFileConfig) string { return w.TicketPrompt }), roleDefaults.TicketPrompt, loaded.Config.Defaults.TicketPrompt, builtinPrompt),
 		ReviewSkipTags:             strings.Join(canonicalReviewSkipTags(loaded.Config.Review.SkipTags), "\x1f"),
-		Codex:                      supervisor.CodexFileConfig{Sandbox: value("codex-sandbox", "TICKET_ORC_CODEX_SANDBOX", workerString(worker, func(w WorkerFileConfig) string { return w.Codex.Sandbox }), roleDefaults.Codex.Sandbox, loaded.Config.Defaults.Codex.Sandbox, "")},
-		Pi:                         supervisor.PiFileConfig{Provider: value("pi-provider", "TICKET_ORC_PI_PROVIDER", workerString(worker, func(w WorkerFileConfig) string { return w.Pi.Provider }), roleDefaults.Pi.Provider, loaded.Config.Defaults.Pi.Provider, "")},
-		Claude:                     supervisor.ClaudeFileConfig{PermissionMode: value("claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE", workerString(worker, func(w WorkerFileConfig) string { return w.Claude.PermissionMode }), roleDefaults.Claude.PermissionMode, loaded.Config.Defaults.Claude.PermissionMode, "")},
+		Codex: supervisor.CodexFileConfig{
+			Sandbox:     value("codex-sandbox", "TICKET_ORC_CODEX_SANDBOX", workerString(worker, func(w WorkerFileConfig) string { return w.Codex.Sandbox }), roleDefaults.Codex.Sandbox, loaded.Config.Defaults.Codex.Sandbox, ""),
+			ServiceTier: value("codex-service-tier", "TICKET_ORC_CODEX_SERVICE_TIER", workerString(worker, func(w WorkerFileConfig) string { return w.Codex.ServiceTier }), roleDefaults.Codex.ServiceTier, loaded.Config.Defaults.Codex.ServiceTier, ""),
+		},
+		Pi:     supervisor.PiFileConfig{Provider: value("pi-provider", "TICKET_ORC_PI_PROVIDER", workerString(worker, func(w WorkerFileConfig) string { return w.Pi.Provider }), roleDefaults.Pi.Provider, loaded.Config.Defaults.Pi.Provider, "")},
+		Claude: supervisor.ClaudeFileConfig{PermissionMode: value("claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE", workerString(worker, func(w WorkerFileConfig) string { return w.Claude.PermissionMode }), roleDefaults.Claude.PermissionMode, loaded.Config.Defaults.Claude.PermissionMode, "")},
 	}
 	filters, err := ticketclient.CanonicalQueueFilters(ticketclient.QueueFilters{
 		Tags:        roleDefaults.TicketTags,
@@ -604,6 +607,9 @@ func validateRoleConfig(config supervisor.RoleConfig, values map[string]string, 
 		if config.Reasoning != "" && !oneOf(config.Reasoning, "low", "medium", "high", "xhigh", "max", "ultra") {
 			return configValidation("reasoning.invalid", "reasoning", "reasoning is unsupported by the selected harness", "choose a supported reasoning level")
 		}
+		if config.Codex.ServiceTier != "" && !oneOf(config.Codex.ServiceTier, "default", "fast") {
+			return configValidation("codex_service_tier.invalid", "codex.service_tier", "Codex service tier is invalid", "choose default or fast, or leave empty to inherit Codex configuration")
+		}
 		if config.Codex.Sandbox != "" && !oneOf(config.Codex.Sandbox, "read-only", "workspace-write", "danger-full-access") {
 			return configValidation("codex_sandbox.invalid", "codex.sandbox", "Codex sandbox mode is invalid", "choose a supported sandbox mode")
 		}
@@ -667,11 +673,11 @@ func validateHarnessNamespace(config supervisor.RoleConfig, values map[string]st
 			return fmt.Errorf("selected codex harness cannot use pi or claude settings")
 		}
 	case "pi":
-		if config.Codex.Sandbox != "" || config.Claude.PermissionMode != "" || hasExplicitValue(values, lookupEnv, "codex-sandbox", "TICKET_ORC_CODEX_SANDBOX") || hasExplicitValue(values, lookupEnv, "claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE") {
+		if config.Codex.ServiceTier != "" || hasExplicitValue(values, lookupEnv, "codex-service-tier", "TICKET_ORC_CODEX_SERVICE_TIER") || config.Codex.Sandbox != "" || config.Claude.PermissionMode != "" || hasExplicitValue(values, lookupEnv, "codex-sandbox", "TICKET_ORC_CODEX_SANDBOX") || hasExplicitValue(values, lookupEnv, "claude-permission-mode", "TICKET_ORC_CLAUDE_PERMISSION_MODE") {
 			return fmt.Errorf("selected pi harness cannot use codex or claude settings")
 		}
 	case "claude":
-		if config.Codex.Sandbox != "" || config.Pi.Provider != "" || hasExplicitValue(values, lookupEnv, "codex-sandbox", "TICKET_ORC_CODEX_SANDBOX") || hasExplicitValue(values, lookupEnv, "pi-provider", "TICKET_ORC_PI_PROVIDER") {
+		if config.Codex.ServiceTier != "" || hasExplicitValue(values, lookupEnv, "codex-service-tier", "TICKET_ORC_CODEX_SERVICE_TIER") || config.Codex.Sandbox != "" || config.Pi.Provider != "" || hasExplicitValue(values, lookupEnv, "codex-sandbox", "TICKET_ORC_CODEX_SANDBOX") || hasExplicitValue(values, lookupEnv, "pi-provider", "TICKET_ORC_PI_PROVIDER") {
 			return fmt.Errorf("selected claude harness cannot use codex or pi settings")
 		}
 	}

@@ -17,31 +17,36 @@ import (
 
 // RunConfig describes one foreground supervisor invocation.
 type RunConfig struct {
-	ConfigPath         string
-	StateDir           string
-	InstanceID         string
-	LocalDirConfigured bool
-	ListenAddress      string
-	Port               int
-	EndpointKey        string
-	Interactive        bool
-	Doctor             bool
-	Repositories       supervisor.RepositoryRegistry
-	Workers            []supervisor.RunWorker // Full configured inventory, including dormant workers.
-	StartupWorkers     []string               // Names selected for initial launch only.
-	Diagnostics        []ConfigDiagnostic
-	steerPolicies      *steerPolicyStore
-	steerStatus        *dynamicSteerStatus
-	dispatchGate       *dispatchGate
-	steerDirty         *steerDirtySet
-	startupGuard       *state.Lock
-	Runtime            *supervisor.RuntimeState[supervisor.RunWorker]
-	Hooks              supervisor.SupervisorHooks
-	startChild         runChildStarter
-	startDaemon        runDaemonStarter
-	ticketProbe        func(context.Context, supervisor.RunWorker) (ticketclient.RepositoryInfo, error)
-	repositoryProbe    repositoryProbe
-	control            *daemon.Control
+	ConfigPath           string
+	StateDir             string
+	InstanceID           string
+	LocalDirConfigured   bool
+	ListenAddress        string
+	Port                 int
+	EndpointKey          string
+	Interactive          bool
+	Doctor               bool
+	Repositories         supervisor.RepositoryRegistry
+	Workers              []supervisor.RunWorker // Full configured inventory, including dormant workers.
+	StartupWorkers       []string               // Names selected for initial launch only.
+	Diagnostics          []ConfigDiagnostic
+	steerPolicies        *steerPolicyStore
+	steerStatus          *dynamicSteerStatus
+	dispatchGate         *dispatchGate
+	steerDirty           *steerDirtySet
+	startupGuard         *state.Lock
+	Runtime              *supervisor.RuntimeState[supervisor.RunWorker]
+	Hooks                supervisor.SupervisorHooks
+	startChild           runChildStarter
+	startDaemon          runDaemonStarter
+	ticketProbe          func(context.Context, supervisor.RunWorker) (ticketclient.RepositoryInfo, error)
+	repositoryProbe      repositoryProbe
+	control              *daemon.Control
+	conversations        *supervisor.ConversationManager
+	conversationHooks    supervisor.ConversationProcessHooks
+	conversationLoaded   *LoadedFileConfig
+	conversationProfiles *orc.ConversationProfiles
+	conversationLimits   orc.ConversationLimits
 }
 
 type runDaemonStarter func(context.Context, *supervisor.RuntimeState[supervisor.RunWorker], []supervisor.RunWorker) (*daemon.Server, error)
@@ -240,12 +245,23 @@ func parseRunConfig(args []string, lookupEnv envLookup) (RunConfig, bool, error)
 	if err != nil {
 		return RunConfig{}, false, err
 	}
-	return RunConfig{ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, InstanceID: loaded.Config.ID, LocalDirConfigured: loaded.Instance.LocalDirConfigured, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, StartupWorkers: selected, Diagnostics: diagnostics, steerPolicies: newSteerPolicyStore(steerRoles), steerStatus: &dynamicSteerStatus{}}, false, nil
+	return RunConfig{conversationLoaded: &loaded, ConfigPath: loaded.Instance.ConfigPath, StateDir: stateDir, InstanceID: loaded.Config.ID, LocalDirConfigured: loaded.Instance.LocalDirConfigured, ListenAddress: listenAddress, Port: listenPort, EndpointKey: loaded.Config.Supervisor.EndpointKey, Interactive: interactive, Repositories: repositories, Workers: resolved, StartupWorkers: selected, Diagnostics: diagnostics, steerPolicies: newSteerPolicyStore(steerRoles), steerStatus: &dynamicSteerStatus{}}, false, nil
 }
 
 func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[string]steerRolePolicy, error) {
 	steerRoles := make(map[string]steerRolePolicy, len(config.Roles))
 	for name, role := range config.Roles {
+		nudgePrompt := role.NudgePrompt
+		if nudgePrompt == "" {
+			switch role.TicketQueue {
+			case "open":
+				nudgePrompt = coderNudgePrompt
+			case "review":
+				nudgePrompt = reviewerNudgePrompt
+			case "signoff":
+				nudgePrompt = architectNudgePrompt
+			}
+		}
 		reviewCompletion := ""
 		if role.TicketQueue == "review" {
 			reviewCompletion = firstNonEmpty(role.ReviewCompletion, config.Defaults.ReviewCompletion, ReviewCompletionSignoff)
@@ -279,7 +295,7 @@ func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[strin
 		if role.TicketQueue == "review" {
 			reviewSkipTags = canonicalReviewSkipTags(config.Review.SkipTags)
 		}
-		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, TicketWithoutTags: genericFilters.WithoutTags, ReviewSkipTags: reviewSkipTags, NudgePrompt: role.NudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
+		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, TicketWithoutTags: genericFilters.WithoutTags, ReviewSkipTags: reviewSkipTags, NudgePrompt: nudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
 	}
 	return steerRoles, nil
 }

@@ -455,12 +455,17 @@ func TestTicketOrcWorkerSkillScopesOneItemRuleToDynamicTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	skill := string(content)
-	for _, want := range []string{"dynamic/steered Orc work turn", "at most one actionable item", "stop and return from the turn", "Do not select or claim a second item", "even if another Orc notification arrives", "managed execution", "exact-ticket instruction", "dynamic open/review work-bearing notifications", "sole unclaimed dynamic signoff exception", "ticket query -j id:FULL_ID state:signoff unclaimed :: reassign --to user", "changed: false", "one exact unclaimed signoff entry per wake"} {
+	for _, want := range []string{"dynamic/steered Orc open/review work turn", "at most one actionable item", "stop and return from the turn", "Do not select or claim a second item", "even if another Orc notification arrives", "managed execution", "exact-ticket instruction", "dynamic open/review work-bearing notifications", "sole unclaimed dynamic signoff exception", "ticket query -j id:FULL_ID state:signoff unclaimed :: reassign --to user", "changed: false", "one exact unclaimed signoff entry per wake"} {
 		if !strings.Contains(skill, want) {
 			t.Errorf("worker Skill omitted %q", want)
 		}
 	}
-	for _, unwanted := range []string{"Continue selecting and processing until", "only then conclude the Orc-driven turn"} {
+	for _, want := range []string{"not a limit on analysis", "refine unowned related planning tickets", "Related planning maintenance does not count as accepting a second ticket", "final integration requires complete prerequisites"} {
+		if !strings.Contains(skill, want) {
+			t.Errorf("worker Skill omitted architectural planning guidance %q", want)
+		}
+	}
+	for _, unwanted := range []string{"Continue selecting and processing until", "only then conclude the Orc-driven turn", "This inspection does not grant authority to act on another entry's lifecycle"} {
 		if strings.Contains(skill, unwanted) {
 			t.Errorf("worker Skill retains dynamic queue-drain instruction %q", unwanted)
 		}

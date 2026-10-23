@@ -178,7 +178,7 @@ func validateAndNormalizeFileConfig(config *FileConfig, configDir string) error 
 			return err
 		}
 	}
-	return nil
+	return validateConversationFileConfig(config, configDir)
 }
 
 func isUUIDv4(value string) bool {
@@ -228,7 +228,7 @@ func validateRolePolicies(config *FileConfig) error {
 		if err := validateReviewCompletionPolicy("roles."+name+".review_completion", role.ReviewCompletion); err != nil {
 			return err
 		}
-		if strings.TrimSpace(role.NudgePrompt) == "" {
+		if role.NudgePrompt != "" && strings.TrimSpace(role.NudgePrompt) == "" {
 			return fmt.Errorf("roles.%s.nudge_prompt must not be empty", name)
 		}
 	}
@@ -414,7 +414,7 @@ func validateWorker(name string, worker WorkerFileConfig) error {
 		return err
 	}
 	if worker.Harness != "" {
-		if worker.Harness != "codex" && worker.Codex.Sandbox != "" {
+		if worker.Harness != "codex" && (worker.Codex.Sandbox != "" || worker.Codex.ServiceTier != "") {
 			return fmt.Errorf("worker %q configures codex settings for harness %q", name, worker.Harness)
 		}
 		if worker.Harness != "pi" && worker.Pi.Provider != "" {

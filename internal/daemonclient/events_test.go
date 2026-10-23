@@ -168,3 +168,24 @@ func TestEventStreamReconnectStartsFreshSyncBaseline(t *testing.T) {
 		t.Fatalf("reconnected event=%#v err=%v, want fresh baseline 100", event, err)
 	}
 }
+
+func TestEventStreamPositionDetectsDroppedFinalAndDoesNotIncrement(t *testing.T) {
+	client := newEventStreamTestClient(t, "id: 5\nevent: stream.sync\ndata: {\"seq\":5,\"type\":\"stream.sync\"}\n\n"+
+		"id: 5\nevent: stream.position\ndata: {\"seq\":5,\"type\":\"stream.position\"}\n\n"+
+		"id: 6\nevent: stream.position\ndata: {\"seq\":6,\"type\":\"stream.position\"}\n\n"+
+		"id: 6\nevent: stream.position\ndata: {\"seq\":6,\"type\":\"stream.position\"}\n\n"+
+		"id: 7\nevent: worker.state\ndata: {\"seq\":7,\"type\":\"worker.state\"}\n\n")
+	stream, err := client.Events(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	event, err := stream.Next()
+	if err != ErrEventGap || event.Type != "stream.position" || event.Seq != 6 {
+		t.Fatalf("final loss: %+v %v", event, err)
+	}
+	event, err = stream.Next()
+	if err != nil || event.Type != "worker.state" || event.Seq != 7 {
+		t.Fatalf("after watermark: %+v %v", event, err)
+	}
+}

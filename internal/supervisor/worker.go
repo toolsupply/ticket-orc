@@ -36,7 +36,8 @@ const (
 )
 
 type CodexFileConfig struct {
-	Sandbox string `json:"sandbox"`
+	Sandbox     string `json:"sandbox"`
+	ServiceTier string `json:"service_tier"`
 }
 type PiFileConfig struct {
 	Provider string `json:"provider"`

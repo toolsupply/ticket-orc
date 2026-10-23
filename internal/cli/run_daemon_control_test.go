@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/harness"
+	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 )
@@ -505,5 +507,87 @@ func TestReloadPreservesPausedAndAbortedModesWithoutStartingNewWork(t *testing.T
 				t.Fatalf("new worker state after reload=%q, want stopped", got)
 			}
 		})
+	}
+}
+
+func TestDaemonControlsCoverConversationChildrenAndPausePermitsTurns(t *testing.T) {
+	dir := t.TempDir()
+	gate := newDispatchGate(state.NewDaemonControlStore(dir), state.DaemonRunning)
+	policy, err := orc.NewConversations(state.NewConversationStore(dir), orc.DefaultConversationLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 2)
+	conversations := supervisor.NewConversationManager(policy, supervisor.ConversationProcessHooks{Run: func(ctx context.Context, _ state.Conversation, _ state.ConversationTurn, _ string, _ func(state.ConversationRecord) error) (harness.RunResult, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return harness.RunResult{}, ctx.Err()
+	}})
+	if err := conversations.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conversations.Shutdown(ctx)
+	})
+	config := RunConfig{StateDir: dir, Runtime: NewRuntimeState(nil), dispatchGate: gate, control: &daemon.Control{}, conversations: conversations}
+	manager := newWorkerManager(t.Context(), config, "unused", io.Discard, io.Discard, nil)
+	shutdown := make(chan struct{})
+	var shutdownOnce sync.Once
+	wireSupervisorControlCallbacks(&config, manager, func(supervisor.RuntimeEvent) {}, shutdown, &shutdownOnce)
+	create := func() string {
+		r, err := policy.Create(t.Context(), orc.ConversationCreate{RequestID: orc.NewConversationRequestID(time.Now()), Profile: "plan", Operator: "human", Execution: state.ConversationExecution{Harness: "codex", Actor: "planner", MaxDuration: time.Minute}}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.ConversationID
+	}
+	submit := func(id string) state.ConversationReceipt {
+		r, err := conversations.Submit(t.Context(), id, orc.ConversationSubmit{RequestID: orc.NewConversationRequestID(time.Now()), Text: "private conversation", Operator: "human"}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("conversation did not launch")
+		}
+		return r
+	}
+	if _, err := config.control.PauseDaemon(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	id := create()
+	submit(id)
+	result, err := config.control.AbortDaemon(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Targets) != 1 || result.Targets[0].Kind != "conversation" || result.Targets[0].ConversationID != id || result.Targets[0].Outcome != "terminated" {
+		t.Fatalf("%+v", result)
+	}
+	next := create()
+	if _, err := conversations.Submit(t.Context(), next, orc.ConversationSubmit{RequestID: orc.NewConversationRequestID(time.Now()), Text: "plan", Operator: "human"}, time.Now()); !orc.IsConversationError(err, "execution_blocked") {
+		t.Fatal(err)
+	}
+	if _, err := config.control.ResumeDaemon(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	r := submit(next)
+	if err := config.control.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-shutdown:
+	default:
+		t.Fatal("shutdown not completed")
+	}
+	c, err := policy.Get(t.Context(), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Turns[0].ID != r.TurnID || c.Turns[0].State != "interrupted" {
+		t.Fatalf("%+v", c.Turns)
 	}
 }

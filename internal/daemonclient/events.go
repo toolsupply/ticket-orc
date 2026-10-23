@@ -90,6 +90,16 @@ func (s *EventStream) Next() (daemon.Event, error) {
 			s.baselineSet = true
 			continue
 		}
+		if event.Type == "stream.position" {
+			if !s.baselineSet || !hasSequence || sequence != event.Seq || event.Seq < s.lastSeq {
+				return daemon.Event{}, &Error{Kind: ErrorProtocol, Message: "invalid stream position"}
+			}
+			if event.Seq > s.lastSeq {
+				s.lastSeq = event.Seq
+				return event, ErrEventGap
+			}
+			continue
+		}
 		if event.Seq == 0 && hasSequence {
 			event.Seq = sequence
 		}

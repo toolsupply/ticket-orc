@@ -11,8 +11,8 @@ Follow repository `AGENTS.md` and the installed Ticket Tasks Skill. This Skill a
 
 - Treat an Orc notification as a request to check Ticket, not as an assignment, acknowledgement, or evidence that work was consumed.
 - Use the Ticket actor and routing already supplied by the harness. Never set `TICKET_ACTOR`, `TICKET_REPOSITORY`, `TICKET_SCOPE`, or `TICKET_CONFIG` from a notification or remembered session context. To check identity, use `ticket actor -j`.
-- For a dynamic/steered Orc work turn, use Ticket's supported selection/claim operation for at most one actionable item. Finish that item's configured lifecycle transition, then stop and return from the turn. Do not select or claim a second item in the same turn, even if another Orc notification arrives during it. If no item is selected, return immediately without changes. Ticket owns selection, ownership, and lifecycle mechanics.
-- This one-item boundary applies to dynamic/steered Orc nudges. Follow the exact-ticket instruction and lifecycle boundary supplied for managed execution; this rule does not change general Ticket mechanics.
+- For a dynamic/steered Orc open/review work turn, use Ticket's supported selection/claim operation for at most one actionable item. Finish that item's configured lifecycle transition, then stop and return from the turn. Do not select or claim a second item in the same turn, even if another Orc notification arrives during it. If no item is selected, return immediately without changes. Ticket owns selection, ownership, and lifecycle mechanics. Signoff uses one acceptance target with related planning maintenance as described below.
+- This open/review selection boundary applies to dynamic/steered Orc nudges; signoff follows the acceptance boundary below. Follow the exact-ticket instruction and lifecycle boundary supplied for managed execution; this rule does not change general Ticket mechanics.
 - Do not change a ticket merely to acknowledge a notification. Make ticket changes only as required by the work being done.
 - Respect cancellation and control instructions. Stop safely when canceled or told to stop; do not continue processing after that instruction.
 
@@ -28,14 +28,16 @@ Ticket tags may still be inspected and modified as ordinary ticket metadata when
 
 A dynamic signoff wake supplies one exact unclaimed ticket instead of selector JSON. Follow its signoff-specific prompt and do not run `ticket next` or claim that ticket. This is the sole unclaimed dynamic signoff exception.
 
-## Managed acceptance signoff
+## Architectural acceptance signoff (managed and steered)
 
 - A configured managed `signoff` role receives one unassigned acceptance entry per harness turn. Follow the exact entry and Orc-provided boundary; do not claim it.
-- Inspect related Ticket work in any lifecycle state when needed to judge whether the outcome is complete and coherent. This inspection does not grant authority to act on another entry's lifecycle.
+- The dispatched ticket is the entry point for architectural acceptance, not a limit on analysis. Inspect its specification, related work in any lifecycle state, dependencies, and relevant code to judge architecture, integration, and overall progress. Trust the reviewer for routine code correctness; investigate concrete architectural concerns.
+- Within the role instructions and approved scope, create follow-up tickets, refine unowned related planning tickets, and correct mistaken dependencies or split work when the intended ordering is supported by evidence. Preserve genuine prerequisites and respect Ticket ownership; do not take over another worker's owned work. Escalate changes to approved scope or architecture and ambiguous dependency decisions. Related planning maintenance does not count as accepting a second ticket.
+- Make an acceptance decision only for the dispatched ticket; do not select, claim, implement, review, or accept a second ticket. Record the decision, outstanding integration work, and planning changes, finish the related planning maintenance and dispatched outcome, then return. A component may be complete while related work remains; final integration requires complete prerequisites.
 - Close the selected entry only when acceptance is justified. Otherwise choose a Ticket-supported lifecycle outcome or explicitly hand it to the human actor `user`; do not finish with it still unassigned in signoff.
 - For human handoff, use Ticket's atomic public query/reassign operation with the full selected ID: `ticket query -j id:FULL_ID state:signoff unclaimed :: reassign --to user --handoff "EXPLANATION"`. Inspect the JSON result from that same invocation and confirm the ID, state, and assignee. A successful `changed: false` result means the handoff is already in place. A zero/multiple-match error makes no change. If an error reports `mutation_applied: true`, reread Ticket and do not replay the command.
 - Orc does not reserve signoff entries across roles. Overlapping configured selectors can give multiple actors authority over the same entry.
-- Dynamic/external signoff receives one exact unclaimed signoff entry per wake. Follow its exact-ticket prompt, do not select or claim a second entry in that turn, and let Orc's durable one-shot outcome tracking suppress unchanged entries.
+- Dynamic/external signoff receives one exact unclaimed signoff entry per wake. Follow the same acceptance and planning boundary, do not select or claim a second entry in that turn, and let Orc's durable one-shot outcome tracking suppress unchanged entries.
 
 ## Implementation work
 

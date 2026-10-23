@@ -483,7 +483,7 @@ func TestTicketPromptResolutionPrecedenceAndRoleTemplates(t *testing.T) {
 	writeConfigFixture(t, path, `{
   "version":1,
   "defaults":{"ticket_prompt":"default {{ticket}}"},
-  "roles":{"coder":{"ticket_prompt":"role {{ticket}}"},"reviewer":{"ticket_prompt":"review {{ticket}} {{review_completion}}"}},
+  "roles":{"coder":{"ticket_queue":"open","ticket_prompt":"role {{ticket}}"},"reviewer":{"ticket_queue":"review","ticket_prompt":"review {{ticket}} {{review_completion}}"}},
   "workers":{"coder":{"role":"coder","actor":"coder","ticket_prompt":"worker {{ticket}}"},"reviewer":{"role":"reviewer","actor":"reviewer"}}
 }`)
 	env := mapEnv(map[string]string{"TICKET_ORC_TICKET_PROMPT": "env {{ticket}}"})

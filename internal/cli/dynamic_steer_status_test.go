@@ -112,10 +112,13 @@ func TestPersistedDynamicSignoffRegistrationUsesOneShotExactTargetPath(t *testin
 	}
 	var message string
 	statuses := &dynamicSteerStatus{}
-	roles := map[string]steerRolePolicy{
-		"architect-api": {TicketQueue: "signoff", QueueFilters: ticketclient.QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}, NudgePrompt: "accept"},
-		"coder":         {TicketQueue: "open", NudgePrompt: "code"},
-		"reviewer":      {TicketQueue: "review", NudgePrompt: "review"},
+	roles, err := resolveSteerRolePolicies(FileConfig{Roles: map[string]RoleFileConfig{
+		"architect-api": {TicketQueue: "signoff", TicketTags: []string{"api"}, TicketWithoutTags: []string{"blocked"}},
+		"coder":         {TicketQueue: "open"},
+		"reviewer":      {TicketQueue: "review"},
+	}}, emptyEnv)
+	if err != nil {
+		t.Fatal(err)
 	}
 	clientsFactory := func(state.SteerRegistration) (steerClient, error) {
 		clients.Add(1)
@@ -147,11 +150,12 @@ func TestPersistedDynamicSignoffRegistrationUsesOneShotExactTargetPath(t *testin
 		t.Fatalf("signoff-to-open policy reload lost outstanding target: %#v err=%v", policyReload, err)
 	}
 	runner.policies.Replace(roles)
-	for _, required := range []string{client.ticket.ID, steerSessionBootstrapPrompt, "do not claim", "Do not process a second signoff ticket", "Inspect related Ticket work", "human decision", "ticket query -j id:" + client.ticket.ID, "reassign --to user", "mutation_applied=true", "takes precedence over any conflicting configured role prompt", "accept"} {
+	for _, required := range []string{client.ticket.ID, steerSessionBootstrapPrompt, "do not claim", "Do not select, claim, implement, review, or make an acceptance decision for a second ticket", "related Ticket work", "human decision", "ticket query -j id:" + client.ticket.ID, "reassign --to user", "mutation_applied=true", "constraints take precedence over conflicting role instructions", architectNudgePrompt} {
 		if !strings.Contains(message, required) {
 			t.Errorf("signoff message %q missing %q", message, required)
 		}
 	}
+	assertSeriousHoldGuidance(t, message)
 	bootstrapped, err := runtime.Snapshot(ctx)
 	if err != nil || len(bootstrapped.Deliveries) != 1 || bootstrapped.Deliveries[0].BootstrapPending {
 		t.Fatalf("accepted bootstrap+signoff delivery did not clear bootstrap intent: %#v err=%v", bootstrapped, err)
@@ -207,6 +211,39 @@ func TestPersistedDynamicSignoffRegistrationUsesOneShotExactTargetPath(t *testin
 	after, err := runtime.Snapshot(ctx)
 	if err != nil || len(after.Deliveries) != 1 || after.Deliveries[0].State != "none" || after.Deliveries[0].TargetTicket != "" || after.Deliveries[0].RegistrationID != before.Deliveries[0].RegistrationID {
 		t.Fatalf("signoff delivery changed: before=%#v after=%#v err=%v", before, after, err)
+	}
+}
+
+func TestDynamicSignoffPreservesCustomPlanningPrompt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	registrations := state.NewRegistrationStore(dir)
+	registration := state.SteerRegistration{RepositoryID: joinTestRepositoryID, RepositoryPath: dir, Actor: "architect", Role: "acceptance", Harness: "codex", Transport: testSteerCodexTransport(dir), SessionID: steerTestThread}
+	if _, _, _, err := registrations.Join(ctx, registration); err != nil {
+		t.Fatal(err)
+	}
+	client := &dynamicSignoffTestClient{
+		sequenceSteerClient: &sequenceSteerClient{activeByQueue: map[string][]bool{"open": {false}, "review": {false}}},
+		ticket:              ticketclient.Ticket{ID: "20261007-12345", State: "signoff"},
+	}
+	const custom = "  Evaluate overall progress.\nCreate planning tickets and resolve mistaken dependency cycles.  "
+	var message string
+	router := testSteerRouter(t, func(_ context.Context, _ string, _ state.SteerRegistration, queued steertransport.Message) error {
+		message = queued.Text
+		return nil
+	})
+	runner := newTestDynamicSteerRunner(t, ctx, dir,
+		map[string]steerRolePolicy{"acceptance": {TicketQueue: "signoff", NudgePrompt: custom}}, nil,
+		func(state.SteerRegistration) (steerClient, error) { return client, nil },
+		router, &dynamicSteerStatus{}, nil, newRegistrationObserver(registrations), nil, nil)
+	t.Cleanup(runner.close)
+	runner.bootstrap(ctx)
+	want := steerSessionBootstrapPrompt + "\n\n[ticket-orc] " + orc.SignoffTurnPrompt(client.ticket.ID) + "\n\n" + custom
+	if message != want {
+		t.Fatalf("signoff message = %q, want shared boundary and verbatim custom instructions %q", message, want)
+	}
+	if strings.Contains(message, steerOneItemTurnPrompt) || strings.Contains(message, "Resolved selector JSON:") {
+		t.Fatal("signoff planning acquired open/review selection instructions")
 	}
 }
 

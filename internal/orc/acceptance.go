@@ -35,6 +35,7 @@ type AcceptanceConfig struct {
 	TicketPrompt               string
 	RepositoryID               string
 	CodexSandbox               string
+	CodexServiceTier           string
 	PiProvider                 string
 	ClaudePermissionMode       string
 	WorkingDir                 string
@@ -85,6 +86,7 @@ func RunAcceptance(ctx context.Context, config AcceptanceConfig, tickets Accepta
 		SessionCleanup:       harness.CleanupPolicy(config.SessionCleanup),
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 	}); err != nil {
@@ -311,6 +313,7 @@ func runAcceptanceTurn(ctx context.Context, config AcceptanceConfig, ticket tick
 		StateDir:             config.StateDir,
 		OutputMode:           config.OutputMode,
 		CodexSandbox:         config.CodexSandbox,
+		CodexServiceTier:     config.CodexServiceTier,
 		PiProvider:           config.PiProvider,
 		ClaudePermissionMode: config.ClaudePermissionMode,
 		Operator:             config.Operator,
@@ -342,11 +345,7 @@ func composeAcceptancePrompt(template, ticketID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	boundary, err := ExpandTicketPrompt(acceptanceBoundaryPrompt, ticketID, "acceptance", "")
-	if err != nil {
-		return "", err
-	}
-	return taskPrompt + "\n\n" + boundary, nil
+	return taskPrompt + "\n\n" + SignoffTurnPrompt(ticketID), nil
 }
 
 func AcceptancePrompt(ticketID string) string { return resolvedAcceptancePrompt("", ticketID) }
