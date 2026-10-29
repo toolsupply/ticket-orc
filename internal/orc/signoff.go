@@ -56,37 +56,11 @@ func PlanSignoffDelivery(hasTarget bool, state SteerDeliveryState, active, boots
 // EligibleSignoffEntry applies Ticket's selected signoff partition to the
 // authoritative Show result before Orc reserves or dispatches an exact target.
 func EligibleSignoffEntry(ticket ticketclient.Ticket, filters ticketclient.QueueFilters) bool {
-	if ticket.State != "signoff" || ticket.Assignee != "" {
-		return false
-	}
-	tags := make(map[string]struct{}, len(ticket.Tags))
-	for _, tag := range ticket.Tags {
-		tags[tag] = struct{}{}
-	}
-	for _, required := range filters.Tags {
-		if _, found := tags[required]; !found {
-			return false
-		}
-	}
-	for _, excluded := range filters.WithoutTags {
-		if _, found := tags[excluded]; found {
-			return false
-		}
-	}
-	return true
+	return EligibleExactSteerEntry(ticket, "signoff", filters)
 }
 
 func ClassifySignoffTarget(state, assignee string) SignoffTargetOutcome {
-	if state != "signoff" {
-		return SignoffTargetResolved
-	}
-	if assignee == "" {
-		return SignoffTargetPending
-	}
-	if assignee == "user" {
-		return SignoffTargetHumanHandoff
-	}
-	return SignoffTargetAssignedElsewhere
+	return ClassifyExactSteerTarget("signoff", state, assignee, "")
 }
 
 func SignoffAwaitingCode(state SteerDeliveryState) string {
@@ -100,4 +74,34 @@ func SignoffAwaitingCode(state SteerDeliveryState) string {
 	default:
 		return "delivery_outstanding"
 	}
+}
+
+// EligibleExactSteerEntry rechecks an unclaimed target against the selected
+// input. Review skip tags belong only to the primary review queue.
+func EligibleExactSteerEntry(ticket ticketclient.Ticket, queue string, filters ticketclient.QueueFilters) bool {
+	return ticket.State == queue && ticket.Assignee == "" && matchesQueueFilters(ticket, filters)
+}
+
+// ClassifyExactSteerTarget uses the task state recorded before delivery.
+// Current role policy and unrelated actor claims cannot resolve a held target.
+func ClassifyExactSteerTarget(targetQueue, state, assignee, expectedOwner string) SignoffTargetOutcome {
+	if state != targetQueue {
+		return SignoffTargetResolved
+	}
+	// Expected hold ownership was acquired before delivery and is not
+	// evidence that the external session consumed a wake.
+	if assignee == "" || targetQueue == "hold" && assignee == expectedOwner {
+		return SignoffTargetPending
+	}
+	if assignee == "user" {
+		return SignoffTargetHumanHandoff
+	}
+	return SignoffTargetAssignedElsewhere
+}
+
+func ExactSteerAwaitingCode(state SteerDeliveryState, queue string) string {
+	if state == SteerQueued && queue == "hold" {
+		return "awaiting_hold_resolution"
+	}
+	return SignoffAwaitingCode(state)
 }

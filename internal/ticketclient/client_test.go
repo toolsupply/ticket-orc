@@ -796,7 +796,16 @@ func TestReviewQueueFilterUsesSupportedTicketProtocol(t *testing.T) {
 	}
 }
 
-func TestSignoffFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
+func TestUnassignedFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
+	for _, queue := range []string{"signoff", "hold"} {
+		t.Run(queue, func(t *testing.T) {
+			testUnassignedFrontierFilteredPagination(t, queue)
+		})
+	}
+}
+
+func testUnassignedFrontierFilteredPagination(t *testing.T, queue string) {
+	t.Helper()
 	executable := os.Getenv("TICKET_ORC_TICKET_BIN")
 	if executable == "" {
 		var err error
@@ -823,7 +832,7 @@ func TestSignoffFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
 		return output
 	}
 	run("init")
-	createSignoff := func(title string, priority int, tags ...string) string {
+	createTicket := func(title string, priority int, tags ...string) string {
 		t.Helper()
 		args := []string{"create", title, "-", "-p", fmt.Sprint(priority), "-j"}
 		for _, tag := range tags {
@@ -832,7 +841,7 @@ func TestSignoffFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
 		command := exec.Command(executable, args...)
 		command.Dir = root
 		command.Env = commandEnv
-		command.Stdin = strings.NewReader("Verify signoff frontier\n")
+		command.Stdin = strings.NewReader("Verify unassigned frontier\n")
 		output, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("ticket create %q: %v\n%s", title, err, output)
@@ -843,24 +852,36 @@ func TestSignoffFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
 		if err := json.Unmarshal(output, &created); err != nil || created.ID == "" {
 			t.Fatalf("create response %q, err=%v", output, err)
 		}
-		run("open", created.ID, "--claim")
-		run("submit", created.ID)
-		run("approve", created.ID)
+		if queue == "hold" {
+			run("hold", created.ID)
+		} else {
+			run("open", created.ID, "--claim")
+			run("submit", created.ID)
+			run("approve", created.ID)
+		}
 		return created.ID
 	}
 	eligible := []string{
-		createSignoff("eligible older one", 2, "api"),
-		createSignoff("eligible older two", 2, "api", "verified"),
+		createTicket("eligible older one", 2, "api"),
+		createTicket("eligible older two", 2, "api", "verified"),
 	}
 	for i := 0; i < 21; i++ {
-		createSignoff(fmt.Sprintf("out of partition %02d", i), 0, "other")
+		createTicket(fmt.Sprintf("out of partition %02d", i), 0, "other")
 	}
-	createSignoff("excluded by negative selector", 2, "api", "blocked")
+	createTicket("excluded by negative selector", 2, "api", "blocked")
+	if queue == "hold" {
+		human := createTicket("human decision outstanding", 0, "api")
+		output := run("query", "-j", "id:"+human, "state:hold", "unclaimed", "::", "reassign", "--to", "user", "--handoff", "BLOCKER, DECISION NEEDED, AND ACTION TO RESUME")
+		var handedOff Ticket
+		if err := json.Unmarshal(output, &handedOff); err != nil || handedOff.ID != human || handedOff.State != "hold" || handedOff.Assignee != "user" {
+			t.Fatalf("guarded hold handoff = %#v, %v; want exact held ticket assigned to user", handedOff, err)
+		}
+	}
 	var unfiltered struct {
 		Items []Ticket `json:"items"`
 		More  bool     `json:"more"`
 	}
-	if err := json.Unmarshal(run("list", "--state", "signoff", "--unassigned", "--limit", "20", "--fields", "id,state,assignee,tags", "-j"), &unfiltered); err != nil {
+	if err := json.Unmarshal(run("list", "--state", queue, "--unassigned", "--limit", "20", "--fields", "id,state,assignee,tags", "-j"), &unfiltered); err != nil {
 		t.Fatalf("decode unfiltered list: %v", err)
 	}
 	if !unfiltered.More {
@@ -878,17 +899,21 @@ func TestSignoffFrontierUsesFilteredListBeyondUnfilteredPage(t *testing.T) {
 		t.Fatalf("new Ticket client: %v", err)
 	}
 	defer client.Close()
-	first, err := client.SignoffFrontier(context.Background(), QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}, 1, 0)
+	observe := client.SignoffFrontier
+	if queue == "hold" {
+		observe = client.HoldFrontier
+	}
+	first, err := observe(context.Background(), QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}, 1, 0)
 	if err != nil || len(first.Items) != 1 || !first.More {
 		t.Fatalf("first filtered frontier = %#v, %v; want one item and more=true", first, err)
 	}
-	second, err := client.SignoffFrontier(context.Background(), QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}, 1, 1)
+	second, err := observe(context.Background(), QueueFilters{Tags: []string{"api"}, WithoutTags: []string{"blocked"}}, 1, 1)
 	if err != nil || len(second.Items) != 1 || second.More {
 		t.Fatalf("second filtered frontier = %#v, %v; want one final item", second, err)
 	}
 	got := map[string]bool{first.Items[0].ID: true, second.Items[0].ID: true}
 	if len(got) != 2 || !got[eligible[0]] || !got[eligible[1]] {
-		t.Fatalf("filtered signoff sweep returned %v, want eligible IDs %v", got, eligible)
+		t.Fatalf("filtered unassigned sweep returned %v, want eligible IDs %v", got, eligible)
 	}
 }
 
@@ -1899,6 +1924,10 @@ func runTicketWatchHelper(scenario string) int {
 }
 
 func handleHelperRequest(scenario string, count int, args []string, stdin *string) int {
+	if strings.HasPrefix(scenario, "attachment-") {
+		attachmentLocationHelper(scenario, args)
+		return -1
+	}
 	switch scenario {
 	case "sequence":
 		want := [][]string{
@@ -2044,6 +2073,59 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 		} else {
 			writeHelperError("bad_args", fmt.Sprintf("queue conflict verification args = %q", args), nil)
 		}
+	case "hold-escalation":
+		mode := os.Getenv(helperResponseEnv)
+		owner := os.Getenv("TICKET_ACTOR")
+		if mode == "unassigned" {
+			owner = ""
+		}
+		if count == 1 {
+			if !reflect.DeepEqual(args, []string{"show", testID, "--section", "handoff", "--max-bytes", "1048576"}) {
+				return 81
+			}
+			writeHelperJSON(map[string]any{"id": testID, "state": "hold", "sections": map[string]any{"handoff": map[string]any{"text": "Existing blocker and concrete next action", "truncated": mode == "truncated"}}})
+		} else if count == 2 || count == 4 {
+			if !reflect.DeepEqual(args, []string{"show", testID}) {
+				return 82
+			}
+			if mode == "observation failed" {
+				writeHelperError("conflict", "observation failed", nil)
+				break
+			}
+			if mode == "other owner" {
+				owner = "other"
+			}
+			if count == 4 {
+				owner = "user"
+				if mode == "owner race" {
+					owner = "other"
+				}
+			}
+			writeHelperJSON(map[string]any{"id": testID, "state": "hold", "assignee": owner})
+		} else if count == 3 {
+			guard := "assignee:" + owner
+			if owner == "" {
+				guard = "unclaimed"
+			}
+			handoff := "Existing blocker and concrete next action\n\nOperator action"
+			if !reflect.DeepEqual(args, []string{"query", "id:" + testID, "state:hold", guard, "::", "reassign", "--to", "user", "--handoff", handoff, "--message", "Automated hold assessment unresolved; escalated to user."}) {
+				return 83
+			}
+			if mode == "uncertain" {
+				writeHelperError("scm_failed", "persist failed", map[string]any{"mutation_applied": true})
+				break
+			}
+			if mode == "owner race" {
+				writeHelperError("invalid_argument", "no match", map[string]any{"count": 0})
+				break
+			}
+			if mode == "ambiguous" {
+				owner = "other"
+			}
+			writeHelperJSON(map[string]any{"id": testID, "state": "hold", "assignee": "user", "from_assignee": owner, "changed": true, "handoff": handoff})
+		} else {
+			return 84
+		}
 	case "single-response":
 		_, _ = io.WriteString(os.Stdout, os.Getenv(helperResponseEnv)+"\n")
 	case "malformed":
@@ -2065,15 +2147,40 @@ func handleHelperRequest(scenario string, count int, args []string, stdin *strin
 			return -1
 		}
 		writeHelperJSON(map[string]any{"items": []map[string]any{{"id": testID, "title": "closed", "state": StateLegacyCompleted, "modified": "2026-10-18T04:05:06.123456789+02:00"}}, "more": true})
-	case "signoff-frontier":
-		want := []string{"list", "--state", "signoff", "--unassigned", "--tag", "backend", "--tag", "urgent", "--without-tag", "blocked", "--without-tag", "draft", "--limit", "2", "--offset", "4", "--fields", "id,state,assignee"}
+	case "signoff-frontier", "hold-frontier":
+		queue := "signoff"
+		if scenario == "hold-frontier" {
+			queue = "hold"
+			if len(args) > 1 && args[0] == "list" && ValidateFullID(args[1]) == nil {
+				want := []string{"list", args[1], "--state", "all", "--limit", "1", "--offset", "0", "--fields", "id,title,state,priority,assignee,tags,parent,depends_on,modified"}
+				if !reflect.DeepEqual(args, want) {
+					writeHelperError("bad_args", fmt.Sprintf("hold ownership args = %q", args), nil)
+					return -1
+				}
+				item := map[string]any{"id": args[1], "state": "hold", "title": "rechecked", "modified": "2026-10-25T00:00:00Z"}
+				if raw := os.Getenv(helperResponseEnv); raw != "" {
+					_ = json.Unmarshal([]byte(raw), &item)
+				}
+				writeHelperJSON(map[string]any{"items": []any{item}, "more": false})
+				return -1
+			}
+			if len(args) == 2 && args[0] == "show" {
+				item := map[string]any{"id": args[1], "state": "hold", "title": "rechecked"}
+				if raw := os.Getenv(helperResponseEnv); raw != "" {
+					_ = json.Unmarshal([]byte(raw), &item)
+				}
+				writeHelperJSON(item)
+				return -1
+			}
+		}
+		want := []string{"list", "--state", queue, "--unassigned", "--tag", "backend", "--tag", "urgent", "--without-tag", "blocked", "--without-tag", "draft", "--limit", "2", "--offset", "4", "--fields", "id,state,assignee"}
 		if !reflect.DeepEqual(args, want) {
 			writeHelperError("bad_args", fmt.Sprintf("signoff frontier args = %q", args), nil)
 			return -1
 		}
 		writeHelperJSON(map[string]any{"items": []map[string]any{
-			{"id": "20260919-10001", "state": "signoff", "assignee": ""},
-			{"id": "20260919-10002", "state": "signoff", "assignee": ""},
+			{"id": "20260919-10001", "state": queue, "assignee": ""},
+			{"id": "20260919-10002", "state": queue, "assignee": ""},
 		}, "more": true})
 	case "signoff-frontier-large-offset":
 		want := []string{"list", "--state", "signoff", "--unassigned", "--limit", "20", "--offset", "1024", "--fields", "id,state,assignee"}

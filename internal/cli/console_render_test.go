@@ -220,7 +220,7 @@ func TestConsoleStartupShowsFullStatus(t *testing.T) {
 	renderConsoleStatus(&output, daemon.Status{Mode: "running", Repositories: []daemon.RepositoryStatus{{ID: "repo-id", Path: "/canonical/path", State: "healthy"}}})
 	text := output.String()
 	const banner = "[ticket-orc] interactive console; type help for commands."
-	if !strings.Contains(text, banner+"\n\nDaemon mode: running\n\nRepositories:") {
+	if !strings.Contains(text, banner+"\n\nDaemon mode: running\n\nHold roles: none configured\nRepositories:") {
 		t.Fatalf("startup banner spacing is incorrect: %q", text)
 	}
 	if !strings.Contains(text, "Sessions: none") {

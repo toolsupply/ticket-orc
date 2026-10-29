@@ -4,6 +4,7 @@
 package supervisor
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -44,20 +45,25 @@ type WorkerObservation struct {
 	TicketEvent  string
 	TicketID     string
 	TicketSource string
+	// The latest hold assessment survives ordinary claim activity. This is a
+	// bounded observation, not an inventory of held tickets.
+	HoldTicket  string
+	HoldOutcome string
 }
 
 // RuntimeState retains the latest worker state for one supervisor run. W is
 // supplied by the application layer; key extracts its stable worker name so
 // this package need not depend on CLI configuration types.
 type RuntimeState[W any] struct {
-	mu           sync.Mutex
-	key          func(W) string
-	workers      map[string]WorkerTransition
-	configured   []W
-	effective    map[string]W
-	observed     map[string]WorkerObservation
-	repositories map[string]RepositoryStatus
-	revision     string
+	mu            sync.Mutex
+	key           func(W) string
+	workers       map[string]WorkerTransition
+	configured    []W
+	effective     map[string]W
+	observed      map[string]WorkerObservation
+	repositories  map[string]RepositoryStatus
+	revision      string
+	diagnosticDir string
 }
 
 func (s *RuntimeState[W]) workerName(worker W) string {
@@ -183,11 +189,17 @@ func (s *RuntimeState[W]) Observe(event orc.Event) {
 	}
 	item := s.observed[event.Worker]
 	now := time.Now().UTC()
-	if event.Type == "ticket.claim" || event.Type == "ticket.lifecycle" {
+	if event.Type == "ticket.hold" {
+		item.HoldTicket = event.Ticket
+		item.HoldOutcome = event.State
+	}
+	if event.Type == "ticket.claim" || event.Type == "ticket.lifecycle" || event.Type == "ticket.hold" {
 		item.TicketAt = now
 		item.TicketID = event.Ticket
 		if event.Type == "ticket.claim" {
 			item.TicketEvent = "claimed ticket"
+		} else if event.Type == "ticket.hold" {
+			item.TicketEvent = "hold assessment: " + terminaltext.Sanitize(event.State, false)
 		} else {
 			item.TicketEvent = "ticket lifecycle: " + terminaltext.Sanitize(event.State, false)
 		}
@@ -279,4 +291,30 @@ func (s *RuntimeState[W]) Snapshot() map[string]WorkerTransition {
 		result[name] = transition
 	}
 	return result
+}
+
+// SetDiagnosticDirectory configures evidence storage without changing lifecycle
+// state. Reads do not hold the runtime mutex across file IO or state locking.
+func (s *RuntimeState[W]) SetDiagnosticDirectory(dir string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.diagnosticDir = dir
+	s.mu.Unlock()
+}
+func (s *RuntimeState[W]) LatestFailure(repository, worker string) (*LatestFailure, string) {
+	s.mu.Lock()
+	dir := s.diagnosticDir
+	s.mu.Unlock()
+	if dir == "" || repository == "" {
+		return nil, ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	record, err := LoadLatestFailure(ctx, dir, repository, worker)
+	if err != nil {
+		return nil, "diagnostic_read_failed"
+	}
+	return record, ""
 }

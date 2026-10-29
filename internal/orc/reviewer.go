@@ -30,6 +30,9 @@ type ReviewerConfig struct {
 	OutputMode                 string
 	ReviewCompletion           string
 	QueueFilters               ticketclient.QueueFilters
+	HoldQueue                  bool
+	HoldQueueFilters           ticketclient.QueueFilters
+	RepositoryID               string
 	CodexSandbox               string
 	CodexServiceTier           string
 	PiProvider                 string
@@ -52,7 +55,7 @@ type ReviewerTickets interface {
 // RunReviewer continuously claims review tickets until cancellation or a
 // state, harness, or lifecycle error occurs. A confirmed hold after a successful
 // turn ends the ticket attempt and returns to Ticket queue selection.
-func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) error {
+func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTickets, agent harness.Harness, orchestrationState TicketState, cleanup TicketCleanup) (runErr error) {
 	if config.RoleName == "" {
 		config.RoleName = "reviewer"
 	}
@@ -114,8 +117,37 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		}
 		config.WorkingDir = workingDir
 	}
+	var holds interface {
+		holdQueueTickets
+		NextAndClaimReview(context.Context, ticketclient.QueueFilters) (*ticketclient.Ticket, error)
+	}
+	var watch ticketclient.ChangeWatcher
+	if config.HoldQueue {
+		var ok bool
+		holds, ok = tickets.(interface {
+			holdQueueTickets
+			NextAndClaimReview(context.Context, ticketclient.QueueFilters) (*ticketclient.Ticket, error)
+		})
+		if !ok {
+			return fmt.Errorf("reviewer Ticket client does not support hold observation and nonblocking review claims")
+		}
+		if !ticketclient.ValidRepositoryID(config.RepositoryID) {
+			return fmt.Errorf("reviewer repository ID is invalid")
+		}
+		var err error
+		config.HoldQueueFilters, err = ticketclient.CanonicalQueueFilters(config.HoldQueueFilters)
+		if err != nil {
+			return fmt.Errorf("reviewer hold selector: %w", err)
+		}
+		watch, err = holds.StartChangeWatch(ctx, config.RepositoryID)
+		if err != nil {
+			return fmt.Errorf("start Ticket change watch: %w", err)
+		}
+		defer func() { runErr = errors.Join(runErr, watch.Close()) }()
+	}
 	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: config.RoleName, State: "ready", Phase: "startup"})
 
+	preferPrimary := false // Idle loops start with a hold opportunity.
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -127,9 +159,57 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 				return err
 			}
 		}
-		claimed, err := tickets.WaitAndClaimReview(ctx, config.QueueFilters)
-		if err != nil {
-			return &WorkWaitError{Role: "reviewer", Cause: err}
+		var claimed ticketclient.Ticket
+		if holds != nil {
+			var item *ticketclient.Ticket
+			var err error
+			if preferPrimary {
+				item, err = holds.NextAndClaimReview(ctx, config.QueueFilters)
+				if err != nil {
+					return &WorkWaitError{Role: "reviewer", Cause: err}
+				}
+			}
+			if item == nil {
+				candidate, err := selectManagedHold(ctx, holds, config.HoldQueueFilters, watch, cleanup)
+				if err != nil {
+					return err
+				}
+				if candidate != nil {
+					emitEvent(config.EventSink, Event{Type: "ticket.hold", Worker: config.WorkerName, Role: config.RoleName, State: "selected", Ticket: candidate.ID})
+					turn, prepareErr := runReviewerTask(ctx, config, candidate.ID, HoldTaskPrompt(candidate.ID, "review"), agent, orchestrationState)
+					if err := finishManagedHold(ctx, holds, watch, cleanup, *candidate, turn.result, errors.Join(prepareErr, turn.err), config.EventSink, config.WorkerName, config.RoleName, config.Diagnostics); err != nil {
+						return err
+					}
+					preferPrimary = true
+					continue
+				}
+			}
+			if item == nil && !preferPrimary {
+				item, err = holds.NextAndClaimReview(ctx, config.QueueFilters)
+				if err != nil {
+					return &WorkWaitError{Role: "reviewer", Cause: err}
+				}
+			}
+			if item == nil {
+				for {
+					material, err := watch.WaitForChange(ctx)
+					if err != nil {
+						return fmt.Errorf("wait for Ticket change: %w", err)
+					}
+					if material {
+						break
+					}
+				}
+				continue
+			}
+			preferPrimary = false
+			claimed = *item
+		} else {
+			var err error
+			claimed, err = tickets.WaitAndClaimReview(ctx, config.QueueFilters)
+			if err != nil {
+				return &WorkWaitError{Role: "reviewer", Cause: err}
+			}
 		}
 		if err := validateReviewClaim(claimed); err != nil {
 			return err
@@ -139,6 +219,12 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if watch != nil {
+			if err := watch.Check(); err != nil {
+				return fmt.Errorf("Ticket change watch failed before review dispatch: %w", err)
+			}
+		}
+		var attempt state.TicketLoop
 		if loopState, ok := orchestrationState.(TicketLoopState); ok && config.MaxBounces > 0 {
 			loop, participationTripped, err := loopState.Participate(ctx, claimed.ID, config.MaxBounces)
 			if err != nil {
@@ -148,6 +234,7 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			if err != nil {
 				return fmt.Errorf("record reviewer claim for %s: %w", claimed.ID, err)
 			}
+			attempt = loop
 			if loop.Phase != state.TicketLoopActive {
 				loopReader, ok := tickets.(TicketLoopReader)
 				if !ok {
@@ -172,13 +259,16 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		if prepareErr != nil {
 			return fmt.Errorf("prepare reviewer turn for %s: %w", claimed.ID, prepareErr)
 		}
+		postTurnError := func(err error) error {
+			return NewFailureContextError(FailureContext{Origin: "orc", Operation: "post-turn reconciliation", Phase: "post-turn", Ticket: claimed.ID, Worker: config.WorkerName, Role: config.RoleName, Actor: config.Actor, Execution: turn.result.Evidence, RepositoryID: config.RepositoryID, AttemptID: attempt.AttemptID}, err)
+		}
 		observed, runErr := tickets.Show(ctx, claimed.ID)
 		turnErr := errors.Join(turn.err, runErr)
 		if runErr != nil {
 			if turn.err != nil && turn.result.SessionID == "" && ctx.Err() == nil {
 				logReviewer(config.Diagnostics, "%s: automatic claim recovery skipped because Ticket state could not be verified", claimed.ID)
 			}
-			return turnErr
+			return postTurnError(turnErr)
 		}
 		if attempted, released, recoveryErr := releaseFailedStartupClaim(ctx, tickets, claimed.ID, config.Actor, "review", turn.result, turn.err, observed); attempted {
 			if released {
@@ -186,18 +276,18 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 			} else {
 				logReviewer(config.Diagnostics, "%s: automatic claim recovery failed after pre-session harness failure", claimed.ID)
 			}
-			return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, recoveryErr)
+			return postTurnError(fmt.Errorf("reviewer turn for %s: %w", claimed.ID, recoveryErr))
 		}
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: config.RoleName, State: observed.State, Ticket: observed.ID})
 		if loopState, ok := orchestrationState.(TicketLoopState); ok {
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
 				if reconcileErr != nil {
-					return errors.Join(turnErr, reconcileErr)
+					return postTurnError(errors.Join(turnErr, reconcileErr))
 				}
 				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
 					if turnErr != nil {
-						return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, turnErr)
+						return postTurnError(fmt.Errorf("reviewer turn for %s: %w", claimed.ID, turnErr))
 					}
 					// A confirmed hold ends this ticket attempt, not the worker.
 					continue
@@ -206,10 +296,10 @@ func RunReviewer(ctx context.Context, config ReviewerConfig, tickets ReviewerTic
 		}
 		lifecycleErr := finishReviewerLifecycle(ctx, config, tickets, cleanup, orchestrationState, observed)
 		if lifecycleErr != nil {
-			return errors.Join(turnErr, lifecycleErr)
+			return postTurnError(errors.Join(turnErr, lifecycleErr))
 		}
 		if turnErr != nil {
-			return fmt.Errorf("reviewer turn for %s: %w", claimed.ID, turnErr)
+			return postTurnError(fmt.Errorf("reviewer turn for %s: %w", claimed.ID, turnErr))
 		}
 	}
 }
@@ -270,11 +360,14 @@ type reviewerTurnResult struct {
 }
 
 func runReviewerTurn(ctx context.Context, config ReviewerConfig, ticketID string, agent harness.Harness, orchestrationState TicketState) (reviewerTurnResult, error) {
+	return runReviewerTask(ctx, config, ticketID, resolvedReviewerPrompt(config.TicketPrompt, ticketID, config.ReviewCompletion), agent, orchestrationState)
+}
+
+func runReviewerTask(ctx context.Context, config ReviewerConfig, ticketID, prompt string, agent harness.Harness, orchestrationState TicketState) (reviewerTurnResult, error) {
 	roleName := config.RoleName
 	if roleName == "" {
 		roleName = "reviewer"
 	}
-	prompt := resolvedReviewerPrompt(config.TicketPrompt, ticketID, config.ReviewCompletion)
 	request := harness.RunRequest{
 		WorkerName:           config.WorkerName,
 		WorkingDir:           config.WorkingDir,

@@ -26,7 +26,7 @@ An existing-claim recovery notification means continue that owned ticket and mak
 
 Ticket tags may still be inspected and modified as ordinary ticket metadata when required by the work. Worker-chosen tags must not alter Orc-controlled selection.
 
-A dynamic signoff wake supplies one exact unclaimed ticket instead of selector JSON. Follow its signoff-specific prompt and do not run `ticket next` or claim that ticket. This is the sole unclaimed dynamic signoff exception.
+A dynamic signoff wake supplies one exact unclaimed ticket instead of selector JSON. Follow its signoff-specific prompt and do not run `ticket next` or claim that ticket. An exact owned hold notification supplies deliberately assigned assessment work: verify hold and expected current ownership using the authoritative effective Ticket actor, then follow its concrete hold task instruction and return after that target’s outcome. Do not apply ordinary review or signoff completion to a held target.
 
 ## Architectural acceptance signoff (managed and steered)
 

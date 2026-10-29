@@ -34,6 +34,17 @@ type managedPipelineTickets struct {
 	selectorByQueue   map[string]ticketclient.QueueFilters
 }
 
+func (tickets *managedPipelineTickets) HasActiveClaim(_ context.Context, queue string) (bool, error) {
+	tickets.mu.Lock()
+	defer tickets.mu.Unlock()
+	for _, item := range tickets.itemsLocked() {
+		if item.State == queue && item.Assignee == "api-architect" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (tickets *managedPipelineTickets) WaitAndClaimImplementation(_ context.Context, filters ticketclient.QueueFilters) (ticketclient.Ticket, error) {
 	tickets.mu.Lock()
 	defer tickets.mu.Unlock()

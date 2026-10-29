@@ -32,6 +32,8 @@ type AcceptanceConfig struct {
 	StateDir                   string
 	OutputMode                 string
 	QueueFilters               ticketclient.QueueFilters
+	HoldQueue                  bool
+	HoldQueueFilters           ticketclient.QueueFilters
 	TicketPrompt               string
 	RepositoryID               string
 	CodexSandbox               string
@@ -45,6 +47,7 @@ type AcceptanceConfig struct {
 }
 
 type AcceptanceTickets interface {
+	HasActiveClaim(context.Context, string) (bool, error)
 	Show(context.Context, string) (ticketclient.Ticket, error)
 	SignoffFrontier(context.Context, ticketclient.QueueFilters, int, int) (ticketclient.ListResult, error)
 	StartChangeWatch(context.Context, string) (ticketclient.ChangeWatcher, error)
@@ -109,6 +112,18 @@ func RunAcceptance(ctx context.Context, config AcceptanceConfig, tickets Accepta
 	if err != nil {
 		return fmt.Errorf("acceptance selector: %w", err)
 	}
+	var holds holdQueueTickets
+	if config.HoldQueue {
+		var ok bool
+		holds, ok = tickets.(holdQueueTickets)
+		if !ok {
+			return fmt.Errorf("acceptance Ticket client does not support hold observation")
+		}
+		config.HoldQueueFilters, err = ticketclient.CanonicalQueueFilters(config.HoldQueueFilters)
+		if err != nil {
+			return fmt.Errorf("acceptance hold selector: %w", err)
+		}
+	}
 	watch, err := tickets.StartChangeWatch(ctx, config.RepositoryID)
 	if err != nil {
 		return fmt.Errorf("start Ticket change watch: %w", err)
@@ -116,14 +131,73 @@ func RunAcceptance(ctx context.Context, config AcceptanceConfig, tickets Accepta
 	defer func() { runErr = errors.Join(runErr, watch.Close()) }()
 	emitEvent(config.EventSink, Event{Type: WorkerReadyEventType, Worker: config.WorkerName, Role: config.RoleName, State: "ready", Phase: "startup"})
 
+	// The cursor is local to this worker invocation, never durable state.
+	preferPrimary := false
+	dispatchHold := func() (bool, error) {
+		if holds == nil {
+			return false, nil
+		}
+
+		candidate, err := selectManagedHold(ctx, holds, config.HoldQueueFilters, watch, cleanup)
+		if err != nil {
+			return false, err
+		}
+		if candidate != nil {
+			emitEvent(config.EventSink, Event{Type: "ticket.hold", Worker: config.WorkerName, Role: config.RoleName, State: "selected", Ticket: candidate.ID})
+			result, turnErr := runAcceptanceTask(ctx, config, *candidate, HoldTaskPrompt(candidate.ID, "signoff"), agent, orchestrationState)
+			if err := finishManagedHold(ctx, holds, watch, cleanup, *candidate, result, turnErr, config.EventSink, config.WorkerName, config.RoleName, config.Diagnostics); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		return false, nil
+	}
 	offset := 0
 	staleTargets := make(map[string]struct{})
+	waitForChange := func() error {
+		for {
+			material, err := watch.WaitForChange(ctx)
+			if err != nil {
+				return fmt.Errorf("wait for Ticket change: %w", err)
+			}
+			if material {
+				if err := refreshStaleAcceptanceTargets(ctx, tickets, cleanup, staleTargets); err != nil {
+					return err
+				}
+				offset = 0
+				return nil
+			}
+		}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := watch.Check(); err != nil {
 			return fmt.Errorf("Ticket change watch failed: %w", err)
+		}
+		// An architect must wait for its actor's existing work to finish before
+		// selecting either input, including on primary-preferred boundaries.
+		active, err := hasManagedActiveClaim(ctx, tickets)
+		if err != nil {
+			return err
+		}
+		if active {
+			if err := waitForChange(); err != nil {
+				return err
+			}
+			continue
+		}
+		if !preferPrimary {
+			selected, err := dispatchHold()
+			if err != nil {
+				return err
+			}
+			if selected {
+				preferPrimary = true
+				offset = 0
+				continue
+			}
 		}
 		frontier, err := tickets.SignoffFrontier(ctx, filters, acceptanceFrontierLimit, offset)
 		if err != nil {
@@ -136,18 +210,18 @@ func RunAcceptance(ctx context.Context, config AcceptanceConfig, tickets Accepta
 				}
 				continue
 			}
-			for {
-				material, waitErr := watch.WaitForChange(ctx)
-				if waitErr != nil {
-					return fmt.Errorf("wait for Ticket change: %w", waitErr)
+			if preferPrimary {
+				selected, err := dispatchHold()
+				if err != nil {
+					return err
 				}
-				if material {
-					if err := refreshStaleAcceptanceTargets(ctx, tickets, cleanup, staleTargets); err != nil {
-						return err
-					}
+				if selected {
 					offset = 0
-					break
+					continue
 				}
+			}
+			if err := waitForChange(); err != nil {
+				return err
 			}
 			continue
 		}
@@ -177,6 +251,7 @@ func RunAcceptance(ctx context.Context, config AcceptanceConfig, tickets Accepta
 		}
 		logAcceptance(config.Diagnostics, "%s: selected unassigned signoff work", candidate.ID)
 		emitEvent(config.EventSink, Event{Type: "ticket.acceptance", Worker: config.WorkerName, Role: config.RoleName, State: "selected", Ticket: candidate.ID})
+		preferPrimary = false
 		turnErr := runAcceptanceTurn(ctx, config, current, agent, orchestrationState)
 		observed, observeErr := tickets.Show(ctx, candidate.ID)
 		if observeErr != nil {
@@ -266,6 +341,10 @@ func eligibleAcceptanceEntry(ticket ticketclient.Ticket, filters ticketclient.Qu
 	if ticket.State != "signoff" || ticket.Assignee != "" {
 		return false
 	}
+	return matchesQueueFilters(ticket, filters)
+}
+
+func matchesQueueFilters(ticket ticketclient.Ticket, filters ticketclient.QueueFilters) bool {
 	tags := make(map[string]struct{}, len(ticket.Tags))
 	for _, tag := range ticket.Tags {
 		tags[tag] = struct{}{}
@@ -300,6 +379,11 @@ func runAcceptanceTurn(ctx context.Context, config AcceptanceConfig, ticket tick
 	if err != nil {
 		return err
 	}
+	_, err = runAcceptanceTask(ctx, config, ticket, prompt, agent, orchestrationState)
+	return err
+}
+
+func runAcceptanceTask(ctx context.Context, config AcceptanceConfig, ticket ticketclient.Ticket, prompt string, agent harness.Harness, orchestrationState TicketState) (harness.RunResult, error) {
 	request := harness.RunRequest{
 		WorkerName:           config.WorkerName,
 		WorkingDir:           config.WorkingDir,
@@ -325,8 +409,8 @@ func runAcceptanceTurn(ctx context.Context, config AcceptanceConfig, ticket tick
 		MinimumContextPercent: config.MinimumReuseContextPercent,
 		Diagnostics:           config.Diagnostics,
 	}
-	_, runErr, _ := runManagedTurn(ctx, options, orchestrationState, agent, request)
-	return runErr
+	result, runErr, _ := runManagedTurn(ctx, options, orchestrationState, agent, request)
+	return result, runErr
 }
 
 func resolvedAcceptancePrompt(template, ticketID string) string {

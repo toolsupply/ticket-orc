@@ -57,3 +57,23 @@ func TestSignoffEligibilityAndTargetOutcomes(t *testing.T) {
 		})
 	}
 }
+
+func TestExactSteerTargetOutcomesUseRecordedQueue(t *testing.T) {
+	for _, test := range []struct {
+		queue, state, assignee string
+		want                   SignoffTargetOutcome
+	}{
+		{"signoff", "hold", "", SignoffTargetResolved},
+		{"hold", "signoff", "", SignoffTargetResolved},
+		{"hold", "hold", "", SignoffTargetPending},
+		{"hold", "hold", "user", SignoffTargetHumanHandoff},
+		{"hold", "hold", "other", SignoffTargetAssignedElsewhere},
+		{"hold", "hold", "assessor", SignoffTargetPending},
+		{"signoff", "signoff", "assessor", SignoffTargetAssignedElsewhere},
+		{"hold", "closed", "", SignoffTargetResolved},
+	} {
+		if got := ClassifyExactSteerTarget(test.queue, test.state, test.assignee, "assessor"); got != test.want {
+			t.Errorf("recorded=%s current=%s assignee=%q outcome=%v want=%v", test.queue, test.state, test.assignee, got, test.want)
+		}
+	}
+}

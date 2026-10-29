@@ -290,13 +290,13 @@ func TestSteerRuntimeSignoffTargetPersistsUntilResolved(t *testing.T) {
 	}
 
 	const target = "20261007-88560"
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve target reserved=%t err=%v", reserved, err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || reserved {
 		t.Fatalf("duplicate reservation reserved=%t err=%v; want suppression", reserved, err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, "20261007-88561"); err != nil || reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, "20261007-88561", "signoff"); err != nil || reserved {
 		t.Fatalf("second target reservation reserved=%t err=%v; want one outstanding target", reserved, err)
 	}
 
@@ -320,7 +320,7 @@ func TestSteerRuntimeSignoffTargetPersistsUntilResolved(t *testing.T) {
 	if err := restarted.Reconcile(ctx, []SteerRegistration{registration}); err != nil {
 		t.Fatal(err)
 	}
-	if reserved, err := restarted.ReserveSignoffTarget(ctx, registration, target); err != nil || reserved {
+	if reserved, err := restarted.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || reserved {
 		t.Fatalf("restart allowed duplicate target reservation=%t err=%v", reserved, err)
 	}
 	snapshot, err = restarted.Snapshot(ctx)
@@ -334,7 +334,7 @@ func TestSteerRuntimeSignoffTargetPersistsUntilResolved(t *testing.T) {
 		t.Fatalf("resolved target clear updated=%t err=%v", updated, err)
 	}
 	snapshot, err = restarted.Snapshot(ctx)
-	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].State != "none" || !snapshot.Deliveries[0].BootstrapPending {
+	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].TargetQueue != "" || snapshot.Deliveries[0].State != "none" || !snapshot.Deliveries[0].BootstrapPending {
 		t.Fatalf("cleared target changed unrelated state: %#v err=%v", snapshot.Deliveries, err)
 	}
 }
@@ -351,13 +351,13 @@ func TestSteerRuntimeSignoffUncertainDeliveryKeepsTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	const target = "20261007-88560"
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve target reserved=%t err=%v", reserved, err)
 	}
 	if updated, err := runtime.Update(ctx, registration, "degraded", "queue_uncertain"); err != nil || !updated {
 		t.Fatalf("record uncertain queue result updated=%t err=%v", updated, err)
 	}
-	if reserved, err := NewSteerRuntimeStore(dir).ReserveSignoffTarget(ctx, registration, target); err != nil || reserved {
+	if reserved, err := NewSteerRuntimeStore(dir).ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || reserved {
 		t.Fatalf("uncertain target was made sendable again reserved=%t err=%v", reserved, err)
 	}
 	snapshot, err := runtime.Snapshot(ctx)
@@ -378,24 +378,24 @@ func TestSteerRuntimeRejectsSignoffAtomicallyAndCompletesIncludedIntents(t *test
 		t.Fatal(err)
 	}
 	const target = "20261007-88560"
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve target=%t err=%v", reserved, err)
 	}
 	if rejected, err := runtime.RejectSignoffDelivery(ctx, registration, target); err != nil || !rejected {
 		t.Fatalf("reject target=%t err=%v", rejected, err)
 	}
 	snapshot, err := runtime.Snapshot(ctx)
-	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].State != "degraded" || snapshot.Deliveries[0].Code != "queue_rejected" {
+	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].TargetQueue != "" || snapshot.Deliveries[0].State != "degraded" || snapshot.Deliveries[0].Code != "queue_rejected" {
 		t.Fatalf("atomic rejected delivery=%#v err=%v", snapshot.Deliveries, err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || reserved {
 		t.Fatalf("rejected delivery was immediately reservable=%t err=%v", reserved, err)
 	}
 
 	if _, err := runtime.Update(ctx, registration, "none", ""); err != nil {
 		t.Fatal(err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve bootstrap target=%t err=%v", reserved, err)
 	}
 	if completed, err := runtime.CompleteSignoffDeliveryWithIntents(ctx, registration, target, true, true); err != nil || !completed {
@@ -425,7 +425,7 @@ func TestSteerRuntimeSignoffReserveFailsClosedWhenLockUnavailable(t *testing.T) 
 	if err := os.Mkdir(lockPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reserved, reserveErr := runtime.ReserveSignoffTarget(ctx, registration, "20261007-88560")
+	reserved, reserveErr := runtime.ReserveSignoffTarget(ctx, registration, "20261007-88560", "signoff")
 	if reserveErr == nil || reserved {
 		t.Fatalf("reservation with unavailable state lock=%t err=%v; want no reservation", reserved, reserveErr)
 	}
@@ -433,11 +433,11 @@ func TestSteerRuntimeSignoffReserveFailsClosedWhenLockUnavailable(t *testing.T) 
 		t.Fatal(err)
 	}
 	snapshot, err := runtime.Snapshot(ctx)
-	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" {
+	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].TargetQueue != "" {
 		t.Fatalf("failed reservation changed durable state: %#v err=%v", snapshot.Deliveries, err)
 	}
 	const target = "20261007-88560"
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve before completion failure reserved=%t err=%v", reserved, err)
 	}
 	if err := os.Remove(lockPath); err != nil {
@@ -472,7 +472,7 @@ func TestSteerRuntimeSignoffTargetClearsOnIncarnationReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	const target = "20261007-88560"
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, first, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, first, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve target reserved=%t err=%v", reserved, err)
 	}
 
@@ -487,10 +487,10 @@ func TestSteerRuntimeSignoffTargetClearsOnIncarnationReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, err := runtime.Snapshot(ctx)
-	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].IncarnationID != current.IncarnationID || snapshot.Deliveries[0].TargetTicket != "" {
+	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].IncarnationID != current.IncarnationID || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].TargetQueue != "" {
 		t.Fatalf("replacement inherited target: %#v err=%v", snapshot.Deliveries, err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(ctx, first, target); err != nil || reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(ctx, first, target, "signoff"); err != nil || reserved {
 		t.Fatalf("stale incarnation reserved target after replacement=%t err=%v", reserved, err)
 	}
 }
@@ -506,7 +506,7 @@ func TestSteerRuntimeSignoffTargetRejectsMalformedIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ticketID := range []string{"", "20261007", "20261340-12345", "20261007-1234x", " 20261007-12345"} {
-		if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, ticketID); err == nil || reserved {
+		if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, ticketID, "signoff"); err == nil || reserved {
 			t.Errorf("malformed target %q reservation=%t err=%v", ticketID, reserved, err)
 		}
 	}
@@ -533,10 +533,10 @@ func TestSteerRuntimeSignoffTargetRejectsMalformedIDs(t *testing.T) {
 	}
 }
 
-func TestSteerRuntimeReadsCurrentV4DeliveriesWithoutTarget(t *testing.T) {
+func TestSteerRuntimeMigratesV4DeliveriesWithoutTarget(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
-	snapshot := SteerRuntimeSnapshot{Version: steerRuntimeFileVersion, Deliveries: []SteerDelivery{
+	snapshot := SteerRuntimeSnapshot{Version: 4, Deliveries: []SteerDelivery{
 		{RepositoryID: testSteerRepositoryID, Actor: "coder", RegistrationID: "11111111111111111111111111111111", IncarnationID: "22222222222222222222222222222222", SessionID: "coder-session", State: "queued", UpdatedAt: now},
 		{RepositoryID: testSteerRepositoryID, Actor: "reviewer", RegistrationID: "33333333333333333333333333333333", IncarnationID: "44444444444444444444444444444444", SessionID: "reviewer-session", State: "none", UpdatedAt: now},
 	}}
@@ -561,7 +561,7 @@ func TestSteerRuntimeReadsCurrentV4DeliveriesWithoutTarget(t *testing.T) {
 	}
 }
 
-func TestSteerRuntimeConcurrentSignoffReservationsAllowOneTarget(t *testing.T) {
+func TestSteerRuntimeConcurrentExactReservationsAllowOneTarget(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	registration, _, _, err := NewRegistrationStore(dir).Join(ctx, testSteerRegistration(t))
@@ -575,22 +575,27 @@ func TestSteerRuntimeConcurrentSignoffReservationsAllowOneTarget(t *testing.T) {
 	targets := []string{"20261007-88560", "20261007-88561"}
 	type result struct {
 		target   string
+		queue    string
 		reserved bool
 		err      error
 	}
 	results := make(chan result, len(targets))
 	var wait sync.WaitGroup
-	for _, target := range targets {
+	for index, target := range targets {
+		queue := "signoff"
+		if index == 1 {
+			queue = "hold"
+		}
 		wait.Add(1)
-		go func(target string) {
+		go func(target, queue string) {
 			defer wait.Done()
-			reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target)
-			results <- result{target: target, reserved: reserved, err: err}
-		}(target)
+			reserved, err := runtime.ReserveSignoffTarget(ctx, registration, target, queue)
+			results <- result{target: target, queue: queue, reserved: reserved, err: err}
+		}(target, queue)
 	}
 	wait.Wait()
 	close(results)
-	var reservedTarget string
+	var reservedTarget, reservedQueue string
 	for result := range results {
 		if result.err != nil {
 			t.Fatal(result.err)
@@ -600,13 +605,14 @@ func TestSteerRuntimeConcurrentSignoffReservationsAllowOneTarget(t *testing.T) {
 				t.Fatalf("multiple targets reserved: %s and %s", reservedTarget, result.target)
 			}
 			reservedTarget = result.target
+			reservedQueue = result.queue
 		}
 	}
 	if reservedTarget == "" {
 		t.Fatal("no concurrent signoff reservation succeeded")
 	}
 	snapshot, err := runtime.Snapshot(ctx)
-	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != reservedTarget || snapshot.Deliveries[0].State != "sending" {
+	if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].TargetTicket != reservedTarget || snapshot.Deliveries[0].TargetQueue != reservedQueue || snapshot.Deliveries[0].State != "sending" {
 		t.Fatalf("concurrent reservation state=%#v err=%v", snapshot.Deliveries, err)
 	}
 }
@@ -1141,8 +1147,8 @@ func TestSteerRuntimeMigratesV3PreservingPendingDeliveryAndWritesOnReconcile(t *
 }
 
 func TestSteerFilesHaveIndependentSchemaVersions(t *testing.T) {
-	if steerRegistrationFileVersion == steerRuntimeFileVersion {
-		t.Fatal("steer registration and runtime files share one schema version")
+	if steerRegistrationFileVersion != 5 || currentVersion != 2 {
+		t.Fatal("runtime schema change altered registration or managed state schema")
 	}
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -1165,7 +1171,7 @@ func TestSteerFilesHaveIndependentSchemaVersions(t *testing.T) {
 }
 
 func TestSteerRuntimeRejectsUnsupportedVersion(t *testing.T) {
-	for _, version := range []int{1, 2, 5} {
+	for _, version := range []int{1, 2, 6} {
 		t.Run(fmt.Sprintf("version_%d", version), func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, steerRuntimeFileName)
@@ -1260,6 +1266,92 @@ func TestRegistrationStoreKeysOwnersByRepositoryAndActor(t *testing.T) {
 	for _, registration := range snapshot.Registrations {
 		if registration.RepositoryID == first.RepositoryID && registration.Actor == otherActor.Actor && registration.Role != "coder" {
 			t.Fatalf("second actor role = %q, want coder: %#v", registration.Role, registration)
+		}
+	}
+}
+
+func TestSteerRuntimeExactTargetCannotReplaceOutstandingOrdinaryDelivery(t *testing.T) {
+	for _, phase := range []string{"sending", "queued", "consumed", "degraded"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			registration, _, _, err := NewRegistrationStore(dir).Join(ctx, testSteerRegistration(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := NewSteerRuntimeStore(dir)
+			if err := runtime.Reconcile(ctx, []SteerRegistration{registration}); err != nil {
+				t.Fatal(err)
+			}
+			if current, err := runtime.Update(ctx, registration, phase, ""); err != nil || !current {
+				t.Fatalf("update=%t %v", current, err)
+			}
+			if reserved, err := runtime.ReserveSignoffTarget(ctx, registration, "20261025-12345", "signoff"); err != nil || reserved {
+				t.Fatalf("outstanding %s replaced: %t %v", phase, reserved, err)
+			}
+			snapshot, err := runtime.Snapshot(ctx)
+			if err != nil || len(snapshot.Deliveries) != 1 || snapshot.Deliveries[0].State != phase || snapshot.Deliveries[0].TargetTicket != "" || snapshot.Deliveries[0].TargetQueue != "" {
+				t.Fatalf("outstanding delivery changed: %#v %v", snapshot, err)
+			}
+		})
+	}
+}
+
+func TestHoldTargetSurvivesRegistrationReplacement(t *testing.T) {
+	for _, replacement := range []string{"incarnation", "session"} {
+		for _, outcome := range []string{"sending", "queued", "rejected"} {
+			t.Run(replacement+"/"+outcome, func(t *testing.T) {
+				ctx := context.Background()
+				dir := t.TempDir()
+				regs := NewRegistrationStore(dir)
+				first, _, _, err := regs.Join(ctx, testSteerRegistration(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				runtime := NewSteerRuntimeStore(dir)
+				if err := runtime.Reconcile(ctx, []SteerRegistration{first}); err != nil {
+					t.Fatal(err)
+				}
+				const target = "20261025-12345"
+				if ok, err := runtime.ReserveSignoffTarget(ctx, first, target, "hold"); err != nil || !ok {
+					t.Fatalf("reserve: %t %v", ok, err)
+				}
+				wantState, wantCode := "sending", ""
+				if outcome == "queued" {
+					wantState = "queued"
+					if ok, err := runtime.CompleteSignoffDelivery(ctx, first, target); err != nil || !ok {
+						t.Fatal(err)
+					}
+				}
+				if outcome == "rejected" {
+					wantState, wantCode = "degraded", "queue_rejected"
+					if ok, err := runtime.RejectSignoffDelivery(ctx, first, target); err != nil || !ok {
+						t.Fatal(err)
+					}
+				}
+				next := first
+				if replacement == "session" {
+					next.SessionID = "01a0da4e-aa3a-78d3-87ba-b5972a10e2a6"
+				}
+				current, _, _, err := regs.Join(ctx, next)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := runtime.Reconcile(ctx, []SteerRegistration{current}); err != nil {
+					t.Fatal(err)
+				}
+				snapshot, err := runtime.Snapshot(ctx)
+				if err != nil || len(snapshot.Deliveries) != 1 {
+					t.Fatalf("snapshot: %+v %v", snapshot, err)
+				}
+				d := snapshot.Deliveries[0]
+				if d.TargetTicket != target || d.TargetQueue != "hold" || d.State != wantState || d.Code != wantCode {
+					t.Fatalf("hold evidence lost: %+v", d)
+				}
+				if ok, err := runtime.ReserveSignoffTarget(ctx, current, target, "hold"); err != nil || ok {
+					t.Fatalf("replacement reauthorized assessment: %t %v", ok, err)
+				}
+			})
 		}
 	}
 }

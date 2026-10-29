@@ -40,3 +40,13 @@ func releaseFailedStartupClaim(
 	}
 	return true, true, harnessErr
 }
+
+// Codex may execute commands before emitting a session ID. Preserve startup
+// release only on positive adapter evidence that execution never began.
+// Other harnesses and reviewers retain their existing startup behavior.
+func releaseFailedCoderStartupClaim(ctx context.Context, adapter string, tickets claimReleaseTickets, ticketID, actor string, result harness.RunResult, runErr error, observed ticketclient.Ticket) (bool, bool, error) {
+	if adapter == "codex" && (result.Evidence == nil || result.Evidence.Bounded().Process.Start != "not_started") {
+		return false, false, nil
+	}
+	return releaseFailedStartupClaim(ctx, tickets, ticketID, actor, "open", result, runErr, observed)
+}

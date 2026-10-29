@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unicode"
@@ -114,6 +115,19 @@ func newClient(actor, executable string, environ environFunc, workingDir string,
 		return nil, fmt.Errorf("ticket process environment must not be nil")
 	}
 	if err := target.validate(); err != nil {
+		return nil, err
+	}
+	// Capture the actual invocation cwd once. Ticket's advisory attachment path
+	// is relative to this process location, even if the caller later changes cwd.
+	if workingDir == "" {
+		var err error
+		workingDir, err = os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+	}
+	workingDir, err := filepath.Abs(workingDir)
+	if err != nil {
 		return nil, err
 	}
 

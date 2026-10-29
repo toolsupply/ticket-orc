@@ -2,6 +2,7 @@ package ticketclient
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -189,9 +190,23 @@ func (c *Client) Show(ctx context.Context, id string) (Ticket, error) {
 	if err := validateFullID(id); err != nil {
 		return Ticket{}, err
 	}
-	var ticket Ticket
-	if err := c.invoke(ctx, []string{"show", id}, &ticket); err != nil {
+	var response struct {
+		Ticket
+		Assignee json.RawMessage `json:"assignee"`
+	}
+	if err := c.invoke(ctx, []string{"show", id}, &response); err != nil {
 		return Ticket{}, err
+	}
+	ticket := response.Ticket
+	if len(response.Assignee) > 0 {
+		// Omission represents unassigned work in Ticket's public projection.
+		// An explicit null or wrong type must not become an empty owner during
+		// an exact-ticket hold or signoff recheck.
+		var assignee *string
+		if err := json.Unmarshal(response.Assignee, &assignee); err != nil || assignee == nil {
+			return Ticket{}, fmt.Errorf("%w: show assignee must be a string", ErrProtocol)
+		}
+		ticket.Assignee = *assignee
 	}
 	if ticket.ID != id {
 		return Ticket{}, fmt.Errorf("%w: show returned ticket %q, expected %q", ErrProtocol, ticket.ID, id)
@@ -200,27 +215,27 @@ func (c *Client) Show(ctx context.Context, id string) (Ticket, error) {
 	if strings.TrimSpace(ticket.State) == "" {
 		return Ticket{}, fmt.Errorf("%w: show response has no state", ErrProtocol)
 	}
-	if ticket.State == "signoff" && ticket.Assignee == "" {
-		// Ticket 0.2.5's show projection omits signoff assignees after the
+	if ticket.Assignee == "" && (ticket.State == "signoff" || ticket.State == "hold" && len(response.Assignee) == 0) {
+		// Ticket's show projection omits hold and signoff assignees after the
 		// query/reassign composition path. Refresh this exact entry through the
 		// public list projection so callers can observe human handoff and other
 		// ownership outcomes without reading managed metadata.
 		observed, err := c.ListTickets(ctx, ListQuery{IDs: []string{id}, States: []string{"all"}, Limit: 1})
 		if err != nil {
-			return Ticket{}, fmt.Errorf("observe signoff ticket ownership: %w", err)
+			return Ticket{}, fmt.Errorf("observe %s ticket ownership: %w", ticket.State, err)
 		}
 		if len(observed.Items) != 1 || observed.Items[0].ID != id {
 			// A terminal ticket may have been archived between Show and List.
 			// Preserve its authoritative lifecycle result if the exact Show now
-			// reports that it has left signoff.
+			// reports that it has left the observed queue.
 			var current Ticket
 			if showErr := c.invoke(ctx, []string{"show", id}, &current); showErr == nil && current.ID == id {
 				current = current.NormalizeState()
-				if current.State != "signoff" {
+				if current.State != ticket.State {
 					return current, nil
 				}
 			}
-			return Ticket{}, fmt.Errorf("%w: signoff list did not return ticket %q", ErrProtocol, id)
+			return Ticket{}, fmt.Errorf("%w: %s list did not return ticket %q", ErrProtocol, ticket.State, id)
 		}
 		ticket = observed.Items[0]
 	}

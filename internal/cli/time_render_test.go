@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/toolsupply/ticket-orc/internal/daemon"
+	"github.com/toolsupply/ticket-orc/internal/executionlog"
+	"github.com/toolsupply/ticket-orc/internal/harness"
 )
 
 const testLocalTimeProcessEnv = "TICKET_ORC_TEST_LOCAL_TIME_PROCESS"
@@ -115,5 +117,62 @@ func TestConsoleWatchTimeAndDateMarkerUseLocalDay(t *testing.T) {
 	text := output.String()
 	if !strings.Contains(text, "--- 2026-09-28 ---") || !strings.Contains(text, "23:59:59") || !strings.Contains(text, "00:00:01") {
 		t.Fatalf("watch did not use local time with separate day marker: %q", text)
+	}
+}
+
+func TestUnifiedWatchOrcEventsUseLocalTime(t *testing.T) {
+	if runWithTestLocalTime(t) {
+		return
+	}
+	var output bytes.Buffer
+	renderer := &consoleWatchRenderer{unified: true}
+	at := time.Date(2026, 10, 24, 1, 30, 0, 0, time.UTC)
+	if err := renderer.render(&output, daemon.Event{Type: "daemon.started"}, at); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "18:30:00 [orc] daemon started\n"; got != want {
+		t.Fatalf("unified watch event = %q, want %q", got, want)
+	}
+}
+
+func TestUnifiedWatchWorkerRowsUseLocalTime(t *testing.T) {
+	if runWithTestLocalTime(t) {
+		return
+	}
+	// Execution observations arrive in UTC. Every displayed line, including
+	// multiline messages and skipped-event diagnostics, uses the
+	// viewer's local clock rather than the observation's serialized zone.
+	at := time.Date(2026, 10, 24, 1, 30, 0, 0, time.UTC)
+	for _, provider := range []string{"codex", "claude", "pi"} {
+		for _, verbose := range []bool{false, true} {
+			options := watchOptions{selector: "all", verbose: verbose}
+			for _, record := range []harness.LogRecord{
+				{Kind: "message", Text: "hello\nworld"},
+				{Kind: "diagnostic", Text: "diagnostic", Level: "error"},
+				{Kind: "diagnostic", Text: "malformed event", Code: "invalid_event"},
+				{Kind: "diagnostic", Text: "oversized event", Code: "event_too_large"},
+			} {
+				t.Run(provider+"/"+string(options.outputMode())+"/"+record.Kind+"/"+record.Code, func(t *testing.T) {
+					var output bytes.Buffer
+					observation := executionlog.Observation{Harness: provider, ObservedAt: at, Record: record}
+					if err := renderWorkerObservation(&output, options, observation, "repo:coder"); err != nil {
+						t.Fatal(err)
+					}
+					rows := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+					wantRows := 1
+					if record.Kind == "message" {
+						wantRows = 2
+					}
+					if len(rows) != wantRows {
+						t.Fatalf("rows = %q, want %d rows", rows, wantRows)
+					}
+					for _, row := range rows {
+						if !strings.HasPrefix(row, "18:30:00 [repo:coder] ") {
+							t.Errorf("worker row did not use local time: %q", row)
+						}
+					}
+				})
+			}
+		}
 	}
 }

@@ -339,8 +339,8 @@ func (s *countingSteerRuntime) CompleteDelivery(ctx context.Context, reg state.S
 func (s *countingSteerRuntime) ConfirmNoActiveClaim(ctx context.Context, reg state.SteerRegistration) (bool, error) {
 	return s.inner.ConfirmNoActiveClaim(ctx, reg)
 }
-func (s *countingSteerRuntime) ReserveSignoffTarget(ctx context.Context, reg state.SteerRegistration, ticketID string) (bool, error) {
-	return s.inner.ReserveSignoffTarget(ctx, reg, ticketID)
+func (s *countingSteerRuntime) ReserveSignoffTarget(ctx context.Context, reg state.SteerRegistration, ticketID, targetQueue string) (bool, error) {
+	return s.inner.ReserveSignoffTarget(ctx, reg, ticketID, targetQueue)
 }
 func (s *countingSteerRuntime) CompleteSignoffDelivery(ctx context.Context, reg state.SteerRegistration, ticketID string) (bool, error) {
 	return s.inner.CompleteSignoffDelivery(ctx, reg, ticketID)
@@ -384,11 +384,11 @@ func (s failingSteerRuntime) ConfirmNoActiveClaim(ctx context.Context, reg state
 	}
 	return s.inner.ConfirmNoActiveClaim(ctx, reg)
 }
-func (s failingSteerRuntime) ReserveSignoffTarget(ctx context.Context, reg state.SteerRegistration, ticketID string) (bool, error) {
+func (s failingSteerRuntime) ReserveSignoffTarget(ctx context.Context, reg state.SteerRegistration, ticketID, targetQueue string) (bool, error) {
 	if s.fail == "signoff_reserve" {
 		return false, errors.New("injected persistence error")
 	}
-	return s.inner.ReserveSignoffTarget(ctx, reg, ticketID)
+	return s.inner.ReserveSignoffTarget(ctx, reg, ticketID, targetQueue)
 }
 func (s failingSteerRuntime) CompleteSignoffDelivery(ctx context.Context, reg state.SteerRegistration, ticketID string) (bool, error) {
 	if s.fail == "signoff_complete" {

@@ -12,9 +12,68 @@ import (
 	"testing"
 	"time"
 
+	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 )
+
+func TestStartupTerminalPathsRetainUnconfirmedWorkspaceProtection(t *testing.T) {
+	for _, mode := range []string{"exit without envelope", "timeout", "known pre-execution"} {
+		t.Run(mode, func(t *testing.T) {
+			worker := supervisorTestWorker("startup", t.TempDir())
+			worker.Config.WorkingDir = t.TempDir()
+			runtime := NewRuntimeState([]supervisor.RunWorker{worker})
+			manager := newWorkerManager(t.Context(), RunConfig{Workers: []supervisor.RunWorker{worker}, Runtime: runtime}, os.Args[0], io.Discard, io.Discard, nil)
+			child := &runChild{worker: worker, waited: make(chan struct{}), ready: make(chan struct{})}
+			child.setExitResult(errors.New("abrupt startup exit"))
+			if mode == "known pre-execution" {
+				child.captureFailure(orc.Event{Type: "worker.failure", Failure: &orc.Failure{Classification: "harness_start_failed", Execution: &harness.ExecutionEvidence{Process: harness.ProcessOutcome{Start: "not_started"}}}})
+			}
+			manager.lifecycle.TrackChild(worker.Name, child)
+			var err error
+			if mode == "timeout" {
+				// Exercise the synchronous timeout transition, without waiting on
+				// a timer or claiming that the still-unconfirmed child has exited.
+				manager.lifecycle.Lock()
+				exit := manager.lifecycle.ReconcileExitLocked(worker.Name, child)
+				err = manager.failStartupReadiness(worker.Name, child, exit)
+				manager.lifecycle.Unlock()
+			} else {
+				close(child.waited)
+				err = manager.verifyWorkerStartup(t.Context(), worker.Name)
+			}
+			if err == nil {
+				t.Fatal("startup failure reported success")
+			}
+			launched := false
+			manager.starter = func(_ context.Context, _, _ string, worker supervisor.RunWorker, _, _ io.Writer, _, _ *sync.Mutex) (*runChild, error) {
+				launched = true
+				child := &runChild{worker: worker, done: make(chan error, 1), waited: make(chan struct{})}
+				child.done <- nil
+				close(child.waited)
+				return child, nil
+			}
+			_, startErr := manager.start(t.Context(), worker.Name)
+			if mode == "known pre-execution" {
+				if startErr != nil || !launched {
+					t.Fatalf("positive pre-execution failure blocked normal start: %v", startErr)
+				}
+			} else {
+				var failureErr *supervisor.LifecycleError
+				if !errors.As(startErr, &failureErr) || failureErr.Code != "workspace_cleanup_unconfirmed" || launched {
+					t.Fatalf("startup path bypassed protection: launched=%v err=%v", launched, startErr)
+				}
+				failure := runtime.Snapshot()[worker.Name].Failure
+				if failure == nil || failure.Remediation != orc.CleanupUnconfirmed || failure.Ticket != "" || failure.AttemptID != 0 {
+					t.Fatalf("missing/fabricated startup diagnostic: %+v", failure)
+				}
+			}
+			if manager.lifecycle.ObserveExit(worker.Name, child, child.exitResult(), false).Current {
+				t.Fatal("startup exit observed twice")
+			}
+		})
+	}
+}
 
 // Startup readiness remains pending until the child emits its explicit event.
 func TestVerifyWorkerStartupWaitsForExplicitReadiness(t *testing.T) {

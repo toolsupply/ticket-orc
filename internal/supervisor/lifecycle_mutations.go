@@ -64,6 +64,9 @@ func (m *LifecycleManager[W, C]) startLocked(ctx context.Context, name string) (
 		children[key] = child
 	}
 	m.mu.Unlock()
+	if m.workspaceBlocked(worker) {
+		return MutationResult{Worker: name, State: string(WorkerFailed)}, &LifecycleError{Code: "workspace_cleanup_unconfirmed", Message: "previous execution cleanup is unconfirmed; reconcile it before restarting the daemon or using this workspace"}
+	}
 	if m.hooks.Conflict != nil {
 		if err := m.hooks.Conflict(name, worker, children); err != nil {
 			return MutationResult{Worker: name, State: string(WorkerFailed), Applied: false}, err

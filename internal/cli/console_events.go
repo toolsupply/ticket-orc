@@ -372,6 +372,8 @@ func consoleEventMessage(event daemon.Event) string {
 		}
 	case "worker.failure":
 		return "worker failed"
+	case "ticket.hold":
+		return watchTicketMessage("hold assessment: "+consoleField(event.State), event)
 	case "ticket.claim":
 		return watchTicketMessage("claimed", event)
 	case "ticket.lifecycle":
@@ -469,7 +471,7 @@ func consoleEventMessage(event daemon.Event) string {
 			return "role changed"
 		}
 		if event.Code != "" && event.Code != "ready" && event.Code != "busy" && event.Code != "idle" && event.Code != "consumed" && event.Code != "awaiting_claim" {
-			return humanDeliveryCode(event.Code)
+			return humanDeliveryCode(event.Code, event.State)
 		}
 		if event.State == "left" {
 			return "session left"

@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +30,7 @@ type LifecycleHooks[W any, C comparable] struct {
 	StartupExited        func(string, C, ExitReconciliation[W]) error
 	StartupTimedOut      func(string, C, ExitReconciliation[W]) error
 	ClassifyExit         func(C, error) ExitOutcome
+	Workspace            func(W) string
 	MarkStartupPending   func(C)
 	CompleteStartup      func(C, error, bool, *WorkerFailure)
 	SetEffective         func(W)
@@ -40,6 +43,9 @@ type ExitOutcome struct {
 	Failure         *WorkerFailure
 	TransitionError error
 	Shutdown        bool
+	// An uncertain ended execution may still write. Keep its workspace out
+	// of subsequent launches until the operator reconciles it outside Orc.
+	BlockWorkspace bool
 }
 
 type ExitObservation[W any] struct {
@@ -52,21 +58,23 @@ type ExitObservation[W any] struct {
 // are private; callers observe or change desired state through its methods
 // while all transitions follow the documented global/per-worker order.
 type LifecycleManager[W any, C comparable] struct {
-	mu              sync.Mutex
-	gate            *LifecycleCoordinator
-	name            func(W) string
-	workers         map[string]W
-	children        map[string]C
-	startupAttempts map[string]*StartupAttempt
-	paused          map[string]bool
-	stopping        bool
-	hooks           LifecycleHooks[W, C]
+	mu                  sync.Mutex
+	gate                *LifecycleCoordinator
+	name                func(W) string
+	workers             map[string]W
+	children            map[string]C
+	startupAttempts     map[string]*StartupAttempt
+	paused              map[string]bool
+	stopping            bool
+	uncertainWorkspaces map[string]bool // guarded by the global lifecycle gate
+	hooks               LifecycleHooks[W, C]
 }
 
 func NewLifecycleManager[W any, C comparable](workers []W, hooks LifecycleHooks[W, C]) *LifecycleManager[W, C] {
 	manager := &LifecycleManager[W, C]{
 		name: hooks.Name, workers: make(map[string]W, len(workers)), children: make(map[string]C),
 		startupAttempts: make(map[string]*StartupAttempt), paused: make(map[string]bool), hooks: hooks,
+		uncertainWorkspaces: make(map[string]bool),
 	}
 	names := make([]string, 0, len(workers))
 	for _, worker := range workers {
@@ -303,6 +311,9 @@ func (m *LifecycleManager[W, C]) ObserveExit(name string, child C, err error, sh
 		outcome = m.hooks.ClassifyExit(child, err)
 		outcome.Shutdown = false
 	}
+	if outcome.BlockWorkspace && m.hooks.Workspace != nil {
+		m.ProtectWorkspaceLocked(m.hooks.ChildWorker(child), outcome)
+	}
 	if reconciled.Configured && m.hooks.SetEffective != nil {
 		m.hooks.SetEffective(reconciled.Desired)
 	}
@@ -311,6 +322,38 @@ func (m *LifecycleManager[W, C]) ObserveExit(name string, child C, err error, sh
 	}
 	m.transition(name, outcome.State, outcome.TransitionError)
 	return ExitObservation[W]{Current: true, Worker: reconciled.Desired, Outcome: outcome}
+}
+
+// ProtectWorkspaceLocked preserves uncertain execution safety for normal exit,
+// startup-exit and startup-timeout reconciliation. The caller must have consumed
+// the exact current child and hold the global lifecycle gate.
+func (m *LifecycleManager[W, C]) ProtectWorkspaceLocked(worker W, outcome ExitOutcome) {
+	if outcome.BlockWorkspace && m.hooks.Workspace != nil {
+		m.uncertainWorkspaces[m.hooks.Workspace(worker)] = true
+	}
+}
+
+func (m *LifecycleManager[W, C]) workspaceBlocked(worker W) bool {
+	if m.hooks.Workspace == nil {
+		return false
+	}
+	workspace := m.hooks.Workspace(worker)
+	for blocked := range m.uncertainWorkspaces {
+		if blocked == "" || workspace == "" || workspacesOverlap(blocked, workspace) {
+			return true
+		}
+	}
+	return false
+}
+
+// workspacesOverlap includes nested working directories in the same boundary.
+// Process adapters supply absolute paths with existing symlinks resolved.
+func workspacesOverlap(a, b string) bool {
+	within := func(parent, child string) bool {
+		rel, err := filepath.Rel(parent, child)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	return within(a, b) || within(b, a)
 }
 
 // ReconcileExitLocked consumes only the current child's terminal result. The

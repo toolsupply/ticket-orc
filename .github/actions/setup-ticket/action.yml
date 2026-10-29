@@ -1,0 +1,51 @@
+name: Set up Ticket
+description: Install the pinned native Ticket release used by integration tests
+runs:
+  using: composite
+  steps:
+    - name: Install and verify Ticket
+      shell: bash
+      env:
+        TICKET_VERSION: 0.2.6
+      run: |
+        set -euo pipefail
+        target="$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
+        case "$target" in
+          linux/amd64|linux/arm64|darwin/amd64|darwin/arm64)
+            archive="ticket-${target%/*}-${target#*/}.tar.gz"
+            binary=ticket
+            ;;
+          windows/amd64)
+            archive=ticket-windows-amd64.zip
+            binary=ticket.exe
+            ;;
+          *) echo "unsupported native Ticket target: $target" >&2; exit 1 ;;
+        esac
+        directory="$RUNNER_TEMP/ticket-$TICKET_VERSION"
+        mkdir -p "$directory/download" "$directory/bin"
+        base="https://github.com/toolsupply/ticket/releases/download/v$TICKET_VERSION"
+        curl --fail --silent --show-error --location "$base/$archive" --output "$directory/download/$archive"
+        curl --fail --silent --show-error --location "$base/SHA256SUMS" --output "$directory/download/SHA256SUMS"
+        (
+          cd "$directory/download"
+          checksum="$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)"
+          test -n "$checksum"
+          if command -v sha256sum >/dev/null 2>&1; then
+            printf '%s\n' "$checksum" | sha256sum --check -
+          else
+            printf '%s\n' "$checksum" | shasum -a 256 --check -
+          fi
+          if [ "$binary" = ticket.exe ]; then
+            unzip -q "$archive" "$binary" -d "$directory/bin"
+          else
+            tar -xzf "$archive" -C "$directory/bin" "$binary"
+            chmod +x "$directory/bin/$binary"
+          fi
+        )
+        version="$("$directory/bin/$binary" --version)"
+        echo "$version"
+        case "$version" in
+          "ticket $TICKET_VERSION ("*) ;;
+          *) echo "expected Ticket $TICKET_VERSION, got: $version" >&2; exit 1 ;;
+        esac
+        echo "$directory/bin" >> "$GITHUB_PATH"

@@ -47,6 +47,7 @@ func consoleEllipsize(value string, width int) string {
 func renderConsoleVerboseStatus(out io.Writer, status daemon.Status) {
 	fmt.Fprintln(out)
 	writeConsoleDaemonMode(out, status.Mode)
+	renderHoldRoles(out, status.HoldQueueRoles)
 	renderConsoleRepositorySummary(out, status.Repositories)
 	if len(status.Repositories) == 0 {
 		fmt.Fprintln(out, "Repositories: none")
@@ -82,6 +83,7 @@ func renderConsoleSteerStatus(out io.Writer, sessions []daemon.SteerStatus, repo
 			fmt.Fprintf(out, "Repository: %s\n", consoleField(sessionRepositoryLabel(session, repositories)))
 			fmt.Fprintf(out, "  Codex session: %s\n", consoleField(shortIdentity(session.Session)))
 			fmt.Fprintf(out, "Role: %s\n", consoleField(session.Role))
+			fmt.Fprintf(out, "Queues: %s; unassigned holds: %t\n", consoleField(session.EffectiveTicketQueue), session.EffectiveHoldQueue)
 			fmt.Fprintf(out, "Ticket actor: %s\n", consoleField(session.Actor))
 			fmt.Fprintf(out, "State: %s\n", consoleSteerState(session.State))
 			fmt.Fprintf(out, "Activity: %s\n", consoleSteerSessionActivity(session))
@@ -89,7 +91,7 @@ func renderConsoleSteerStatus(out io.Writer, sessions []daemon.SteerStatus, repo
 				fmt.Fprintf(out, "  Conflict: actor %s is owned by managed worker %s\n", consoleField(session.Actor), consoleField(session.ManagedOwner))
 			}
 			if session.Code != "" && session.Failure == nil {
-				fmt.Fprintf(out, "  Detail: %s\n", consoleField(humanDeliveryCode(session.Code)))
+				fmt.Fprintf(out, "  Detail: %s\n", consoleField(humanDeliveryCode(session.Code, session.State)))
 			}
 			fmt.Fprintln(out)
 		}
@@ -137,10 +139,24 @@ func sessionRepositoryLabel(session daemon.SteerStatus, repositories []daemon.Re
 }
 
 func consoleSteerSessionActivity(session daemon.SteerStatus) string {
+	activity := consoleSteerSessionOutcome(session)
+	if session.TargetQueue != "" && session.Ticket != "" {
+		activity += " (" + consoleField(session.TargetQueue) + " " + consoleField(session.Ticket) + ")"
+	}
+	if session.EffectiveHoldQueue {
+		activity += "; holds enabled"
+	}
+	if session.HoldTicket != "" && session.TargetQueue != "hold" {
+		activity += "; last hold " + consoleField(session.HoldTicket) + " " + consoleField(session.HoldOutcome)
+	}
+	return activity
+}
+
+func consoleSteerSessionOutcome(session daemon.SteerStatus) string {
 	if session.Failure != nil {
 		detail := consoleSteerFailureDetail(session.Failure)
 		if session.Code != "" && session.Code != "ticket_observation_failed" && session.Code != "ticket_client_failed" {
-			detail += "; " + humanDeliveryCode(session.Code)
+			detail += "; " + humanDeliveryCode(session.Code, session.State)
 		}
 		return detail
 	}
@@ -161,8 +177,9 @@ func consoleSteerActivity(state, code string) string {
 		return "delivery uncertain"
 	case "queue_rejected":
 		return "notification rejected"
-	case "runtime_state_unavailable", "runtime_state_write_failed", "ticket_observation_failed", "ticket_client_failed":
-		return humanDeliveryCode(code)
+	}
+	if code != "" && code != "idle" {
+		return humanDeliveryCode(code, state)
 	}
 	switch state {
 	case "none", "idle":
@@ -193,6 +210,7 @@ func renderConsoleManagedWorkers(out io.Writer, workers []daemon.WorkerStatus) {
 	fmt.Fprintln(out, renderColumnRow([]string{"Worker", "Repository", "Role", "Ticket actor", "Session", "State", "Activity"}, []int{consoleStatusNameCol, consoleStatusNameCol, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusSession, consoleStatusState, 0}))
 	for _, worker := range workers {
 		fmt.Fprintln(out, renderColumnRow([]string{worker.Name, consoleWorkerRepository(worker), worker.Role, worker.TicketActor, "—", consoleWorkerState(worker), consoleWorkerStatusActivity(worker)}, []int{consoleStatusNameCol, consoleStatusNameCol, consoleStatusRoleCol, consoleStatusRoleCol, consoleStatusSession, consoleStatusState, 0}))
+		renderConsoleLatestFailure(out, worker)
 	}
 	fmt.Fprintln(out)
 }
@@ -290,6 +308,7 @@ func renderConsoleStatus(out io.Writer, status daemon.Status) {
 func renderConsoleStatusSnapshot(out io.Writer, status daemon.Status) {
 	fmt.Fprintln(out)
 	writeConsoleDaemonMode(out, status.Mode)
+	renderHoldRoles(out, status.HoldQueueRoles)
 	renderConsoleRepositorySummary(out, status.Repositories)
 	if len(status.Repositories) == 0 {
 		fmt.Fprintln(out, "Repositories: none")
@@ -313,6 +332,7 @@ func renderColumnRow(values []string, widths []int) string {
 func renderConsoleDetailStatus(out io.Writer, status daemon.Status) {
 	fmt.Fprintln(out)
 	writeConsoleDaemonMode(out, status.Mode)
+	renderHoldRoles(out, status.HoldQueueRoles)
 	if len(status.Repositories) != 0 {
 		renderConsoleRepositories(out, status.Repositories)
 	}
@@ -324,6 +344,10 @@ func renderConsoleDetailStatus(out io.Writer, status daemon.Status) {
 		}
 		fmt.Fprintf(out, "Worker: %s\n", consoleField(worker.Name))
 		fmt.Fprintf(out, "  State: %s\n", consoleField(worker.State))
+		fmt.Fprintf(out, "  Queues: %s; unassigned holds: %t\n", consoleField(worker.EffectiveTicketQueue), worker.EffectiveHoldQueue)
+		if worker.HoldTicket != "" {
+			fmt.Fprintf(out, "  Last hold assessment: %s (%s)\n", consoleField(worker.HoldTicket), consoleField(worker.HoldOutcome))
+		}
 		fmt.Fprintf(out, "  Activity/state: %s\n", consoleWorkerActivity(worker))
 		if worker.Role != "" {
 			fmt.Fprintf(out, "  Role: %s\n", consoleField(worker.Role))
@@ -353,6 +377,7 @@ func renderConsoleDetailStatus(out io.Writer, status daemon.Status) {
 		if worker.Reason != "" {
 			fmt.Fprintf(out, "  Failure reason: %s\n", consoleField(worker.Reason))
 		}
+		renderConsoleLatestFailure(out, worker)
 		if worker.Failure != nil {
 			fmt.Fprintf(out, "  Failure: %s\n", consoleWorkerFailureDetail(worker.Failure))
 		}
@@ -374,6 +399,19 @@ func consoleWorkerFailureDetail(failure *daemon.WorkerFailure) string {
 		return ""
 	}
 	parts := []string{consoleField(failure.Classification), "during", consoleField(failure.Phase)}
+	if failure.Detail != "" {
+		parts = append(parts, "detail="+consoleField(failure.Detail))
+	}
+	if failure.OuterProcess != nil {
+		if failure.OuterProcess.ExitObserved {
+			parts = append(parts, fmt.Sprintf("outer_exit_code=%d", failure.OuterProcess.ExitCode))
+			if failure.OuterProcess.Signal != 0 {
+				parts = append(parts, fmt.Sprintf("outer_signal=%d", failure.OuterProcess.Signal))
+			}
+		} else {
+			parts = append(parts, "outer_exit=unknown")
+		}
+	}
 	if failure.ExitCode != 0 {
 		parts = append(parts, fmt.Sprintf("exit_code=%d", failure.ExitCode))
 	}
@@ -394,6 +432,9 @@ func consoleWorkerFailureDetail(failure *daemon.WorkerFailure) string {
 	}
 	if failure.NestedExitCode != 0 {
 		parts = append(parts, fmt.Sprintf("nested_exit_code=%d", failure.NestedExitCode))
+	}
+	if detail := executionFailureDetail(failure.Execution); detail != "" {
+		parts = append(parts, detail)
 	}
 	if failure.Ticket != "" {
 		parts = append(parts, "ticket="+consoleField(failure.Ticket))
@@ -466,6 +507,12 @@ func consoleWorkerStatusActivity(worker daemon.WorkerStatus) string {
 		activity = consoleField(worker.Reason)
 	} else {
 		activity = "no recent Ticket activity"
+	}
+	if worker.EffectiveHoldQueue {
+		activity += "; holds enabled"
+	}
+	if worker.HoldTicket != "" {
+		activity += "; last hold " + consoleField(worker.HoldTicket) + " " + consoleField(worker.HoldOutcome)
 	}
 	return activity
 }
@@ -597,4 +644,23 @@ func safeConsoleError(err error) string {
 		return clientErr.Error()
 	}
 	return "daemon request failed"
+}
+
+// Configured roles are visible even before any external session joins.
+func renderHoldRoles(out io.Writer, roles []string) {
+	if len(roles) == 0 {
+		fmt.Fprintln(out, "Hold roles: none configured")
+		return
+	}
+	fmt.Fprintf(out, "Hold roles: %s (unassigned only)\n", consoleField(strings.Join(roles, ", ")))
+}
+
+func renderConsoleLatestFailure(out io.Writer, worker daemon.WorkerStatus) {
+	if worker.LatestFailure != nil {
+		fmt.Fprintf(out, "  Latest failure: %s at %s\n", consoleWorkerFailureDetail(worker.LatestFailure.Failure), worker.LatestFailure.ObservedAt.Local().Format(time.RFC3339))
+		fmt.Fprintf(out, "  Diagnostic: %s (relative to instance local directory)\n", consoleField(worker.LatestFailure.Reference))
+	}
+	if worker.DiagnosticError != "" {
+		fmt.Fprintf(out, "  Diagnostic error: %s\n", consoleField(worker.DiagnosticError))
+	}
 }

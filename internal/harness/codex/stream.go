@@ -21,6 +21,8 @@ type streamParser struct {
 	sessionInvalidated bool
 	framer             harness.LineFramer
 	err                error
+	failed             bool
+	outputFailed       bool
 }
 
 func newStreamParser(output io.Writer, expected string) *streamParser {
@@ -36,6 +38,7 @@ func (p *streamParser) Write(data []byte) (int, error) {
 	}
 	parseErr := p.parse(data)
 	written, outputErr := p.output.Write(data)
+	p.outputFailed = p.outputFailed || (outputErr != nil && !errors.Is(outputErr, ErrProtocol)) || written != len(data)
 	if outputErr != nil {
 		outputErr = fmt.Errorf("write Codex stream: %w", outputErr)
 	} else if written != len(data) {
@@ -85,6 +88,9 @@ func (p *streamParser) parseLine(line []byte) error {
 		return fmt.Errorf("%w: malformed JSONL event: %v", ErrProtocol, err)
 	}
 	if event.Type != "thread.started" {
+		if event.Type == "turn.failed" {
+			p.failed = true
+		}
 		return p.publishLine(line)
 	}
 	if strings.TrimSpace(event.ThreadID) == "" {
@@ -115,6 +121,7 @@ func (p *streamParser) publishLine(line []byte) error {
 	}
 	for _, record := range records {
 		if err := harness.PublishOutputEvent(p.events, record); err != nil {
+			p.outputFailed = true
 			return err
 		}
 	}

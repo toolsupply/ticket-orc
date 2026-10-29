@@ -29,6 +29,7 @@ type processRequest struct {
 type processResult struct {
 	exitCode int
 	stderr   string
+	outcome  harness.ProcessOutcome
 }
 
 type processRunner func(context.Context, processRequest) (processResult, error)
@@ -65,7 +66,7 @@ func NewManaged(executable string, env []string, run func(context.Context, harne
 	captured := append([]string(nil), env...)
 	return newAdapter(executable, func() []string { return append([]string(nil), captured...) }, func(ctx context.Context, req processRequest) (processResult, error) {
 		result, err := run(ctx, harness.ProcessRequest{Executable: req.executable, Args: req.args, Dir: req.dir, Env: req.env, Stdout: req.stdout, StderrLimit: maxDiagnosticBytes})
-		return processResult{exitCode: result.ExitCode, stderr: result.Stderr}, err
+		return processResult{exitCode: result.ExitCode, stderr: result.Stderr, outcome: result.Outcome}, err
 	})
 }
 
@@ -135,7 +136,8 @@ func (a *Adapter) Run(ctx context.Context, request harness.RunRequest) (harness.
 // identity reported by the stream.
 func (a *Adapter) Resume(ctx context.Context, sessionID string, request harness.RunRequest) (harness.RunResult, error) {
 	if err := validateSessionID(sessionID); err != nil {
-		return harness.RunResult{}, err
+		result := harness.RunResult{SessionID: sessionID, Evidence: &harness.ExecutionEvidence{Process: harness.ProcessOutcome{Start: "not_started", Cancellation: "none"}, Phase: "startup"}}
+		return result, &harness.ExecutionError{Harness: "codex", Result: result, Cause: err}
 	}
 	return a.execute(ctx, sessionID, request)
 }
@@ -208,12 +210,24 @@ func (a *Adapter) Queue(ctx context.Context, home, thread, message string) error
 	return nil
 }
 
-func (a *Adapter) execute(ctx context.Context, sessionID string, request harness.RunRequest) (harness.RunResult, error) {
+func (a *Adapter) execute(ctx context.Context, sessionID string, request harness.RunRequest) (result harness.RunResult, runErr error) {
+	// Every return, including pre-execution rejection, retains explicit evidence.
+	evidence := harness.ExecutionEvidence{Process: harness.ProcessOutcome{Start: "not_started", Cancellation: "none"}, Phase: "startup"}
+	result = harness.RunResult{SessionID: sessionID, Evidence: &evidence}
+	defer func() {
+		if ctx != nil && (evidence.Process.Cancellation == "" || (evidence.Process.Cancellation == "none" && ctx.Err() != nil)) {
+			evidence.Process.Cancellation = harness.ProcessCancellation(ctx)
+		}
+		result.Evidence = &evidence
+		if runErr != nil {
+			runErr = &harness.ExecutionError{Harness: "codex", Result: result, Cause: runErr}
+		}
+	}()
 	if err := validateContext(ctx); err != nil {
-		return harness.RunResult{}, err
+		return result, err
 	}
 	if err := validateRequest(request); err != nil {
-		return harness.RunResult{}, err
+		return result, err
 	}
 	output, err := OpenExecutionOutput(
 		request.StateDir,
@@ -224,8 +238,10 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 		"codex", request.WorkerName,
 	)
 	if err != nil {
-		return harness.RunResult{}, err
+		evidence.OutputFailed = true
+		return result, err
 	}
+	evidence.LogID = filepath.Base(output.Path())
 	args := []string{"exec", "--skip-git-repo-check", "--json"}
 	if request.Model != "" {
 		args = append(args, "-m", request.Model)
@@ -258,11 +274,24 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 	})
 	finishErr := parser.Finish()
 	closeErr := output.Close()
-	streamErr := errors.Join(finishErr, closeErr)
+	evidence.Process = process.outcome
+	evidence.Phase = "running"
+	if evidence.Process.Start == "not_started" {
+		evidence.Phase = "startup"
+	}
+	evidence.ProviderFailed = parser.failed
+	evidence.ProtocolFailed = errors.Is(finishErr, ErrProtocol) || errors.Is(closeErr, ErrProtocol)
+	evidence.OutputFailed = parser.outputFailed || output.failed
+	if evidence.ProtocolFailed {
+		evidence.Phase = "protocol"
+	}
+	if evidence.OutputFailed {
+		evidence.Phase = "output"
+	}
 	// exec --json currently provides per-turn token usage but no authoritative
 	// context-window size or remaining headroom. Keep ContextTelemetry unknown;
 	// do not inspect Codex's private rollout files or estimate context use.
-	result := harness.RunResult{
+	result = harness.RunResult{
 		SessionID: parser.session,
 		SessionOutcome: func() harness.SessionOutcome {
 			if parser.sessionInvalidated {
@@ -270,33 +299,28 @@ func (a *Adapter) execute(ctx context.Context, sessionID string, request harness
 			}
 			return harness.SessionReusable
 		}(),
-		ExitCode: process.exitCode,
-		LogPath:  output.Path(),
+		ExitCode:            process.exitCode,
+		LogPath:             output.Path(),
+		StreamEndedNormally: finishErr == nil && closeErr == nil && ctx.Err() == nil,
 	}
-	if contextErr := ctx.Err(); contextErr != nil {
-		return result, errors.Join(contextErr, streamErr)
-	}
-	if streamErr != nil {
-		return result, streamErr
-	}
-	result.StreamEndedNormally = true
+	var outcomeErr error
 	if processErr != nil || process.exitCode != 0 {
-		if process.exitCode < 0 && processErr != nil {
-			var exitErr *exec.ExitError
-			if !errors.As(processErr, &exitErr) {
-				return result, fmt.Errorf("run Codex: %w", processErr)
-			}
-		}
-		return result, &ProcessError{
+		outcomeErr = &ProcessError{
 			ExitCode: process.exitCode,
 			Stderr:   process.stderr,
 			cause:    processErr,
 		}
 	}
-	if sessionID == "" && request.RequireSession && result.SessionID == "" {
-		return result, fmt.Errorf("%w: successful run did not report a thread ID", ErrProtocol)
+	if outcomeErr == nil && sessionID == "" && request.RequireSession && result.SessionID == "" {
+		evidence.ProtocolFailed = true
+		evidence.Phase = "protocol"
+		finishErr = errors.Join(finishErr, fmt.Errorf("%w: successful run did not report a thread ID", ErrProtocol))
 	}
-	return result, nil
+	if parser.failed {
+		outcomeErr = errors.Join(outcomeErr, ErrTurnFailed)
+	}
+	runErr = errors.Join(outcomeErr, finishErr, closeErr, ctx.Err())
+	return result, runErr
 }
 
 // Cleanup applies the configured Codex terminal-session policy.
@@ -414,7 +438,7 @@ func runProcess(ctx context.Context, request processRequest) (processResult, err
 		Stdout:      request.stdout,
 		StderrLimit: maxDiagnosticBytes,
 	})
-	return processResult{exitCode: result.ExitCode, stderr: result.Stderr}, err
+	return processResult{exitCode: result.ExitCode, stderr: result.Stderr, outcome: result.Outcome}, err
 }
 
 func withActor(base []string, actor string) []string {

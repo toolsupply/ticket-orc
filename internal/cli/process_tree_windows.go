@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -21,24 +22,42 @@ type childContainment struct {
 
 // Observe leader exit without closing its stdout pipe. Conversation execution
 // can then stop the job descendants before draining output and calling cmd.Wait.
-func waitForChildExitBeforeReap(process *os.Process) bool {
+func waitForChildExitBeforeReap(process *os.Process) error {
 	if process == nil {
-		return false
+		return os.ErrProcessDone
 	}
 	handle, err := syscall.OpenProcess(syscall.SYNCHRONIZE, false, uint32(process.Pid))
 	if err != nil {
-		return false
+		return err
 	}
 	defer syscall.CloseHandle(handle)
-	event, err := syscall.WaitForSingleObject(handle, syscall.INFINITE)
-	return err == nil && event == syscall.WAIT_OBJECT_0
+	stopped, err := windowsProcessStopped(handle, syscall.INFINITE)
+	if err != nil {
+		return err
+	}
+	if !stopped {
+		return errors.New("child termination wait timed out")
+	}
+	return nil
 }
 
-// processAlive is only reached from the Darwin-specific fallback branch in
-// startRunChild. The runtime guard is not enough to hide the symbol from the
-// Windows compiler, so keep the platform stub false where that branch cannot
-// execute.
-func processAlive(_ *os.Process) bool { return false }
+// Only a signaled retained process handle establishes termination of that exact
+// process. Timeout is an observation of an unsignaled handle; errors establish
+// neither liveness nor death. Retain the actual result and system diagnostic.
+func windowsProcessStopped(handle syscall.Handle, timeout uint32) (bool, error) {
+	event, err := syscall.WaitForSingleObject(handle, timeout)
+	if err != nil {
+		return false, fmt.Errorf("WaitForSingleObject result=%#x: %w", event, err)
+	}
+	switch event {
+	case syscall.WAIT_OBJECT_0:
+		return true, nil
+	case syscall.WAIT_TIMEOUT:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected process wait result=%#x", event)
+	}
+}
 
 type windowsJobBasicLimitInformation struct {
 	PerProcessUserTimeLimit int64
@@ -79,6 +98,22 @@ var (
 	closeKernelHandle        = kernel32.NewProc("CloseHandle")
 )
 
+// Keep the assignment syscall controllable so the launch interval and its
+// failure path can be tested with real children held behind explicit barriers.
+var assignChildToJob = func(job, process syscall.Handle) error {
+	if result, _, err := assignProcessToJobObject.Call(uintptr(job), uintptr(process)); result == 0 {
+		return fmt.Errorf("AssignProcessToJobObject: %w", err)
+	}
+	return nil
+}
+
+// A successful attachment is containment from this point forward, not proof
+// of ownership of earlier descendants. exec.Cmd.Start has already allowed the
+// worker to execute. Keep processBoundaryResult uncertain for this launch path;
+// neither empty-job accounting nor a successful TerminateJobObject could prove
+// that a child created before assignment stopped. Automatic claim release must
+// remain disabled until creation and job assignment are atomic.
+// https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject
 func attachChildContainment(process *os.Process) (childContainment, error) {
 	if process == nil {
 		return childContainment{}, fmt.Errorf("worker process is unavailable")
@@ -100,7 +135,7 @@ func attachChildContainment(process *os.Process) (childContainment, error) {
 		return childContainment{}, openErr
 	}
 	defer syscall.CloseHandle(processHandle)
-	if result, _, assignErr := assignProcessToJobObject.Call(job, uintptr(processHandle)); result == 0 {
+	if assignErr := assignChildToJob(syscall.Handle(job), processHandle); assignErr != nil {
 		_ = containment.close()
 		return childContainment{}, assignErr
 	}
@@ -109,11 +144,16 @@ func attachChildContainment(process *os.Process) (childContainment, error) {
 
 func (containment childContainment) force(process *os.Process) error {
 	if containment.handle != 0 {
-		if result, _, err := terminateJobObject.Call(uintptr(containment.handle), 1); result != 0 {
-			return nil
-		} else if err != syscall.Errno(0) {
-			return err
+		if result, _, err := terminateJobObject.Call(uintptr(containment.handle), 1); result == 0 {
+			// Still try to stop the leader, but never erase the job failure
+			// merely because that fallback succeeded.
+			stopErr := forceChildStop(process)
+			if errors.Is(stopErr, os.ErrProcessDone) {
+				stopErr = nil // The job failure must not look like a benign late stop.
+			}
+			return errors.Join(fmt.Errorf("TerminateJobObject: %w", err), stopErr)
 		}
+		return nil // Request accepted, not descendant completion.
 	}
 	return forceChildStop(process)
 }

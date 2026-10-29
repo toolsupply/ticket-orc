@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,11 +38,10 @@ func TestConversationAgentProcess(t *testing.T) {
 		return
 	}
 	fail := func(err error) { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
-	cwd, err := os.Getwd()
-	if err != nil {
+	if err := checkConversationTestWorkingDirectory(os.Getenv("ORC_CONVERSATION_TEST_CWD")); err != nil {
 		fail(err)
 	}
-	if cwd != os.Getenv("ORC_CONVERSATION_TEST_CWD") || os.Getenv("TICKET_ACTOR") != "planner-agent" || os.Getenv("TICKET_ORC_WORKER") != "" || os.Getenv(supervisedRoleEnv) != "" {
+	if os.Getenv("TICKET_ACTOR") != "planner-agent" || os.Getenv("TICKET_ORC_WORKER") != "" || os.Getenv(supervisedRoleEnv) != "" {
 		fail(fmt.Errorf("incorrect managed environment"))
 	}
 	args := os.Args[slices.Index(os.Args, "--")+1:]
@@ -98,6 +100,66 @@ func TestConversationAgentProcess(t *testing.T) {
 	fmt.Println(`{"type":"item.completed","item":{"id":"diagnosis","type":"agent_message","text":"Inspected Orc and paused worker dispatch."}}`)
 	fmt.Println(`{"type":"turn.completed"}`)
 	os.Exit(0)
+}
+
+func TestConversationAgentWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	working := filepath.Join(root, "project")
+	other := filepath.Join(root, "other")
+	for _, dir := range []string{working, other} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(working)
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "configured", path: working, want: true},
+		{name: "different", path: other, want: false},
+		{name: "missing", path: filepath.Join(root, "missing"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkConversationTestWorkingDirectory(tc.path)
+			if (err == nil) != tc.want {
+				t.Fatalf("working directory %q: %v; want match=%t", tc.path, err, tc.want)
+			}
+		})
+	}
+	t.Run("symlink", func(t *testing.T) {
+		alias := filepath.Join(root, "project-link")
+		if err := os.Symlink(working, alias); err != nil {
+			// Windows requires Developer Mode or symlink privilege (1314).
+			// Unsupported filesystems may reject symlinks on any platform.
+			if errors.Is(err, errors.ErrUnsupported) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP) ||
+				(runtime.GOOS == "windows" && (os.IsPermission(err) || errors.Is(err, syscall.Errno(1314)))) {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			t.Fatal(err)
+		}
+		if err := checkConversationTestWorkingDirectory(alias); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func checkConversationTestWorkingDirectory(want string) error {
+	cwd, err := os.Stat(".")
+	if err != nil {
+		return fmt.Errorf("stat managed working directory: %w", err)
+	}
+	expected, err := os.Stat(want)
+	if err != nil {
+		return fmt.Errorf("stat expected managed working directory: %w", err)
+	}
+	// A child may resolve symlinks in the configured path (for example /var on
+	// macOS), so compare directory identity rather than path spelling.
+	if !os.SameFile(cwd, expected) {
+		return fmt.Errorf("incorrect managed working directory: want %q", want)
+	}
+	return nil
 }
 
 func TestConversationManagedAgentIntegration(t *testing.T) {
@@ -185,7 +247,11 @@ func TestConversationManagedAgentIntegration(t *testing.T) {
 				}
 				return codex.NewManaged(os.Args[0], env, func(ctx context.Context, req harness.ProcessRequest) (harness.ProcessResult, error) {
 					req.Args = append([]string{"-test.run=^TestConversationAgentProcess$", "--"}, req.Args...)
-					return runConversationProcess(ctx, req)
+					result, err := runConversationProcess(ctx, req)
+					if err != nil {
+						t.Logf("conversation child result=%+v error=%v", result, err)
+					}
+					return result, err
 				})
 			})
 			m := supervisor.NewConversationManager(policy, hooks)
@@ -315,7 +381,8 @@ func TestConversationManagedAgentIntegration(t *testing.T) {
 				want = "interrupted"
 			}
 			if turn.State != want {
-				t.Fatalf("turn=%#v records=%#v", turn, c.Records)
+				data, _ := json.Marshal(c.Records)
+				t.Fatalf("turn=%#v records=%s", turn, data)
 			}
 			data, _ := json.Marshal(c.Records)
 			if bytes.Contains(data, []byte(key)) {
@@ -383,7 +450,8 @@ func TestConversationOutputFailureStopsControlledChild(t *testing.T) {
 	defer cancel()
 	sentinel := fmt.Errorf("controlled output failure")
 	result, err := runConversationProcess(ctx, harness.ProcessRequest{Executable: os.Args[0], Args: []string{"-test.run=^TestConversationOutputFailureStopsControlledChild$"}, Env: append(os.Environ(), "ORC_CONVERSATION_OUTPUT_CHILD=1"), Stdout: conversationFailWriter{err: sentinel}})
-	if err != sentinel || result.ExitCode == 0 || ctx.Err() != nil {
+	var exit *exec.ExitError
+	if !errors.Is(err, sentinel) || !errors.As(err, &exit) || result.ExitCode != exit.ExitCode() || result.ExitCode == 0 || ctx.Err() != nil {
 		t.Fatalf("output failure did not stop owned child: %#v %v ctx=%v", result, err, ctx.Err())
 	}
 }

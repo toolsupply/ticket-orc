@@ -26,6 +26,15 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("ORC_TEST_ATTACHMENTS") == "1" {
+		os.Exit(runAttachmentTicket())
+	}
+	if os.Getenv("ORC_TEST_FAILURE_DIAGNOSTIC") != "" {
+		os.Exit(runFailureDiagnosticWorker())
+	}
+	if os.Getenv("ORC_FAILED_CLAIM_WORKER") == "1" {
+		os.Exit(runFailedClaimTestWorker())
+	}
 	if os.Getenv("ORC_TEST_DELETE") == "1" {
 		os.Exit(runRepositoryDeleteTicket())
 	}
@@ -77,10 +86,6 @@ func startSupervisorTestRun(t *testing.T, cancel context.CancelFunc, run func() 
 	t.Helper()
 	done := make(chan error, 1)
 	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		done <- run()
-	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -89,6 +94,10 @@ func startSupervisorTestRun(t *testing.T, cancel context.CancelFunc, run func() 
 			t.Errorf("supervisor goroutine did not stop during test cleanup")
 		}
 	})
+	go func() {
+		defer close(finished)
+		done <- run()
+	}()
 	return done
 }
 

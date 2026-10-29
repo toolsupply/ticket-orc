@@ -91,7 +91,7 @@ func TestInitCreatesMinimalSecureInstanceAndRequiresForceToReplace(t *testing.T)
 		fields := role.(map[string]any)
 		wantFieldCount := 2
 		if name == "reviewer" {
-			wantFieldCount = 3
+			wantFieldCount = 4
 		}
 		if len(fields) != wantFieldCount || fields["nudge_prompt"] == nil || fields["queue"] != nil || fields["queue_prompt"] != nil {
 			t.Fatalf("init role %q fields=%#v", name, fields)
@@ -303,15 +303,15 @@ func assertInitTopology(t *testing.T, loaded LoadedFileConfig, architect bool) {
 		t.Fatalf("generated topology default=%q roles=%#v", loaded.Config.DefaultRole, loaded.Config.Roles)
 	}
 	coder, ok := loaded.Config.Roles["coder"]
-	if !ok || coder.TicketQueue != "open" || coder.ReviewCompletion != "" {
+	if !ok || coder.TicketQueue != "open" || coder.HoldQueue || coder.ReviewCompletion != "" {
 		t.Fatalf("generated coder role=%#v", coder)
 	}
 	reviewer, ok := loaded.Config.Roles["reviewer"]
-	if !ok || reviewer.TicketQueue != "review" || reviewer.ReviewCompletion != wantReviewerCompletion {
+	if !ok || reviewer.TicketQueue != "review" || reviewer.HoldQueue != !architect || reviewer.ReviewCompletion != wantReviewerCompletion {
 		t.Fatalf("generated reviewer role=%#v, want completion %q", reviewer, wantReviewerCompletion)
 	}
 	architectRole, found := loaded.Config.Roles["architect"]
-	if architect && (!found || architectRole.TicketQueue != "signoff" || architectRole.NudgePrompt != architectNudgePrompt) {
+	if architect && (!found || architectRole.TicketQueue != "signoff" || !architectRole.HoldQueue || architectRole.NudgePrompt != architectNudgePrompt) {
 		t.Fatalf("generated architect role=%#v found=%v", architectRole, found)
 	}
 	if architect {

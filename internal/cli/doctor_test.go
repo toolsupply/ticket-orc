@@ -157,8 +157,8 @@ func TestWorkerManagerDoctorRejectsChildThatExitsDuringVerification(t *testing.T
 	if err != nil || len(second.Workers) != 1 || second.Workers[0].Outcome != "failed" {
 		t.Fatalf("repeat doctor result=%#v err=%v", second, err)
 	}
-	if starts != 2 {
-		t.Fatalf("definitive startup failure launches=%d, want one retry", starts)
+	if starts != 1 || second.Workers[0].Reason != "manual operator decision required" {
+		t.Fatalf("unconfirmed startup failure must not relaunch: starts=%d result=%+v", starts, second.Workers[0])
 	}
 }
 

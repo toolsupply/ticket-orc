@@ -37,6 +37,29 @@ func TryAcquireLock(ctx context.Context, dir string) (Lock, error) {
 	return acquireLockWithTimeout(ctx, dir, 0, true)
 }
 
+// TryAcquireFileLock uses the same lock protocol on an already securely opened
+// regular file. Ownership transfers only on success; Release closes the file.
+// Callers must preserve the lock inode and validate its namespace independently.
+func TryAcquireFileLock(ctx context.Context, file *os.File) (Lock, error) {
+	if ctx == nil || file == nil {
+		return nil, fmt.Errorf("lock context and file must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("lock must be a regular file")
+	}
+	if err := lockFile(ctx, file, 0); err != nil {
+		return nil, err
+	}
+	return &fileLock{file: file}, nil
+}
+
 func acquireLockWithTimeout(ctx context.Context, dir string, timeout time.Duration, allowImmediate bool) (Lock, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("state directory must not be empty")

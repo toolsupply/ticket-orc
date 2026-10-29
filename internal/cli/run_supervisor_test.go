@@ -304,6 +304,52 @@ func TestRunSupervisorDefaultOutputUsesServiceSummaries(t *testing.T) {
 	}
 }
 
+func TestRunSupervisorForegroundShowsConfiguredHoldRoles(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("hold_queue=%t", enabled), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			stateDir := t.TempDir()
+			var stderr bytes.Buffer
+			var outputMu sync.Mutex
+			ready := make(chan struct{})
+			writer := &supervisorTestSignalWriter{
+				dst: &lockedWriter{dst: &stderr, mu: &outputMu},
+				// This section follows the hold summary in foreground output.
+				match: "Repositories: none", seen: ready,
+			}
+			config := RunConfig{
+				StateDir: stateDir,
+				steerPolicies: newSteerPolicyStore(map[string]steerRolePolicy{
+					"reviewer": {TicketQueue: "review", HoldQueue: enabled},
+				}),
+			}
+			done := startSupervisorTestRun(t, cancel, func() error {
+				return runSupervisor(ctx, config, os.Args[0], io.Discard, writer)
+			})
+			awaitSupervisorSignal(t, ready, "foreground hold role summary")
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("supervisor did not stop after foreground summary")
+			}
+			outputMu.Lock()
+			text := stderr.String()
+			outputMu.Unlock()
+			want := "Hold roles: none configured"
+			if enabled {
+				want = "Hold roles: reviewer (unassigned only)"
+			}
+			if strings.Count(text, "Hold roles:") != 1 || !strings.Contains(text, want) {
+				t.Fatalf("foreground startup should report %q: %s", want, text)
+			}
+		})
+	}
+}
+
 func TestRunSupervisorLockFailureHasSafeDiagnostic(t *testing.T) {
 	stateDir := t.TempDir()
 	lock, err := state.TryAcquireLock(context.Background(), filepath.Join(stateDir, "run"))
@@ -957,6 +1003,11 @@ func TestRunSupervisorPartialStartFailureCleansAllChildren(t *testing.T) {
 	runChildStopTimeout = 40 * time.Millisecond
 	t.Cleanup(func() { runChildStopTimeout = oldTimeout })
 	workers := []supervisor.RunWorker{supervisorTestWorker("exited", stateDir), supervisorTestWorker("forced", stateDir), supervisorTestWorker("fail", stateDir)}
+	// This test exercises cleanup after a later independent launch failure.
+	// The earlier uncertain exit must not share that worker's workspace.
+	for i := range workers {
+		workers[i].Config.WorkingDir = t.TempDir()
+	}
 	runtimeState := NewRuntimeState(workers)
 	var output, diagnostics bytes.Buffer
 	hooks := make(chan supervisor.WorkerTransition, 16)

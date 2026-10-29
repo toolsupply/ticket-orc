@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -48,6 +49,7 @@ func renderRunBanner(out io.Writer, configPath, listener string) {
 
 func renderServiceReady(out io.Writer, configPath, listener string, status daemon.Status) {
 	renderRunBanner(out, configPath, listener)
+	renderHoldRoles(out, status.HoldQueueRoles)
 	fmt.Fprintln(out)
 	renderConsoleRepositorySummary(out, status.Repositories)
 	if len(status.Repositories) == 0 {
@@ -81,12 +83,15 @@ func runtimeDaemonStatus(runtime *supervisor.RuntimeState[supervisor.RunWorker],
 		item := daemon.WorkerStatus{
 			Name: worker.Name, Groups: append([]string(nil), worker.Groups...),
 			Role: roleName, EffectiveRoleName: roleName,
-			EffectiveTicketQueue: worker.Config.TicketQueue, Harness: worker.Config.Harness, TicketActor: worker.Config.Actor,
+			EffectiveTicketQueue: worker.Config.TicketQueue, EffectiveHoldQueue: worker.Config.HoldQueue, Harness: worker.Config.Harness, TicketActor: worker.Config.Actor,
 			EffectiveTicketTags: splitTicketTags(worker.Config.TicketTags), EffectiveTicketWithoutTags: splitTicketTags(worker.Config.TicketWithoutTags), EffectiveReviewSkipTags: splitReviewSkipTags(worker.Config.ReviewSkipTags),
+			HoldTicket: observation.HoldTicket, HoldOutcome: observation.HoldOutcome,
 			TicketActivityAt: observation.TicketAt, TicketActivity: observation.TicketEvent,
 			TicketActivityTicket: observation.TicketID, TicketActivitySource: observation.TicketSource,
 			State: string(transition.State), Reason: workerStatusReason(transition), Failure: daemon.WorkerFailureDTO(transition.Failure),
 		}
+		latest, diagnosticError := runtime.LatestFailure(worker.Config.RepositoryIdentity, worker.Name)
+		item.LatestFailure, item.DiagnosticError = daemon.LatestFailureDTO(latest), diagnosticError
 		addWorkerRepositoryStatus(&item, worker)
 		status.Workers = append(status.Workers, item)
 	}
@@ -95,10 +100,18 @@ func runtimeDaemonStatus(runtime *supervisor.RuntimeState[supervisor.RunWorker],
 
 func runtimeDaemonStatusWithSteerPolicies(runtime *supervisor.RuntimeState[supervisor.RunWorker], sessions []daemon.SteerStatus, policies *steerPolicyStore) daemon.Status {
 	projected := append([]daemon.SteerStatus(nil), sessions...)
+	var holdRoles []string
 	if policies != nil {
 		policySnapshot := policies.Snapshot()
+		for name, policy := range policySnapshot.roles {
+			if policy.HoldQueue {
+				holdRoles = append(holdRoles, name)
+			}
+		}
+		sort.Strings(holdRoles)
 		for index := range projected {
 			projected[index].EffectiveTicketQueue = ""
+			projected[index].EffectiveHoldQueue = false
 			projected[index].EffectiveTicketTags = nil
 			projected[index].EffectiveTicketWithoutTags = nil
 			projected[index].EffectiveReviewSkipTags = nil
@@ -107,7 +120,9 @@ func runtimeDaemonStatusWithSteerPolicies(runtime *supervisor.RuntimeState[super
 			}
 		}
 	}
-	return runtimeDaemonStatus(runtime, projected)
+	status := runtimeDaemonStatus(runtime, projected)
+	status.HoldQueueRoles = holdRoles
+	return status
 }
 
 func sanitizeServiceToken(value string) string {
@@ -156,6 +171,9 @@ func renderWorkerFailure(out io.Writer, worker string, state supervisor.WorkerSt
 	}
 	if failure.NestedExitCode != 0 {
 		_, _ = fmt.Fprintf(out, " nested_exit_code=%d", failure.NestedExitCode)
+	}
+	if detail := executionFailureDetail(failure.Execution); detail != "" {
+		_, _ = fmt.Fprintf(out, " %s", detail)
 	}
 	if failure.Ticket != "" {
 		_, _ = fmt.Fprintf(out, " ticket=%s", failure.Ticket)

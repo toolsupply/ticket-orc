@@ -3,6 +3,9 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"io"
+
+	"github.com/toolsupply/ticket-orc/internal/attachments"
 )
 
 // RepositoryTicketQuery is the bounded read-only query accepted by the
@@ -133,16 +136,49 @@ type RepositoryTicketMutation struct {
 	Ticket        RepositoryTicket `json:"ticket"`
 }
 
+// Attachment requests contain only relative entries and explicit caller attribution.
+// Actor is selected by the authorized caller, never inferred from a worker.
+type RepositoryAttachmentQuery struct {
+	Path   string
+	Limit  int
+	Cursor string
+}
+type RepositoryAttachmentRequest struct {
+	Actor     string
+	Path      string
+	Condition attachments.Condition
+}
+type RepositoryAttachmentMoveRequest struct {
+	Actor, From, To, Revision string
+	Condition                 attachments.Condition
+}
+type RepositoryAttachmentContent struct {
+	Entry   attachments.Entry
+	Content io.ReadCloser
+}
+
 // RepositoryGateway supplies bounded Ticket projections and typed mutations to
 // the daemon control plane. Implementations must resolve repository IDs
 // themselves and must never accept caller filesystem paths or arbitrary argv.
 type RepositoryGateway struct {
-	DeleteTicket func(context.Context, string, string, RepositoryTicketDeleteRequest) (RepositoryTicketDeletion, error)
-	ListTickets  func(context.Context, string, RepositoryTicketQuery) (RepositoryTicketList, error)
-	GetTicket    func(context.Context, string, string) (RepositoryTicketDetail, error)
-	CreateTicket func(context.Context, string, RepositoryTicketCreateRequest) (RepositoryTicketMutation, error)
-	UpdateTicket func(context.Context, string, string, RepositoryTicketUpdateRequest) (RepositoryTicketMutation, error)
-	MutateTicket func(context.Context, string, string, string, RepositoryTicketMutationRequest) (RepositoryTicketMutation, error)
+	ListAttachments func(context.Context, string, string, RepositoryAttachmentQuery) (attachments.Listing, error)
+	ReadAttachment  func(context.Context, string, string, string) (RepositoryAttachmentContent, error)
+	// WriteAttachment streams body under the storage transfer deadline. Callers must
+	// make blocking reader IO obey context cancellation and the total transfer deadline,
+	// including shutdown during staging. The final callback runs only after a complete
+	// body is accepted and its cancellation detached. It must obtain the existing
+	// server-owned lifecycle via Server.MutationContext; shutdown remains effective.
+	// The callback's cancel function is always called; publication is never retried.
+	WriteAttachment           func(context.Context, string, string, RepositoryAttachmentRequest, io.Reader, int64, attachments.CommitContext) (attachments.Receipt, error)
+	CreateAttachmentDirectory func(context.Context, string, string, RepositoryAttachmentRequest) (attachments.Receipt, error)
+	MoveAttachment            func(context.Context, string, string, RepositoryAttachmentMoveRequest) (attachments.Receipt, error)
+	DeleteAttachment          func(context.Context, string, string, RepositoryAttachmentRequest) (attachments.Receipt, error)
+	DeleteTicket              func(context.Context, string, string, RepositoryTicketDeleteRequest) (RepositoryTicketDeletion, error)
+	ListTickets               func(context.Context, string, RepositoryTicketQuery) (RepositoryTicketList, error)
+	GetTicket                 func(context.Context, string, string) (RepositoryTicketDetail, error)
+	CreateTicket              func(context.Context, string, RepositoryTicketCreateRequest) (RepositoryTicketMutation, error)
+	UpdateTicket              func(context.Context, string, string, RepositoryTicketUpdateRequest) (RepositoryTicketMutation, error)
+	MutateTicket              func(context.Context, string, string, string, RepositoryTicketMutationRequest) (RepositoryTicketMutation, error)
 	// TicketBodyBudgetBytes is the maximum body size returned by GetTicket.
 	TicketBodyBudgetBytes int
 }

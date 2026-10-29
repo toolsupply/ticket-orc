@@ -24,11 +24,13 @@ type ProcessRequest struct {
 type ProcessResult struct {
 	ExitCode int
 	Stderr   string
+	Outcome  ProcessOutcome
 }
 
 // RunProcess runs one configured child, streams stdout to its adapter, and
 // captures stderr. Provider-specific diagnostics remain with the adapter.
 func RunProcess(ctx context.Context, request ProcessRequest) (ProcessResult, error) {
+	outcome := ProcessOutcome{Start: "not_started", Cancellation: ProcessCancellation(ctx)}
 	command := exec.CommandContext(ctx, request.Executable, request.Args...)
 	command.Dir = request.Dir
 	command.Env = request.Env
@@ -42,11 +44,13 @@ func RunProcess(ctx context.Context, request ProcessRequest) (ProcessResult, err
 	command.Stderr = stderr
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return ProcessResult{ExitCode: -1}, err
+		return ProcessResult{ExitCode: -1, Outcome: outcome}, err
 	}
 	if err := command.Start(); err != nil {
-		return ProcessResult{ExitCode: -1}, err
+		outcome.Cancellation = ProcessCancellation(ctx)
+		return ProcessResult{ExitCode: -1, Outcome: outcome}, err
 	}
+	outcome.Start = "started"
 	copyErr := error(nil)
 	output := request.Stdout
 	if output == nil {
@@ -57,26 +61,21 @@ func RunProcess(ctx context.Context, request ProcessRequest) (ProcessResult, err
 		_ = command.Process.Kill()
 	}
 	waitErr := command.Wait()
-	if copyErr != nil {
-		err = copyErr
-	} else {
-		err = waitErr
+	exitCode := -1
+	if command.ProcessState != nil {
+		exitCode = command.ProcessState.ExitCode()
+		outcome.ExitObserved = true
+		outcome.ExitCode = exitCode
+		outcome.Signal = processSignal(command.ProcessState)
 	}
-	exitCode := 0
-	if err != nil {
-		exitCode = -1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
-	}
+	outcome.Cancellation = ProcessCancellation(ctx)
 	var stderrText string
 	if bounded != nil {
 		stderrText = bounded.String()
 	} else {
 		stderrText = stderrBuffer.String()
 	}
-	return ProcessResult{ExitCode: exitCode, Stderr: strings.TrimSpace(stderrText)}, err
+	return ProcessResult{ExitCode: exitCode, Stderr: strings.TrimSpace(stderrText), Outcome: outcome}, errors.Join(waitErr, copyErr, ctx.Err())
 }
 
 type limitedBuffer struct {

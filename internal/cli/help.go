@@ -120,7 +120,9 @@ config.json to be tracked. The generated reviewer role closes accepted
 reviews. --architect adds an architect role on the signoff queue and routes
 accepted reviews to it. Without --architect, init creates only coder and
 reviewer. --force replaces the config with the topology selected by this
-invocation and discards custom config edits.
+invocation and discards custom config edits. The generated hold consumer is
+reviewer in two-stage setups and architect with --architect. Stopping architect
+does not transfer holds to reviewer.
 
 `
 
@@ -134,6 +136,9 @@ Supply all endpoint flags together to register an extension-backed session.
 Configured signoff roles can join through this command. A signoff wake names one
 unclaimed ticket and Orc records its one-shot outcome; human handoff assigns the
 ticket to user through Ticket's atomic query/reassign command.
+A role with hold_queue=true also receives exact hold assessments, assigned
+atomically to its Ticket actor before dispatch, separately from primary tasks.
+Holds assigned to user require human action.
 ROLE may be omitted. The role is selected from, in order:
   1. explicit ROLE
   2. TICKET_ORC_ROLE
@@ -178,7 +183,10 @@ Usage:
 Show the current Ticket frontier and the configured or registered owners that
 would receive work. This is a read-only forecast and remains available when
 daemon dispatch is paused or aborted; output identifies the dispatch mode.
-JSON output includes daemon_mode, dispatch_inhibited, and owners.
+JSON output includes daemon_mode, dispatch_inhibited, and owners. Hold
+subscriptions and the latest observed hold assessments are shown separately
+from primary ready work. User-assigned holds require human action; this forecast
+is not an inventory of outstanding human decisions.
 
 Managed signoff roles use Ticket's filtered unassigned signoff list. Overlapping
 signoff selectors can show the same eligible ticket for multiple actors; Orc
@@ -368,6 +376,18 @@ bypass behavior. A committed reload updates dynamic steering immediately,
 while running managed workers keep their effective selector until restarted
 through the normal worker lifecycle.
 
+roles.<name>.hold_queue=true adds unassigned holds as a secondary input to a
+review or signoff role. It defaults to false for existing configurations and
+does not change ticket_queue or ordinary completion policy. Hold tasks assess
+the blocker within that role's authority, record the decision and reopen the
+ticket, or hand off to user when human action is needed. Orc acquires Ticket
+ownership before dispatch; stale ownership requires operator reconciliation.
+Hold tasks do not perform ordinary review/signoff completion on the target.
+Holds assigned to user require human action and are never dispatched. Generic role tag filters
+apply to holds; review.skip_tags applies only to the primary review queue.
+Choose one hold-owning role explicitly; custom partitions use operator-defined
+tags. Disabling or stopping that role does not transfer holds to another role.
+
 Managed roles may use ticket_queue=signoff for final acceptance. Each turn
 handles one unassigned signoff entry; the worker may inspect related tickets,
 and must resolve it with a valid lifecycle outcome or atomic human handoff to
@@ -550,7 +570,7 @@ func writeConsoleTopicHelp(w io.Writer, topic string) {
 	case "daemon":
 		fmt.Fprint(w, "\nInteractive console help: daemon\n\n  daemon pause|resume|abort  Control daemon-wide work dispatch.\n  Daemon pause is distinct from worker pause; worker pause and pause all retain their worker-level meaning.\n  Abort stops managed workers and sends best-effort requests to relevant steer sessions; remote termination is not guaranteed.\n")
 	case "status":
-		fmt.Fprint(w, "\nInteractive console help: status\n\n  status [NAME|verbose|detail]  Show fleet or one worker status.\n  Use workers for worker-focused help and listing.\n")
+		fmt.Fprint(w, "\nInteractive console help: status\n\n  status [NAME|verbose|detail]  Show fleet or one worker status.\n  Use workers for worker-focused help and listing.\n  Latest-failure diagnostic references are relative to the instance local directory.\n")
 	case "workers":
 		fmt.Fprint(w, "\nInteractive console help: workers\n\n  workers [NAME|verbose|detail]  List workers or show one worker's status.\n  Use verbose or detail for expanded fleet status.\n  Use workers -h or workers --help to show this help.\n")
 	case "start", "stop", "restart", "pause", "resume":

@@ -100,11 +100,27 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 	if err != nil {
 		return orc.NewFailureContextError(orc.FailureContext{Origin: "orc_state", Operation: "cleanup setup", Phase: "worker startup"}, fmt.Errorf("startup phase cleanup setup: %w", err))
 	}
+	repositoryID := config.RepositoryIdentity
+	if queue == "signoff" || config.HoldQueue {
+		if !ticketclient.ValidRepositoryID(repositoryID) {
+			info, probeErr := ticketclient.ProbeInfo(ctx, config.Actor, workingDir, ticketTarget(config))
+			if probeErr != nil {
+				return orc.NewFailureContextError(orc.FailureContext{Origin: "ticket", Operation: "repository identity", Phase: "Ticket client startup"}, fmt.Errorf("resolve Ticket repository identity for change watch: %w", probeErr))
+			}
+			repositoryID = info.ID
+		}
+	}
 	if queue == "review" {
 		err = orc.RunReviewer(ctx, orc.ReviewerConfig{
+			HoldQueue: config.HoldQueue,
+			HoldQueueFilters: ticketclient.QueueFilters{
+				Tags:        splitTicketTags(config.TicketTags),
+				WithoutTags: splitTicketTags(config.TicketWithoutTags),
+			},
 			WorkerName:                 config.WorkerName,
 			RoleName:                   roleName,
 			TicketQueue:                queue,
+			RepositoryID:               repositoryID,
 			Actor:                      config.Actor,
 			Harness:                    config.Harness,
 			Model:                      config.Model,
@@ -137,15 +153,12 @@ func executeRole(config supervisor.RoleConfig) (err error) {
 		return quietSupervisedCancellation(supervised, ctx, err)
 	}
 	if queue == "signoff" {
-		repositoryID := config.RepositoryIdentity
-		if !ticketclient.ValidRepositoryID(repositoryID) {
-			info, probeErr := ticketclient.ProbeInfo(ctx, config.Actor, workingDir, ticketTarget(config))
-			if probeErr != nil {
-				return orc.NewFailureContextError(orc.FailureContext{Origin: "ticket", Operation: "repository identity", Phase: "Ticket client startup"}, fmt.Errorf("resolve Ticket repository identity for acceptance watch: %w", probeErr))
-			}
-			repositoryID = info.ID
-		}
 		err = orc.RunAcceptance(ctx, orc.AcceptanceConfig{
+			HoldQueue: config.HoldQueue,
+			HoldQueueFilters: ticketclient.QueueFilters{
+				Tags:        splitTicketTags(config.TicketTags),
+				WithoutTags: splitTicketTags(config.TicketWithoutTags),
+			},
 			WorkerName:                 config.WorkerName,
 			RoleName:                   roleName,
 			Actor:                      config.Actor,

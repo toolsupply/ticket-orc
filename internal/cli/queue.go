@@ -26,6 +26,9 @@ type queueForecastOwner struct {
 	Actor         string                `json:"actor"`
 	Session       string                `json:"session,omitempty"`
 	Queue         string                `json:"queue"`
+	HoldQueue     bool                  `json:"hold_queue"`
+	HoldTicket    string                `json:"hold_ticket,omitempty"`
+	HoldOutcome   string                `json:"hold_outcome,omitempty"`
 	State         string                `json:"state,omitempty"`
 	Reason        string                `json:"reason,omitempty"`
 	Delivery      string                `json:"delivery,omitempty"`
@@ -111,14 +114,16 @@ func writeQueueForecast(ctx context.Context, out io.Writer, jsonOutput bool, loa
 		encoder := json.NewEncoder(out)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(struct {
+			HoldQueueRoles    []string             `json:"hold_queue_roles,omitempty"`
 			Mode              string               `json:"daemon_mode"`
 			DispatchInhibited bool                 `json:"dispatch_inhibited"`
 			Owners            []queueForecastOwner `json:"owners"`
-		}{Mode: mode, DispatchInhibited: mode != "running", Owners: owners})
+		}{HoldQueueRoles: status.HoldQueueRoles, Mode: mode, DispatchInhibited: mode != "running", Owners: owners})
 	}
 	if status.Mode != "" && status.Mode != "running" {
 		fmt.Fprintf(out, "\ndaemon mode=%s dispatch=inhibited\n", status.Mode)
 	}
+	renderHoldRoles(out, status.HoldQueueRoles)
 	return renderQueueForecast(out, owners)
 }
 
@@ -172,6 +177,7 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			Owner: worker.Name, Kind: "managed", RepositoryID: repoID,
 			Repository: repositoryDisplayLabel(repoName, repoPath, repoID), Role: roleName,
 			Actor: worker.TicketActor, Queue: queue, State: worker.State,
+			HoldQueue: worker.EffectiveHoldQueue, HoldTicket: worker.HoldTicket, HoldOutcome: worker.HoldOutcome,
 			Reason: managedForecastReason(worker), Active: []ticketclient.Ticket{}, repositoryPath: repoPath,
 			AuthorityNote: signoffAuthorityNote(queue),
 			filters:       filters,
@@ -198,9 +204,13 @@ func queueForecast(ctx context.Context, loaded LoadedFileConfig, status daemon.S
 			Owner: ownerName, Kind: "steer", RepositoryID: registration.RepositoryID,
 			Repository: repositoryDisplayLabel(registration.RepositoryName, registration.RepositoryPath, registration.RepositoryID),
 			Role:       registration.Role, Actor: session.Actor, Session: session.Session, Queue: queue,
+			HoldQueue: session.EffectiveHoldQueue, HoldTicket: session.HoldTicket, HoldOutcome: session.HoldOutcome,
 			State: session.State, Reason: steerForecastReason(session), Delivery: session.State,
 			Active: []ticketclient.Ticket{}, repositoryPath: registration.RepositoryPath, deliveryCode: session.Code,
 			filters: filters,
+		}
+		if session.TargetQueue == "hold" {
+			owner.HoldTicket, owner.HoldOutcome = session.Ticket, session.Code
 		}
 		if queue == "" {
 			owner.Reason = "role policy unavailable"
@@ -378,6 +388,9 @@ func steerForecastReason(session daemon.SteerStatus) string {
 	if session.State == "degraded" || session.PersistenceCode != "" {
 		return "degraded delivery"
 	}
+	if session.TargetQueue == "hold" && session.Ticket != "" {
+		return humanDeliveryCode(session.Code, session.State)
+	}
 	if session.Code == "awaiting_signoff_outcome" {
 		return "awaiting signoff outcome"
 	}
@@ -421,7 +434,7 @@ func renderQueueForecast(out io.Writer, owners []queueForecastOwner) error {
 		rowCount += len(rowsByRepository[repositoryID])
 	}
 	if rowCount == 0 {
-		_, _ = io.WriteString(out, "\nNo non-terminal tickets.\n\n")
+		_, _ = io.WriteString(out, "\nNo active or forecast primary tickets.\n\n")
 		writeSignoffForecastDiagnostics(out, owners)
 		return nil
 	}
@@ -455,6 +468,14 @@ func renderQueueForecast(out io.Writer, owners []queueForecastOwner) error {
 }
 
 func writeSignoffForecastDiagnostics(out io.Writer, owners []queueForecastOwner) {
+	for _, owner := range owners {
+		if owner.HoldQueue {
+			fmt.Fprintf(out, "Hold input %s: enabled (unassigned only; primary %s).\n", consoleField(owner.Owner), consoleField(owner.Queue))
+		}
+		if owner.HoldTicket != "" {
+			fmt.Fprintf(out, "Last hold assessment %s: %s (%s).\n", consoleField(owner.Owner), consoleField(owner.HoldTicket), consoleField(owner.HoldOutcome))
+		}
+	}
 	for _, owner := range owners {
 		if owner.Queue == "signoff" && owner.Kind == "steer" && owner.Reason != "" {
 			fmt.Fprintf(out, "Signoff owner %s: %s.\n", consoleField(owner.Owner), consoleField(owner.Reason))

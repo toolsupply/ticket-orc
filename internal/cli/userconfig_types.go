@@ -66,6 +66,7 @@ type DefaultsFileConfig struct {
 
 type RoleFileConfig struct {
 	TicketQueue                string                      `json:"ticket_queue"`
+	HoldQueue                  bool                        `json:"hold_queue,omitempty"`
 	TicketTags                 []string                    `json:"ticket_tags"`
 	TicketWithoutTags          []string                    `json:"ticket_without_tags"`
 	NudgePrompt                string                      `json:"nudge_prompt"`

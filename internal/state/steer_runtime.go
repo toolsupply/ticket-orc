@@ -15,10 +15,10 @@ import (
 )
 
 const steerRuntimeFileName = "steer-runtime.json"
-const steerRuntimeFileVersion = 4
+const steerRuntimeFileVersion = 5
 
 // SteerDelivery records Orc's notification state for one registration
-// incarnation and an optional outstanding signoff target.
+// incarnation and an optional outstanding signoff or owned hold target.
 type SteerDelivery struct {
 	RepositoryID   string `json:"repository_id"`
 	Actor          string `json:"actor"`
@@ -28,6 +28,8 @@ type SteerDelivery struct {
 	State          string `json:"state"`
 	Code           string `json:"code,omitempty"`
 	TargetTicket   string `json:"target_ticket,omitempty"`
+	// TargetQueue records the task state at reservation, independent of later policy.
+	TargetQueue string `json:"target_queue,omitempty"`
 	// BootstrapPending persists the one-time introduction for this session.
 	BootstrapPending bool      `json:"bootstrap_pending,omitempty"`
 	RecoveryPending  bool      `json:"recovery_pending,omitempty"`
@@ -89,9 +91,14 @@ func (s *SteerRuntimeStore) Reconcile(ctx context.Context, registrations []Steer
 			bootstrapPending := d.BootstrapPending || d.SessionID != reg.SessionID
 			d.IncarnationID = reg.IncarnationID
 			d.SessionID = reg.SessionID
-			d.State = "none"
-			d.Code = ""
-			d.TargetTicket = ""
+			// Hold ownership may predate an accepted or uncertain delivery.
+			// Replacement never grants permission to execute it again.
+			if d.TargetQueue != "hold" {
+				d.State = "none"
+				d.Code = ""
+				d.TargetTicket = ""
+				d.TargetQueue = ""
+			}
 			d.BootstrapPending = bootstrapPending
 			d.RecoveryPending = recoveryPending
 			d.UpdatedAt = time.Now().UTC()
@@ -105,6 +112,10 @@ func (s *SteerRuntimeStore) Reconcile(ctx context.Context, registrations []Steer
 				BootstrapPending: bootstrapPending,
 				RecoveryPending:  recoveryPending,
 				UpdatedAt:        time.Now().UTC(),
+			}
+			if hadPrevious && previous.TargetQueue == "hold" && previous.TargetTicket != "" {
+				d.TargetTicket, d.TargetQueue = previous.TargetTicket, previous.TargetQueue
+				d.State, d.Code = previous.State, previous.Code
 			}
 		}
 		next.Deliveries = append(next.Deliveries, d)
@@ -153,15 +164,19 @@ func (s *SteerRuntimeStore) ConfirmNoActiveClaim(ctx context.Context, registrati
 	return s.update(ctx, registration, "", "", false, false, true)
 }
 
-// ReserveSignoffTarget persists a sending intent before transport is called.
+// ReserveSignoffTarget persists an exact signoff or hold intent
+// before transport is called. A generic outstanding wake also blocks reservation.
 // It returns true only when this call newly reserves the target for the exact
 // current registration incarnation; an existing target suppresses another
 // send, even when it is the same ticket.
-func (s *SteerRuntimeStore) ReserveSignoffTarget(ctx context.Context, registration SteerRegistration, ticketID string) (bool, error) {
+func (s *SteerRuntimeStore) ReserveSignoffTarget(ctx context.Context, registration SteerRegistration, ticketID, targetQueue string) (bool, error) {
 	if err := validateSignoffTarget(registration, ticketID); err != nil {
 		return false, err
 	}
-	return s.updateSignoffTarget(ctx, registration, ticketID, "reserve", false, false)
+	if targetQueue != "signoff" && targetQueue != "hold" {
+		return false, fmt.Errorf("exact target_queue must be signoff or hold, got %q", targetQueue)
+	}
+	return s.updateSignoffTarget(ctx, registration, ticketID, targetQueue, "reserve", false, false)
 }
 
 // CompleteSignoffDelivery records accepted transport delivery while retaining
@@ -176,17 +191,17 @@ func (s *SteerRuntimeStore) CompleteSignoffDeliveryWithIntents(ctx context.Conte
 	if err := validateSignoffTarget(registration, ticketID); err != nil {
 		return false, err
 	}
-	return s.updateSignoffTarget(ctx, registration, ticketID, "complete", bootstrap, recovery)
+	return s.updateSignoffTarget(ctx, registration, ticketID, "", "complete", bootstrap, recovery)
 }
 
-// RejectSignoffDelivery atomically retires a definitely rejected target and
+// RejectSignoffDelivery retains an owned hold target or retires a signoff and
 // records the existing one-attempt degraded state, preventing a later pass
 // from reserving and resending it after a partial two-write transition.
 func (s *SteerRuntimeStore) RejectSignoffDelivery(ctx context.Context, registration SteerRegistration, ticketID string) (bool, error) {
 	if err := validateSignoffTarget(registration, ticketID); err != nil {
 		return false, err
 	}
-	return s.updateSignoffTarget(ctx, registration, ticketID, "reject", false, false)
+	return s.updateSignoffTarget(ctx, registration, ticketID, "", "reject", false, false)
 }
 
 // ClearSignoffTarget retires a resolved target for the exact registration
@@ -195,7 +210,7 @@ func (s *SteerRuntimeStore) ClearSignoffTarget(ctx context.Context, registration
 	if err := validateSignoffTarget(registration, ticketID); err != nil {
 		return false, err
 	}
-	return s.updateSignoffTarget(ctx, registration, ticketID, "clear", false, false)
+	return s.updateSignoffTarget(ctx, registration, ticketID, "", "clear", false, false)
 }
 
 func validateSignoffTarget(registration SteerRegistration, ticketID string) error {
@@ -223,7 +238,7 @@ func validSignoffTargetTicketID(ticketID string) bool {
 	return true
 }
 
-func (s *SteerRuntimeStore) updateSignoffTarget(ctx context.Context, registration SteerRegistration, ticketID, operation string, bootstrap, recovery bool) (bool, error) {
+func (s *SteerRuntimeStore) updateSignoffTarget(ctx context.Context, registration SteerRegistration, ticketID, targetQueue, operation string, bootstrap, recovery bool) (bool, error) {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return false, errors.New("steer runtime directory must not be empty")
 	}
@@ -263,10 +278,11 @@ func (s *SteerRuntimeStore) updateSignoffTarget(ctx context.Context, registratio
 		}
 		switch operation {
 		case "reserve":
-			if delivery.TargetTicket != "" || (delivery.State == "degraded" && delivery.Code == "queue_rejected") {
+			if delivery.TargetTicket != "" || delivery.State != "none" {
 				return false, nil
 			}
 			delivery.TargetTicket = ticketID
+			delivery.TargetQueue = targetQueue
 			delivery.State = "sending"
 			delivery.Code = ""
 		case "complete":
@@ -288,13 +304,19 @@ func (s *SteerRuntimeStore) updateSignoffTarget(ctx context.Context, registratio
 				return false, nil
 			}
 			delivery.TargetTicket = ""
+			delivery.TargetQueue = ""
 			delivery.State = "none"
 			delivery.Code = ""
 		case "reject":
 			if delivery.TargetTicket != ticketID || delivery.State != "sending" {
 				return false, nil
 			}
-			delivery.TargetTicket = ""
+			// A rejected hold send still leaves Ticket assigned. Preserve its
+			// exact target evidence for operator reconciliation, never resend.
+			if delivery.TargetQueue != "hold" {
+				delivery.TargetTicket = ""
+				delivery.TargetQueue = ""
+			}
 			delivery.State = "degraded"
 			delivery.Code = "queue_rejected"
 		default:
@@ -389,16 +411,45 @@ func (s *SteerRuntimeStore) loadUnlocked() (SteerRuntimeSnapshot, error) {
 		return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	switch version.Version {
-	case steerRuntimeFileVersion:
+	case steerRuntimeFileVersion, 4:
 		var snapshot SteerRuntimeSnapshot
 		if err := decodeStrictStateJSON(data, &snapshot); err != nil {
 			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		// Inspect field presence as well as values: target_queue is absent in
+		// published v4 and on v5 ordinary notifications, even if empty/null.
+		var fields struct {
+			Deliveries []map[string]json.RawMessage `json:"deliveries"`
+		}
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		for index, delivery := range snapshot.Deliveries {
+			_, hasQueue := fields.Deliveries[index]["target_queue"]
+			if version.Version == 4 && hasQueue {
+				return SteerRuntimeSnapshot{}, fmt.Errorf("%w: steer runtime v4 delivery %d must not contain target_queue", ErrMalformed, index)
+			}
+			if version.Version == steerRuntimeFileVersion && delivery.TargetTicket == "" && hasQueue {
+				return SteerRuntimeSnapshot{}, fmt.Errorf("%w: delivery %d target_queue must be absent without target_ticket", ErrMalformed, index)
+			}
+		}
+		if version.Version == 4 {
+			// Published v4 dispatched only signoff targets. An operator must
+			// reconcile any ambiguous records from the unpublished c56f0f8
+			// candidate before upgrade; current Ticket state cannot infer origin.
+			snapshot.Version = steerRuntimeFileVersion
+			snapshot.migrated = true
+			for index := range snapshot.Deliveries {
+				if snapshot.Deliveries[index].TargetTicket != "" {
+					snapshot.Deliveries[index].TargetQueue = "signoff"
+				}
+			}
 		}
 		if err := validateSteerRuntimeSnapshot(snapshot); err != nil {
 			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
 		return snapshot, nil
-	case steerRuntimeFileVersion - 1:
+	case 3:
 		var previous steerRuntimeSnapshotV3
 		if err := decodeStrictStateJSON(data, &previous); err != nil {
 			return SteerRuntimeSnapshot{}, fmt.Errorf("%w: %v", ErrMalformed, err)
@@ -435,7 +486,7 @@ type steerDeliveryV3 struct {
 }
 
 func validateSteerRuntimeSnapshotV3(snapshot steerRuntimeSnapshotV3) error {
-	if snapshot.Version != steerRuntimeFileVersion-1 {
+	if snapshot.Version != 3 {
 		return fmt.Errorf("unsupported previous steer runtime version %d", snapshot.Version)
 	}
 	if snapshot.Deliveries == nil {
@@ -500,6 +551,12 @@ func validateSteerRuntimeSnapshot(snap SteerRuntimeSnapshot) error {
 	for _, d := range snap.Deliveries {
 		if !isStableTicketRepositoryID(d.RepositoryID) || validateSteerName("actor", d.Actor) != nil || !validSteerRegistrationID(d.RegistrationID) || !validSteerRegistrationID(d.IncarnationID) || validateSteerString("runtime session_id", d.SessionID, maxSteerSessionIDBytes) != nil || d.UpdatedAt.IsZero() || !(d.State == "none" || d.State == "sending" || d.State == "queued" || d.State == "consumed" || d.State == "degraded") || !validSteerRuntimeCode(d.Code) || (d.TargetTicket != "" && !validSignoffTargetTicketID(d.TargetTicket)) {
 			return errors.New("invalid steer runtime delivery")
+		}
+		if d.TargetTicket == "" && d.TargetQueue != "" {
+			return errors.New("target_queue must be absent without target_ticket")
+		}
+		if d.TargetTicket != "" && d.TargetQueue != "signoff" && d.TargetQueue != "hold" {
+			return errors.New("exact target_queue must be signoff or hold")
 		}
 		key := steerDeliveryKey(d.RepositoryID, d.Actor, d.RegistrationID)
 		if seen[key] {

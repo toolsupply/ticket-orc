@@ -295,7 +295,7 @@ func resolveSteerRolePolicies(config FileConfig, lookupEnv envLookup) (map[strin
 		if role.TicketQueue == "review" {
 			reviewSkipTags = canonicalReviewSkipTags(config.Review.SkipTags)
 		}
-		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, QueueFilters: filters, TicketWithoutTags: genericFilters.WithoutTags, ReviewSkipTags: reviewSkipTags, NudgePrompt: nudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
+		steerRoles[name] = steerRolePolicy{TicketQueue: role.TicketQueue, HoldQueue: role.HoldQueue, QueueFilters: filters, TicketWithoutTags: genericFilters.WithoutTags, ReviewSkipTags: reviewSkipTags, NudgePrompt: nudgePrompt, ReviewCompletion: reviewCompletion, MaxBounces: limit, ContainmentActor: orc.ContainmentActor(config.ID)}
 	}
 	return steerRoles, nil
 }

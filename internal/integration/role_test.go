@@ -559,15 +559,15 @@ func TestRoleExecutableHarnessFailureRereadsAndStops(t *testing.T) {
 	if !strings.Contains(result.stderr, "Codex process exited with status 7") && !strings.Contains(result.stderr, "exit status 7") {
 		t.Fatalf("stderr = %q, want harness failure", result.stderr)
 	}
-	if countTicketRequest(ticketLog, "show") != 2 {
-		t.Fatalf("ticket log = %q, want state and readiness observations", readText(ticketLog))
+	if countTicketRequest(ticketLog, "show") != 1 {
+		t.Fatalf("ticket log = %q, want state observation; ended-claim accounting must await outer cleanup", readText(ticketLog))
 	}
 	if len(readCodexCalls(t, codexLog)) != 1 {
 		t.Fatalf("Codex launched more than once: %q", readText(codexLog))
 	}
 }
 
-func TestRoleExecutableReleasesClaimAfterCodexFailsBeforeSession(t *testing.T) {
+func TestRoleExecutableSessionlessCodexFailurePreservesStartedCoderClaim(t *testing.T) {
 	for _, test := range []struct {
 		role  string
 		state string
@@ -587,14 +587,21 @@ func TestRoleExecutableReleasesClaimAfterCodexFailsBeforeSession(t *testing.T) {
 				"TICKET_ORC_FAKE_CODEX_FAIL_BEFORE_SESSION": "1",
 				"TICKET_ORC_FAKE_TICKET_ID":                 integrationTicketID,
 			})
-			if !strings.Contains(result.stderr, "Codex process exited with status 7") || !strings.Contains(result.stderr, "example startup failure") || !strings.Contains(result.stderr, "released unchanged "+test.state+" claim") {
-				t.Fatalf("stderr=%q, want Codex cause and successful claim recovery", result.stderr)
+			if !strings.Contains(result.stderr, "status 7") || !strings.Contains(result.stderr, "example startup failure") {
+				t.Fatalf("stderr=%q, want original Codex failure", result.stderr)
 			}
-			if got := countTicketRequest(ticketLog, "show"); got != 1 {
-				t.Fatalf("show requests=%d log=%q, want authoritative reread", got, readText(ticketLog))
+			wantShows, wantReleases := 1, 0
+			if test.role == "reviewer" {
+				wantShows, wantReleases = 1, 1
 			}
-			if got := countTicketRequest(ticketLog, "release"); got != 1 {
-				t.Fatalf("release requests=%d log=%q, want exactly one claim recovery", got, readText(ticketLog))
+			if strings.Contains(result.stderr, "released unchanged "+test.state+" claim") != (wantReleases == 1) {
+				t.Fatalf("unexpected startup release: %q", result.stderr)
+			}
+			if got := countTicketRequest(ticketLog, "show"); got != wantShows {
+				t.Fatalf("show requests=%d log=%q, want %d authoritative observations", got, readText(ticketLog), wantShows)
+			}
+			if got := countTicketRequest(ticketLog, "release"); got != wantReleases {
+				t.Fatalf("release requests=%d log=%q, want %d", got, readText(ticketLog), wantReleases)
 			}
 			if got := len(readCodexCalls(t, codexLog)); got != 1 {
 				t.Fatalf("Codex calls=%d, want exactly one failed startup", got)

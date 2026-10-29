@@ -957,7 +957,7 @@ func TestRunCoderReleasesUnchangedOpenClaimAfterPreSessionFailure(t *testing.T) 
 	var diagnostics strings.Builder
 	config := coderConfig()
 	config.Diagnostics = &diagnostics
-	err := RunCoder(context.Background(), config, tickets, &fakeCoderHarness{runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
+	err := RunCoder(context.Background(), config, tickets, &fakeCoderHarness{runRes: harness.RunResult{Evidence: &harness.ExecutionEvidence{Process: harness.ProcessOutcome{Start: "not_started"}}}, runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
 	if !errors.Is(err, harnessErr) || !strings.Contains(diagnostics.String(), "released unchanged open claim") || !reflect.DeepEqual(tickets.releases, []string{ticketID}) {
 		t.Fatalf("RunCoder=%v diagnostics=%q releases=%#v", err, diagnostics.String(), tickets.releases)
 	}
@@ -989,7 +989,7 @@ func TestRunCoderPreSessionRecoveryPreservesHarnessAndTicketErrors(t *testing.T)
 				shows:   map[string]ticketclient.Ticket{ticketID: {ID: ticketID, State: "open", Assignee: "coder-1"}},
 				showErr: test.showErr, releaseErr: test.releaseErr, releaseNoop: test.releaseNoop,
 			}
-			err := RunCoder(context.Background(), config, tickets, &fakeCoderHarness{runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
+			err := RunCoder(context.Background(), config, tickets, &fakeCoderHarness{runRes: harness.RunResult{Evidence: &harness.ExecutionEvidence{Process: harness.ProcessOutcome{Start: "not_started"}}}, runErr: harnessErr}, newFakeCoderState(), &fakeCoderCleanup{})
 			if !errors.Is(err, harnessErr) {
 				t.Fatalf("RunCoder=%v, want original harness error", err)
 			}

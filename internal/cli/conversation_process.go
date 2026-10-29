@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/harness/codex"
@@ -87,7 +90,8 @@ func runConversationProcess(ctx context.Context, req harness.ProcessRequest) (ha
 	if err != nil {
 		return harness.ProcessResult{ExitCode: -1}, err
 	}
-	cmd.Stderr = io.Discard
+	// A nil Stderr connects directly to the null device. No copy goroutine
+	// should wait on a discarded stderr pipe inherited by descendants.
 	if err := ctx.Err(); err != nil {
 		return harness.ProcessResult{ExitCode: -1}, err
 	}
@@ -96,11 +100,27 @@ func runConversationProcess(ctx context.Context, req harness.ProcessRequest) (ha
 	}
 	containment, err := attachChildContainment(cmd.Process)
 	if err != nil {
-		_ = forceChildStop(cmd.Process)
-		_ = cmd.Wait()
-		return harness.ProcessResult{ExitCode: -1}, err
+		stopErr := forceChildStop(cmd.Process)
+		waitErr := cmd.Wait()
+		return conversationProcessResult(errors.Join(err, stopErr, waitErr))
 	}
-	defer containment.close()
+	// Output failure and cancellation may both request containment. Once exit
+	// observation reports lost ownership, neither may signal the old identity.
+	var controlMu sync.Mutex
+	owned := true
+	leaderOnly := false
+	var boundaryErr error
+	forceOwned := func() {
+		controlMu.Lock()
+		defer controlMu.Unlock()
+		if owned {
+			if leaderOnly {
+				boundaryErr = errors.Join(boundaryErr, cmd.Process.Kill())
+			} else {
+				boundaryErr = errors.Join(boundaryErr, containment.force(cmd.Process))
+			}
+		}
+	}
 	copyDone := make(chan error, 1)
 	go func() {
 		dst := req.Stdout
@@ -109,7 +129,7 @@ func runConversationProcess(ctx context.Context, req harness.ProcessRequest) (ha
 		}
 		_, err := io.Copy(dst, stdout)
 		if err != nil {
-			_ = containment.force(cmd.Process)
+			forceOwned()
 		}
 		copyDone <- err
 	}()
@@ -119,24 +139,50 @@ func runConversationProcess(ctx context.Context, req harness.ProcessRequest) (ha
 		defer close(cancelDone)
 		select {
 		case <-ctx.Done():
-			_ = containment.force(cmd.Process)
+			forceOwned()
 		case <-stopped:
 		}
 	}()
-	if waitForChildExitBeforeReap(cmd.Process) {
-		_ = containment.forceAfterLeaderExit(cmd.Process)
-	} else {
-		// Failed exit observation cannot justify leaving descendants running.
-		_ = containment.force(cmd.Process)
+	observationErr := waitForChildExitBeforeReap(cmd.Process)
+	lostChild := errors.Is(observationErr, syscall.ECHILD) || errors.Is(observationErr, os.ErrProcessDone)
+	keepControl := observationErr != nil && !lostChild
+	controlMu.Lock()
+	if observationErr == nil {
+		boundaryErr = errors.Join(boundaryErr, containment.forceAfterLeaderExit(cmd.Process))
 	}
-	copyErr := <-copyDone
-	// Join cancellation before reaping so the group identity cannot be reused.
+	// Preserve cancellation while an unobserved child is still owned. Unix
+	// controls must use the exact process handle during cmd.Wait, never its
+	// reusable numeric group. The Windows job handle remains independently owned.
+	leaderOnly = keepControl && runtime.GOOS != "windows"
+	owned = keepControl
+	failedBoundary := boundaryErr != nil || observationErr != nil
+	controlMu.Unlock()
+	if keepControl {
+		// Wait for the live leader with cancellation still enabled. Unlike a
+		// post-exit pipe drain, WaitDelay cannot stop a live process. The final
+		// wait closes stdout after reap, unblocking a retained output reader.
+		err = waitChildProcess(cmd)
+		controlMu.Lock()
+		owned = false
+		controlMu.Unlock()
+	}
 	close(stopped)
 	<-cancelDone
-	err = cmd.Wait()
-	if copyErr != nil {
-		err = copyErr
+	if failedBoundary {
+		// A rejected stop may leave an inherited writer alive. Closing our reader
+		// bounds the output drain; it is not evidence of descendant completion.
+		_ = stdout.Close()
 	}
+	copyErr := <-copyDone
+	if !keepControl {
+		err = waitChildProcess(cmd)
+	}
+	if lostChild {
+		// The forced pipe close is a consequence of lost ownership, not a new
+		// output diagnosis. Keep the authoritative observer and wait errors.
+		copyErr = nil
+	}
+	err = errors.Join(err, copyErr, observationErr, boundaryErr, containment.close())
 	return conversationProcessResult(err)
 }
 

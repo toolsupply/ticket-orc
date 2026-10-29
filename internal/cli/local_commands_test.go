@@ -129,7 +129,7 @@ func TestJoinedSignoffRolesUseFilteredFrontierAndShowOutstandingTarget(t *testin
 			if err := runtime.Reconcile(context.Background(), []state.SteerRegistration{registration}); err != nil {
 				t.Fatal(err)
 			}
-			if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target); err != nil || !reserved {
+			if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target, "signoff"); err != nil || !reserved {
 				t.Fatalf("reserve signoff target=%v err=%v", reserved, err)
 			}
 			if completed, err := runtime.CompleteSignoffDelivery(context.Background(), registration, target); err != nil || !completed {
@@ -204,7 +204,7 @@ func TestSignoffLocalViewsShowDurableSendingTargetAsUncertain(t *testing.T) {
 	if err := runtime.Reconcile(context.Background(), []state.SteerRegistration{registration}); err != nil {
 		t.Fatal(err)
 	}
-	if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target); err != nil || !reserved {
+	if reserved, err := runtime.ReserveSignoffTarget(context.Background(), registration, target, "signoff"); err != nil || !reserved {
 		t.Fatalf("reserve uncertain signoff target=%v err=%v", reserved, err)
 	}
 	runner, _ := fakeTicketRunner("")

@@ -50,6 +50,48 @@ func TestEmptyState(t *testing.T) {
 	}
 }
 
+func TestPublishedV015StateRetainsSessionAndExactAttempt(t *testing.T) {
+	const repository = "12345678-1234-4234-8234-123456789abc"
+	const ticket = "20261024-73376"
+	// Literal published schema: loading it must not require an execution or
+	// recovery journal, nor rewrite its retained session and attempt evidence.
+	data := []byte(`{
+		"version": 2,
+		"sessions": [{"repository":"12345678-1234-4234-8234-123456789abc",
+			"ticket":"20261024-73376","role":"coder","harness":"codex",
+			"owner":"coder-one","id":"retained-session","context_telemetry":{"known":false}}],
+		"ticket_loops": {"12345678-1234-4234-8234-123456789abc\u000020261024-73376": {
+			"repository":"12345678-1234-4234-8234-123456789abc","ticket":"20261024-73376",
+			"stall_count":1,"bounce_count":2,"phase":"active",
+			"claim_state":"open","claim_actor":"coder-actor","attempt_id":9}}
+	}`)
+	dir := t.TempDir()
+	path := filepath.Join(dir, stateFileName)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewForRepository(dir, repository)
+	snapshot, err := store.Read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].ID != "retained-session" || !snapshot.Sessions[0].IsCurrent() {
+		t.Fatalf("published session lost: %+v", snapshot.Sessions)
+	}
+	loop := snapshot.Loops[ticketLoopKey(repository, ticket)]
+	if loop.AttemptID != 9 || loop.ClaimActor != "coder-actor" || loop.ClaimState != "open" || loop.StallCount != 1 || loop.BounceCount != 2 {
+		t.Fatalf("published attempt changed: %+v", loop)
+	}
+	if loaded, err := os.ReadFile(path); err != nil || !bytes.Equal(loaded, data) {
+		t.Fatalf("published state rewritten on read: %s, %v", loaded, err)
+	}
+	for _, name := range []string{"worker-recovery.json", "managed-executions.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("loading published state created %s: %v", name, err)
+		}
+	}
+}
+
 func TestSavedStateUsesInitialPublicSchema(t *testing.T) {
 	ctx := context.Background()
 	store := newStateTestStore(t)

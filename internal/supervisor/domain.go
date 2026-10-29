@@ -4,12 +4,22 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 )
 
 // WorkerFailure is a bounded description of a worker lifecycle failure. It
-// contains domain classifications and identifiers, never process payloads.
+// contains domain classifications, identifiers and bounded sanitized detail,
+// never raw process payloads.
 type WorkerFailure struct {
+	Detail            string
+	OuterProcess      *harness.ProcessOutcome
+	RepositoryID      string
+	Worker            string
+	Role              string
+	Actor             string
+	AttemptID         uint64
+	Execution         *harness.ExecutionEvidence
 	Classification    string
 	Phase             string
 	ExitCode          int

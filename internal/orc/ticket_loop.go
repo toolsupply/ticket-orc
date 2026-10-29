@@ -148,9 +148,16 @@ func containmentMessage(loop state.TicketLoop, heldFrom string) string {
 // ReconcileEndedClaim records a stall only when positive claim evidence is
 // followed by an unassigned, ready ticket in the same lifecycle state.
 func ReconcileEndedClaim(ctx context.Context, store TicketLoopState, reader TicketLoopReader, holder TicketLoopHolder, ticketID string) (state.TicketLoop, error) {
+	return reconcileEndedClaim(ctx, store, reader, holder, ticketID, 0)
+}
+
+func reconcileEndedClaim(ctx context.Context, store TicketLoopState, reader TicketLoopReader, holder TicketLoopHolder, ticketID string, expectedAttempt uint64) (state.TicketLoop, error) {
 	loop, found, err := store.TicketLoop(ctx, ticketID)
 	if err != nil || !found || loop.ClaimState == "" || loop.Phase != state.TicketLoopActive {
 		return loop, err
+	}
+	if expectedAttempt != 0 && loop.AttemptID != expectedAttempt {
+		return loop, nil
 	}
 	detail, err := reader.ShowReadiness(ctx, ticketID)
 	if err != nil {

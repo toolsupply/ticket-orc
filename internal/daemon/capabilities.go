@@ -16,16 +16,17 @@ type Capabilities struct {
 // RepositoryCapabilities describes the repository HTTP surface and its
 // request/response bounds.
 type RepositoryCapabilities struct {
-	Inventory             bool     `json:"inventory"`
-	TicketList            bool     `json:"ticket_list"`
-	TicketDetail          bool     `json:"ticket_detail"`
-	TicketCreate          bool     `json:"ticket_create"`
-	TicketUpdate          bool     `json:"ticket_update"`
-	TicketDelete          bool     `json:"ticket_delete"`
-	TicketActions         []string `json:"ticket_actions"`
-	MaxPageSize           int      `json:"max_page_size"`
-	MaxSearchBytes        int      `json:"max_search_bytes"`
-	TicketBodyBudgetBytes int      `json:"ticket_body_budget_bytes,omitempty"`
+	TicketAttachments     *AttachmentCapabilities `json:"ticket_attachments,omitempty"`
+	Inventory             bool                    `json:"inventory"`
+	TicketList            bool                    `json:"ticket_list"`
+	TicketDetail          bool                    `json:"ticket_detail"`
+	TicketCreate          bool                    `json:"ticket_create"`
+	TicketUpdate          bool                    `json:"ticket_update"`
+	TicketDelete          bool                    `json:"ticket_delete"`
+	TicketActions         []string                `json:"ticket_actions"`
+	MaxPageSize           int                     `json:"max_page_size"`
+	MaxSearchBytes        int                     `json:"max_search_bytes"`
+	TicketBodyBudgetBytes int                     `json:"ticket_body_budget_bytes,omitempty"`
 }
 
 func (s *Server) capabilities() Capabilities {
@@ -37,15 +38,16 @@ func (s *Server) capabilities() Capabilities {
 		WorkerActions: []string{},
 		GroupActions:  []string{},
 		Repositories: RepositoryCapabilities{
-			Inventory:      true,
-			TicketList:     gateway.ListTickets != nil,
-			TicketDetail:   gateway.GetTicket != nil,
-			TicketCreate:   gateway.CreateTicket != nil,
-			TicketUpdate:   gateway.UpdateTicket != nil,
-			TicketDelete:   gateway.DeleteTicket != nil,
-			TicketActions:  []string{},
-			MaxPageSize:    repositoryTicketMaxPageSize,
-			MaxSearchBytes: repositoryTicketMaxSearchBytes,
+			Inventory:         true,
+			TicketAttachments: s.attachmentCapabilities(),
+			TicketList:        gateway.ListTickets != nil,
+			TicketDetail:      gateway.GetTicket != nil,
+			TicketCreate:      gateway.CreateTicket != nil,
+			TicketUpdate:      gateway.UpdateTicket != nil,
+			TicketDelete:      gateway.DeleteTicket != nil,
+			TicketActions:     []string{},
+			MaxPageSize:       repositoryTicketMaxPageSize,
+			MaxSearchBytes:    repositoryTicketMaxSearchBytes,
 		},
 	}
 	if s.config.Logs != nil && s.config.Logs.Inventory != nil {

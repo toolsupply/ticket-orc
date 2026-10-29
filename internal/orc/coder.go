@@ -166,6 +166,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 			return err
 		}
 
+		var attempt state.TicketLoop
 		bounces, err := orchestrationState.BounceCount(ctx, claimed.ID)
 		if err != nil {
 			return fmt.Errorf("read bounce count for %s: %w", claimed.ID, err)
@@ -179,6 +180,7 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 			if err != nil {
 				return fmt.Errorf("record coder claim for %s: %w", claimed.ID, err)
 			}
+			attempt = loop
 			bounces = loop.BounceCount
 			if loop.Phase != state.TicketLoopActive {
 				loopReader, ok := tickets.(TicketLoopReader)
@@ -212,33 +214,44 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		if prepareErr != nil {
 			return fmt.Errorf("prepare coder turn for %s: %w", claimed.ID, prepareErr)
 		}
+		if turn.err != nil && config.Harness == "codex" {
+			// Bind to the claim recorded before launch, never a later state read.
+			turn.err = NewFailureContextError(FailureContext{Origin: "codex", Operation: "managed turn", Ticket: claimed.ID, RepositoryID: attempt.Repository, Worker: config.WorkerName, Role: config.RoleName, Actor: config.Actor, AttemptID: attempt.AttemptID}, turn.err)
+		}
+		postTurnError := func(err error) error {
+			return NewFailureContextError(FailureContext{Origin: "orc", Operation: "post-turn reconciliation", Phase: "post-turn", Ticket: claimed.ID, Worker: config.WorkerName, Role: config.RoleName, Actor: config.Actor, Execution: turn.result.Evidence, RepositoryID: attempt.Repository, AttemptID: attempt.AttemptID}, err)
+		}
 		observed, runErr := tickets.Show(ctx, claimed.ID)
 		turnErr := errors.Join(turn.err, runErr)
 		if runErr != nil {
 			if turn.err != nil && turn.result.SessionID == "" && ctx.Err() == nil {
 				logCoder(config.Diagnostics, "%s: automatic claim recovery skipped because Ticket state could not be verified", claimed.ID)
 			}
-			return turnErr
+			return postTurnError(turnErr)
 		}
-		if attempted, released, recoveryErr := releaseFailedStartupClaim(ctx, tickets, claimed.ID, config.Actor, "open", turn.result, turn.err, observed); attempted {
+		if attempted, released, recoveryErr := releaseFailedCoderStartupClaim(ctx, config.Harness, tickets, claimed.ID, config.Actor, turn.result, turn.err, observed); attempted {
 			if released {
 				logCoder(config.Diagnostics, "%s: failed before session startup; released unchanged open claim", claimed.ID)
 			} else {
 				logCoder(config.Diagnostics, "%s: automatic claim recovery failed after pre-session harness failure", claimed.ID)
 			}
-			return fmt.Errorf("coder turn for %s: %w", claimed.ID, recoveryErr)
+			return postTurnError(fmt.Errorf("coder turn for %s: %w", claimed.ID, recoveryErr))
 		}
 		observed.State = ticketclient.NormalizeLifecycleState(observed.State)
 		emitEvent(config.EventSink, Event{Type: "ticket.lifecycle", Worker: config.WorkerName, Role: config.RoleName, State: observed.State, Ticket: observed.ID})
-		if loopState, ok := orchestrationState.(TicketLoopState); ok {
+		// Descendants of a failed execution may still be live. Defer stall/hold
+		// accounting until the supervisor confirms the outer boundary. Terminal
+		// Ticket cleanup remains authoritative and ticket-wide.
+		deferEndedClaim := turn.err != nil && config.Harness == "codex" && (turn.result.Evidence == nil || turn.result.Evidence.Process.Start != "not_started")
+		if loopState, ok := orchestrationState.(TicketLoopState); ok && !deferEndedClaim {
 			if loopReader, ok := tickets.(TicketLoopReader); ok && observed.State != ticketclient.StateClosed && observed.State != "rejected" {
 				loop, reconcileErr := ReconcileEndedClaim(ctx, loopState, loopReader, config.ContainmentTickets, claimed.ID)
 				if reconcileErr != nil {
-					return errors.Join(turnErr, reconcileErr)
+					return postTurnError(errors.Join(turnErr, reconcileErr))
 				}
 				if loop.Phase == state.TicketLoopContainmentPending || loop.Phase == state.TicketLoopHeld {
 					if turnErr != nil {
-						return fmt.Errorf("coder turn for %s: %w", claimed.ID, turnErr)
+						return postTurnError(fmt.Errorf("coder turn for %s: %w", claimed.ID, turnErr))
 					}
 					// A confirmed hold ends this ticket attempt, not the worker.
 					continue
@@ -247,10 +260,10 @@ func RunCoder(ctx context.Context, config CoderConfig, tickets CoderTickets, age
 		}
 		lifecycleErr := finishCoderLifecycle(ctx, config, tickets, cleanup, observed, turnErr)
 		if lifecycleErr != nil {
-			return errors.Join(turnErr, lifecycleErr)
+			return postTurnError(errors.Join(turnErr, lifecycleErr))
 		}
 		if turnErr != nil {
-			return fmt.Errorf("coder turn for %s: %w", claimed.ID, turnErr)
+			return postTurnError(fmt.Errorf("coder turn for %s: %w", claimed.ID, turnErr))
 		}
 	}
 }

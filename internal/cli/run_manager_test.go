@@ -357,10 +357,17 @@ func TestWorkerManagerPauseSerializesWithStartup(t *testing.T) {
 		<-releaseStarter
 		cmd := exec.Command(os.Args[0], "-test.run=TestMain")
 		cmd.Env = append(os.Environ(), "TICKET_ORC_TEST_CHILD=1", "TICKET_ORC_TEST_CHILD_DIR="+childDir, "TICKET_ORC_WORKER="+worker.Name)
+		configureChildProcess(cmd)
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
-		child := &runChild{worker: worker, cmd: cmd, done: make(chan error, 1), waited: make(chan struct{})}
+		containment, err := attachChildContainment(cmd.Process)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, err
+		}
+		child := &runChild{worker: worker, cmd: cmd, containment: containment, done: make(chan error, 1), waited: make(chan struct{})}
 		go func() {
 			err := cmd.Wait()
 			child.done <- err

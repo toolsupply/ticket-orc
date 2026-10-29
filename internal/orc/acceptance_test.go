@@ -28,6 +28,17 @@ type fakeAcceptanceTickets struct {
 	startErr error
 }
 
+func (f *fakeAcceptanceTickets) HasActiveClaim(_ context.Context, queue string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, item := range f.items {
+		if item.State == queue && item.Assignee == "architect" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeAcceptanceTickets) Show(_ context.Context, id string) (ticketclient.Ticket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -700,32 +711,26 @@ func containsText(value, fragment string) bool { return strings.Contains(value, 
 func assertAcceptanceHoldGuidance(t *testing.T, prompt string) {
 	t.Helper()
 	for _, required := range []string{
-		"outstanding holds",
-		"in the ticket's repository through Ticket public interfaces",
-		"blocker/Handoff and dependencies",
-		"P0 holds",
-		"missing architectural decisions or permissions",
-		"cross-ticket coordination",
-		"held prerequisites of final integration",
-		"circular waits",
-		"without a clear responsible actor",
-		"not narrative similarity",
-		"affected full Ticket IDs",
-		"responsible actor if known, and concrete next action",
-		"assess whether it prevents acceptance",
-		"Do not approve final integration with incomplete prerequisites",
-		"routine external waits",
-		"hold does not itself mean permission is absent",
-		"do not ask again when it is established",
-		"create follow-up tickets",
-		"refine unowned related planning tickets",
-		"correct mistaken dependencies or split work",
-		"Do not remove a genuine prerequisite",
-		"do not take over owned work",
-		"do not require whole-project completion for every component",
-		"Escalate changes to approved scope or architecture",
-		"Record the acceptance decision, outstanding integration work, and planning changes made",
-		"explicit human handoff",
+		"architectural acceptance authority, not as another code reviewer",
+		"entry point into an assessment of the relevant project work",
+		"parent specification, related and dependent tickets, outstanding holds",
+		"Trust the reviewer for routine code-level correctness",
+		"architectural drift, unnecessary complexity, duplicated mechanisms, circular dependencies",
+		"actual Ticket relationships, not narrative similarity",
+		"Prefer simplification and existing project conventions",
+		"Avoid speculative work and duplicate tickets",
+		"amend unowned related tickets",
+		"record findings for owned work without taking it over",
+		"Preserve genuine dependencies",
+		"Planning maintenance does not authorize implementing code",
+		"Honor existing human authorization",
+		"requires authority not already granted",
+		"unresolved material defects",
+		"require whole-project completion only for final integration",
+		"Do not withhold acceptance solely for unrelated improvements",
+		"Process only the dispatched signoff ticket's lifecycle",
+		"do not claim or process additional signoff tickets",
+		"Record the acceptance decision, related planning changes, and outstanding integration work",
 	} {
 		if !strings.Contains(prompt, required) {
 			t.Errorf("acceptance guidance missing %q in %q", required, prompt)

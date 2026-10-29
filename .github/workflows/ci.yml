@@ -29,8 +29,28 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/setup-ticket
       - name: test
-        run: go test -shuffle=on -count=1 ./...
+        shell: bash
+        # The full suite includes the native outer-boundary smoke and the
+        # controlled handoff policy integration; no stale -run selectors.
+        run: |
+          set -o pipefail
+          {
+            git rev-parse HEAD
+            go version
+            go env GOOS GOARCH
+            ticket --version
+            go test -shuffle=on -count=1 ./...
+          } 2>&1 | tee native-tests.log
+      - name: retain native test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-tests-${{ matrix.os }}-${{ github.sha }}
+          path: native-tests.log
+          if-no-files-found: error
+          retention-days: 7
       - name: vet
         run: go vet ./...
 
@@ -45,6 +65,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/setup-ticket
       - name: race test
         run: go test -race -count=1 ./...
 

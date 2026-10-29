@@ -32,9 +32,12 @@ func configureChildProcess(cmd *exec.Cmd) {
 // Object so force stops include descendants, and the supervisor still waits
 // for every child to be reaped before releasing its daemon lock.
 func requestChildStop(process *os.Process) error {
+	if process == nil {
+		return os.ErrProcessDone
+	}
 	return process.Kill()
 }
 
 func forceChildStop(process *os.Process) error {
-	return process.Kill()
+	return requestChildStop(process)
 }

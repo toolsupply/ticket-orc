@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/toolsupply/ticket-orc/internal/attachments"
 	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
@@ -18,6 +19,7 @@ import (
 )
 
 type workerManager struct {
+	attachmentStore   *attachments.Store
 	ctx               context.Context
 	configPath        string
 	localDir          string
@@ -61,6 +63,9 @@ type workerManager struct {
 }
 
 func newWorkerManager(ctx context.Context, config RunConfig, executable string, stdout, stderr io.Writer, transition func(string, supervisor.WorkerState, error)) *workerManager {
+	if config.Runtime != nil {
+		config.Runtime.SetDiagnosticDirectory(config.StateDir)
+	}
 	workers := make(map[string]supervisor.RunWorker, len(config.Workers))
 	for _, worker := range config.Workers {
 		workers[worker.Name] = worker
@@ -119,7 +124,8 @@ func newWorkerManager(ctx context.Context, config RunConfig, executable string, 
 		StartupAttemptError:  manager.startupAttemptError,
 		StartupExited:        manager.reconcileStartupExit,
 		StartupTimedOut:      manager.failStartupReadiness,
-		ClassifyExit:         classifyManagedChildExit,
+		ClassifyExit:         manager.classifyManagedExit,
+		Workspace:            supervisor.ManagedWorkspace,
 		MarkStartupPending:   manager.markStartupResultPending,
 		CompleteStartup:      manager.completeStartupResult,
 		ChildStarted: func(child *runChild) {

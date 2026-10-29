@@ -18,6 +18,11 @@ const (
 )
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
+	// Attachment routes inspect the escaped route before decoding each segment.
+	// URL.Path has already been decoded by net/http.
+	if s.routeAttachments(w, r) {
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1/repositories")
 	if path == "" || path == "/" {
 		if r.Method != http.MethodGet {

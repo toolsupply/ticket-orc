@@ -219,7 +219,7 @@ func TestDynamicSignoffRetirementAndRecoveryTriggerBacklogPass(t *testing.T) {
 		if err := runtime.Reconcile(ctx, []state.SteerRegistration{current}); err != nil {
 			t.Fatal(err)
 		}
-		if reserved, err := runtime.ReserveSignoffTarget(ctx, current, "20261007-12345"); err != nil || !reserved {
+		if reserved, err := runtime.ReserveSignoffTarget(ctx, current, "20261007-12345", "signoff"); err != nil || !reserved {
 			t.Fatalf("seed target reserved=%t err=%v", reserved, err)
 		}
 		if completed, err := runtime.CompleteSignoffDeliveryWithIntents(ctx, current, "20261007-12345", true, false); err != nil || !completed {
@@ -516,7 +516,7 @@ func TestDynamicSignoffClearAndReserveFailuresAreReported(t *testing.T) {
 		if err := inner.Reconcile(ctx, []state.SteerRegistration{current}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := inner.ReserveSignoffTarget(ctx, current, "20261007-12345"); err != nil {
+		if _, err := inner.ReserveSignoffTarget(ctx, current, "20261007-12345", "signoff"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := inner.CompleteSignoffDelivery(ctx, current, "20261007-12345"); err != nil {

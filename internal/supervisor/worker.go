@@ -52,6 +52,7 @@ type RoleConfig struct {
 	Role                       Role
 	RoleName                   string
 	TicketQueue                string
+	HoldQueue                  bool
 	Harness                    string
 	Actor                      string
 	Model                      string

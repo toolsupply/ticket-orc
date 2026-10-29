@@ -2,12 +2,16 @@ package cli
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
+	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/orc"
 	"github.com/toolsupply/ticket-orc/internal/state"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/terminaltext"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
 )
 
@@ -27,6 +31,11 @@ func classifyWorkerFailureError(err error) *supervisor.WorkerFailure {
 func classifyWorkerFailureWithEnvelope(err error, envelope *orc.Failure) *supervisor.WorkerFailure {
 	if envelope != nil && strings.TrimSpace(envelope.Classification) != "" {
 		failure := &supervisor.WorkerFailure{
+			Detail:       terminaltext.Diagnostic(envelope.Detail),
+			RepositoryID: safeFailureRepository(envelope.RepositoryID),
+			Worker:       optionalFailureToken(envelope.Worker), Role: optionalFailureToken(envelope.Role),
+			Actor: safeFailureActor(envelope.Actor), AttemptID: envelope.AttemptID,
+			Execution:         boundedExecution(envelope.Execution),
 			Classification:    safeFailureToken(envelope.Classification),
 			Phase:             safeFailurePhase(envelope.Phase),
 			ExitCode:          envelope.ExitCode,
@@ -50,24 +59,67 @@ func classifyWorkerFailureWithEnvelope(err error, envelope *orc.Failure) *superv
 			failure = &supervisor.WorkerFailure{Classification: "worker_error"}
 		}
 		metadata := contextErr.Context
-		if metadata.Phase != "" {
+		if metadata.Phase != "" && failure.Execution == nil {
 			failure.Phase = safeFailurePhase(metadata.Phase)
 		}
-		if metadata.Origin != "" {
+		if metadata.Origin != "" && failure.Execution == nil {
 			failure.Origin = safeFailureToken(metadata.Origin)
 		}
-		if metadata.Operation != "" {
+		if metadata.Operation != "" && failure.Execution == nil {
 			failure.Operation = safeFailureOperation(metadata.Operation)
 		}
 		if metadata.Ticket != "" {
 			failure.Ticket = optionalFailureTicket(metadata.Ticket)
 		}
 		failure.Contained = failure.Contained || metadata.Contained
+		if failure.RepositoryID == "" {
+			failure.RepositoryID = safeFailureRepository(metadata.RepositoryID)
+		}
+		if failure.Worker == "" {
+			failure.Worker = optionalFailureToken(metadata.Worker)
+		}
+		if failure.Role == "" {
+			failure.Role = optionalFailureToken(metadata.Role)
+		}
+		if failure.Actor == "" {
+			failure.Actor = safeFailureActor(metadata.Actor)
+		}
+		if failure.AttemptID == 0 {
+			failure.AttemptID = metadata.AttemptID
+		}
+		if failure.Execution == nil {
+			failure.Execution = boundedExecution(metadata.Execution)
+		}
 		return failure
 	}
 	failure := &supervisor.WorkerFailure{Phase: "worker operation"}
 	if err == nil {
 		failure.Classification = "silent_exit"
+		return failure
+	}
+	var executionErr *harness.ExecutionError
+	if errors.As(err, &executionErr) && executionErr.Harness == "codex" && executionErr.Result.Evidence != nil {
+		failure.Execution = boundedExecution(executionErr.Result.Evidence)
+		evidence := failure.Execution
+		failure.Origin, failure.Operation, failure.Phase = "codex", "managed turn", evidence.Phase
+		failure.Classification = "harness_execution_failed"
+		switch {
+		case evidence.Process.Cancellation != "none" && evidence.Process.Cancellation != "unknown":
+			failure.Classification = "harness_canceled"
+		case evidence.Process.Start == "not_started":
+			failure.Classification = "harness_start_failed"
+		case evidence.Process.ExitObserved && (evidence.Process.ExitCode != 0 || evidence.Process.Signal != 0):
+			failure.Classification = "harness_process_failed"
+		case evidence.ProtocolFailed:
+			failure.Classification = "harness_protocol_failed"
+		case evidence.OutputFailed:
+			failure.Classification = "harness_output_failed"
+		case evidence.ProviderFailed:
+			failure.Classification = "harness_turn_failed"
+		}
+		if evidence.Process.ExitObserved {
+			failure.NestedExitCode = evidence.Process.ExitCode
+		}
 		return failure
 	}
 	if errors.Is(err, ErrWorkerLeaseConflict) {
@@ -114,6 +166,18 @@ func classifyWorkerFailureWithEnvelope(err error, envelope *orc.Failure) *superv
 
 func classifyManagedChildExit(child *runChild, err error) supervisor.ExitOutcome {
 	failure := classifyWorkerFailureWithEnvelope(err, child.failureEnvelope())
+	failure.OuterProcess = child.observedProcess(err)
+	// OuterProcess is authoritative for the worker's OS exit. Legacy envelope
+	// codes may describe a distinct Ticket command and remain compatible.
+	if failure.Detail == "" {
+		failure.Detail = terminaltext.Diagnostic(child.stderrDetail())
+		if failure.Detail == "" {
+			failure.Detail = safeRetainedFailureDetail(workerWaitExplanation(err))
+		}
+		if failure.Detail == "" {
+			failure.Detail = "no underlying explanation was captured"
+		}
+	}
 	if workerLeaseConflictExit(err) {
 		failure.Classification = "lease_conflict"
 		failure.Phase = "lease acquisition"
@@ -161,7 +225,11 @@ func mergeChildExitStatus(failure *supervisor.WorkerFailure, err error) {
 	// the process status. Once the supervisor has reaped the child, a
 	// nonnegative process status is authoritative; preserve positive transport
 	// statuses that describe a distinct command failure.
-	if failure.NestedExitCode != 0 && exitErr.ExitCode() >= 0 {
+	if failure.Execution != nil {
+		// The wait result here belongs to the outer Orc worker. Its signal and
+		// exit code must never overwrite the nested execution evidence.
+		failure.ExitCode = exitErr.ExitCode()
+	} else if failure.NestedExitCode != 0 && exitErr.ExitCode() >= 0 {
 		failure.ExitCode = exitErr.ExitCode()
 	} else if exitErr.ExitCode() >= 0 && failure.ExitCode <= 0 {
 		failure.ExitCode = exitErr.ExitCode()
@@ -177,6 +245,9 @@ func roleFailureEnvelope(err error) *orc.Failure {
 		return nil
 	}
 	return &orc.Failure{
+		Detail:       safeRetainedFailureDetail(err),
+		RepositoryID: failure.RepositoryID, Worker: failure.Worker, Role: failure.Role,
+		Actor: failure.Actor, AttemptID: failure.AttemptID, Execution: failure.Execution,
 		Classification:    failure.Classification,
 		Phase:             failure.Phase,
 		ExitCode:          failure.ExitCode,
@@ -190,6 +261,51 @@ func roleFailureEnvelope(err error) *orc.Failure {
 		Ticket:            failure.Ticket,
 		Remediation:       failure.Remediation,
 	}
+}
+
+func boundedExecution(evidence *harness.ExecutionEvidence) *harness.ExecutionEvidence {
+	if evidence == nil {
+		return nil
+	}
+	copy := evidence.Bounded()
+	return &copy
+}
+
+func safeFailureRepository(value string) string {
+	if !ticketclient.ValidRepositoryID(value) {
+		return ""
+	}
+	return value
+}
+
+func safeFailureActor(value string) string {
+	if ticketclient.ValidateActor(value) != nil {
+		return ""
+	}
+	return value
+}
+
+func executionFailureDetail(evidence *harness.ExecutionEvidence) string {
+	if evidence == nil {
+		return ""
+	}
+	e := evidence.Bounded()
+	detail := fmt.Sprintf("harness_start=%s", e.Process.Start)
+	if e.LogID != "" {
+		detail += " harness_log=logs/" + e.LogID
+	}
+	if e.Process.ExitObserved {
+		detail += fmt.Sprintf(" harness_exit_code=%d", e.Process.ExitCode)
+	} else {
+		detail += " harness_exit=unknown"
+	}
+	if e.Process.Signal != 0 {
+		detail += fmt.Sprintf(" nested_signal=%d", e.Process.Signal)
+	}
+	if e.Process.Cancellation != "none" {
+		detail += " cancellation=" + e.Process.Cancellation
+	}
+	return detail
 }
 
 func emitRoleFailure(sink orc.EventSink, worker, role string, err error) {
@@ -275,4 +391,43 @@ func safeFailureRemediation(value string) string {
 		}
 	}
 	return value
+}
+
+func safeRetainedFailureDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	detail := terminaltext.Diagnostic(err.Error())
+	if errors.Is(err, os.ErrPermission) {
+		detail += "; filesystem permission denied"
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		detail += "; filesystem entry missing"
+	}
+	if len(detail) > terminaltext.DiagnosticDetailBytes {
+		return terminaltext.Diagnostic(detail)
+	}
+	return detail
+}
+
+// An OS wait status reports what happened, not why. Strip only typed exit
+// results (including inside errors.Join); preserve independent observer or
+// containment errors without interpreting their text.
+func workerWaitExplanation(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := err.(*exec.ExitError); ok {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var causes []error
+		for _, cause := range joined.Unwrap() {
+			if explanation := workerWaitExplanation(cause); explanation != nil {
+				causes = append(causes, explanation)
+			}
+		}
+		return errors.Join(causes...)
+	}
+	return err
 }

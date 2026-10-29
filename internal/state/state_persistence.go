@@ -91,6 +91,10 @@ func (s *Store) loadUnlocked() (Snapshot, error) {
 }
 
 func readBoundedStateFile(path string) ([]byte, error) {
+	return readBoundedStateFileLimit(path, maxStateBytes)
+}
+
+func readBoundedStateFileLimit(path string, limit int64) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -101,8 +105,8 @@ func readBoundedStateFile(path string) ([]byte, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("state file must be a regular file: %s", path)
 	}
-	if info.Size() > maxStateBytes {
-		return nil, fmt.Errorf("%w: state file %s exceeds %d bytes", ErrMalformed, path, maxStateBytes)
+	if info.Size() > limit {
+		return nil, fmt.Errorf("%w: state file %s exceeds %d bytes", ErrMalformed, path, limit)
 	}
 	file, err := openStateFile(path)
 	if err != nil {
@@ -119,12 +123,12 @@ func readBoundedStateFile(path string) ([]byte, error) {
 	if !os.SameFile(info, openedInfo) {
 		return nil, fmt.Errorf("state file changed while opening: %s", path)
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maxStateBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read state file %s: %w", path, err)
 	}
-	if len(data) > maxStateBytes {
-		return nil, fmt.Errorf("%w: state file %s exceeds %d bytes", ErrMalformed, path, maxStateBytes)
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%w: state file %s exceeds %d bytes", ErrMalformed, path, limit)
 	}
 	return data, nil
 }

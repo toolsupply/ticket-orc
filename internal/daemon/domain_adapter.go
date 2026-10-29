@@ -1,6 +1,9 @@
 package daemon
 
-import "github.com/toolsupply/ticket-orc/internal/supervisor"
+import (
+	"github.com/toolsupply/ticket-orc/internal/supervisor"
+	"github.com/toolsupply/ticket-orc/internal/ticketclient"
+)
 
 // MutationResultDTO converts a supervisor outcome to the stable HTTP response
 // shape. The supervisor model deliberately carries no serialization tags.
@@ -58,6 +61,9 @@ func WorkerFailureDTO(failure *supervisor.WorkerFailure) *WorkerFailure {
 		return nil
 	}
 	return &WorkerFailure{
+		Detail: failure.Detail, OuterProcess: failure.OuterProcess,
+		RepositoryID: failure.RepositoryID, Worker: failure.Worker, Role: failure.Role,
+		Actor: failure.Actor, AttemptID: failure.AttemptID, Execution: failure.Execution,
 		Classification: failure.Classification, Phase: failure.Phase,
 		ExitCode: failure.ExitCode, NestedExitCode: failure.NestedExitCode,
 		Signal: failure.Signal, Contained: failure.Contained, Origin: failure.Origin,
@@ -81,10 +87,22 @@ func RepositoryStatusDTO(status supervisor.RepositoryStatus) RepositoryStatus {
 // identifiers into the public event envelope. It has no free-form Ticket
 // message field to serialize.
 func RuntimeEventDTO(event supervisor.RuntimeEvent) Event {
+	actor := ""
+	if ticketclient.ValidateActor(event.Actor) == nil {
+		actor = event.Actor
+	}
 	return Event{
-		Type: event.Type, Worker: event.Worker, Role: event.Role, State: event.State,
+		Actor: actor,
+		Type:  event.Type, Worker: event.Worker, Role: event.Role, State: event.State,
 		Phase: event.Phase, Code: event.Code, Ticket: event.Ticket,
 		RepositoryID: event.RepositoryID, RepositoryKey: event.RepositoryKey,
 		Applied: event.Applied, Failure: WorkerFailureDTO(event.Failure),
 	}
+}
+
+func LatestFailureDTO(record *supervisor.LatestFailure) *LatestFailure {
+	if record == nil {
+		return nil
+	}
+	return &LatestFailure{ObservedAt: record.ObservedAt, Reference: record.Reference, Failure: WorkerFailureDTO(&record.Failure)}
 }

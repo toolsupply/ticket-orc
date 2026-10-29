@@ -53,6 +53,7 @@ const (
 
 // RunResult describes the harness process and parsed session identity.
 type RunResult struct {
+	Evidence            *ExecutionEvidence
 	SessionID           string
 	SessionOutcome      SessionOutcome
 	ContextTelemetry    contextheadroom.Telemetry

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
+	"github.com/toolsupply/ticket-orc/internal/attachments"
 	"github.com/toolsupply/ticket-orc/internal/daemon"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 	"github.com/toolsupply/ticket-orc/internal/ticketclient"
@@ -21,14 +23,30 @@ func (m *workerManager) repositoryGateway() daemon.RepositoryGateway {
 	if m == nil {
 		return daemon.RepositoryGateway{}
 	}
+	m.configMu.Lock()
+	if m.attachmentStore == nil {
+		m.attachmentStore = attachments.NewStore()
+	}
+	store := m.attachmentStore
+	m.configMu.Unlock()
 	return daemon.RepositoryGateway{
-		ListTickets:           m.listRepositoryTickets,
-		GetTicket:             m.getRepositoryTicket,
-		CreateTicket:          m.createRepositoryTicket,
-		UpdateTicket:          m.updateRepositoryTicket,
-		MutateTicket:          m.mutateRepositoryTicket,
-		DeleteTicket:          m.deleteRepositoryTicket,
-		TicketBodyBudgetBytes: ticketclient.RepositoryDetailBodyBudgetBytes,
+		ListAttachments: m.listRepositoryAttachments,
+		ReadAttachment: func(ctx context.Context, repo, id, path string) (daemon.RepositoryAttachmentContent, error) {
+			return m.readRepositoryAttachment(ctx, store, repo, id, path)
+		},
+		WriteAttachment: func(ctx context.Context, repo, id string, req daemon.RepositoryAttachmentRequest, body io.Reader, length int64, beginCommit attachments.CommitContext) (attachments.Receipt, error) {
+			return m.writeRepositoryAttachment(ctx, store, repo, id, req, body, length, beginCommit)
+		},
+		CreateAttachmentDirectory: m.createRepositoryAttachmentDirectory,
+		MoveAttachment:            m.moveRepositoryAttachment,
+		DeleteAttachment:          m.deleteRepositoryAttachment,
+		ListTickets:               m.listRepositoryTickets,
+		GetTicket:                 m.getRepositoryTicket,
+		CreateTicket:              m.createRepositoryTicket,
+		UpdateTicket:              m.updateRepositoryTicket,
+		MutateTicket:              m.mutateRepositoryTicket,
+		DeleteTicket:              m.deleteRepositoryTicket,
+		TicketBodyBudgetBytes:     ticketclient.RepositoryDetailBodyBudgetBytes,
 	}
 }
 

@@ -70,12 +70,12 @@ func executeInit(args []string, stdout, stderr io.Writer, lookupEnv envLookup) i
 		Version: 1, ID: id, DefaultRole: "coder",
 		Roles: map[string]initRoleFile{
 			"coder":    {TicketQueue: "open", NudgePrompt: coderNudgePrompt},
-			"reviewer": {TicketQueue: "review", NudgePrompt: reviewerNudgePrompt, ReviewCompletion: ReviewCompletionClose},
+			"reviewer": {TicketQueue: "review", HoldQueue: true, NudgePrompt: reviewerNudgePrompt, ReviewCompletion: ReviewCompletionClose},
 		},
 	}
 	if architect {
 		config.Roles["reviewer"] = initRoleFile{TicketQueue: "review", NudgePrompt: reviewerNudgePrompt, ReviewCompletion: ReviewCompletionSignoff}
-		config.Roles["architect"] = initRoleFile{TicketQueue: "signoff", NudgePrompt: architectNudgePrompt}
+		config.Roles["architect"] = initRoleFile{TicketQueue: "signoff", HoldQueue: true, NudgePrompt: architectNudgePrompt}
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -249,6 +249,7 @@ func ensureSecureInstanceDir(dir string) error {
 
 type initRoleFile struct {
 	TicketQueue      string `json:"ticket_queue"`
+	HoldQueue        bool   `json:"hold_queue,omitempty"`
 	NudgePrompt      string `json:"nudge_prompt"`
 	ReviewCompletion string `json:"review_completion,omitempty"`
 }

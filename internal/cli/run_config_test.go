@@ -48,6 +48,7 @@ func TestLaunchSnapshotComparisonIncludesResolvedLaunchPolicy(t *testing.T) {
 	}{
 		{name: "actor", change: func(worker *supervisor.RunWorker) { worker.Config.Actor = "changed" }},
 		{name: "configured role", change: func(worker *supervisor.RunWorker) { worker.Config.RoleName = "changed" }},
+		{name: "hold queue", change: func(worker *supervisor.RunWorker) { worker.Config.HoldQueue = true }},
 		{name: "ticket queue", change: func(worker *supervisor.RunWorker) { worker.Config.TicketQueue = "review" }},
 		{name: "ticket selectors", change: func(worker *supervisor.RunWorker) { worker.Config.TicketTags = "backend" }},
 		{name: "review exclusions", change: func(worker *supervisor.RunWorker) { worker.Config.ReviewSkipTags = "no-review" }},

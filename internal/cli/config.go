@@ -393,6 +393,7 @@ func resolveRoleConfig(role supervisor.Role, values map[string]string, loaded Lo
 		Role:                       role,
 		RoleName:                   roleName,
 		TicketQueue:                roleDefaults.TicketQueue,
+		HoldQueue:                  roleDefaults.HoldQueue,
 		Harness:                    value("harness", "TICKET_ORC_HARNESS", workerString(worker, func(w WorkerFileConfig) string { return w.Harness }), roleDefaults.Harness, loaded.Config.Defaults.Harness, defaultHarness),
 		Actor:                      value("actor", "TICKET_ORC_ACTOR", workerString(worker, func(w WorkerFileConfig) string { return w.Actor }), roleDefaults.Actor, "", defaultActor),
 		Model:                      value("model", "TICKET_ORC_MODEL", workerString(worker, func(w WorkerFileConfig) string { return w.Model }), roleDefaults.Model, loaded.Config.Defaults.Model, ""),

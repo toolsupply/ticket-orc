@@ -299,7 +299,7 @@ func runSupervisor(ctx context.Context, config RunConfig, executable string, std
 		if config.steerStatus != nil && len(config.steerStatus.snapshot()) != 0 {
 			sessions = config.steerStatus.snapshot()
 		}
-		status := runtimeDaemonStatus(config.Runtime, sessions)
+		status := runtimeDaemonStatusWithSteerPolicies(config.Runtime, sessions, config.steerPolicies)
 		renderServiceReady(stderr, config.ConfigPath, listenerAddress, status)
 	}
 	if config.Interactive {

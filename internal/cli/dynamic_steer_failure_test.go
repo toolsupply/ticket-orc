@@ -394,7 +394,7 @@ func TestDynamicSignoffObservationDiagnostics(t *testing.T) {
 				if err := persistence.Reconcile(ctx, []state.SteerRegistration{reg}); err != nil {
 					t.Fatal(err)
 				}
-				if ok, err := persistence.ReserveSignoffTarget(ctx, reg, target); err != nil || !ok {
+				if ok, err := persistence.ReserveSignoffTarget(ctx, reg, target, "signoff"); err != nil || !ok {
 					t.Fatalf("reserve=%v err=%v", ok, err)
 				}
 			}
@@ -407,7 +407,7 @@ func TestDynamicSignoffObservationDiagnostics(t *testing.T) {
 				}), statuses, persistence, nil, nil, nil)
 			runner.bootstrap(ctx)
 			items := statuses.snapshot()
-			wantOperation := "show signoff target"
+			wantOperation := "show exact target"
 			if stage == "active claims" || stage == "final claim" {
 				wantOperation = "active claims open"
 			}

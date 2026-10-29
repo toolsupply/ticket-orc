@@ -3,6 +3,7 @@ package ticketclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -233,4 +234,148 @@ func appendMessageFlag(args *[]string, message string) {
 	if message != "" {
 		*args = append(*args, "--message", message)
 	}
+}
+
+// AcquireHold authorizes exactly one assessment by atomically selecting an
+// unassigned hold and assigning it to this client's existing actor. A prior
+// same-actor assignment is never execution authority. Errors are not retryable:
+// the attached reread is diagnostic evidence only, never permission to launch.
+func (c *Client) AcquireHold(ctx context.Context, id string, filters QueueFilters) (*Ticket, error) {
+	if err := validateFullID(id); err != nil {
+		return nil, err
+	}
+	filters, err := CanonicalQueueFilters(filters)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"query", "id:" + id, "state:hold", "unclaimed"}
+	for _, tag := range filters.Tags {
+		args = append(args, "tag:"+tag)
+	}
+	for _, tag := range filters.WithoutTags {
+		args = append(args, "not", "tag:"+tag)
+	}
+	args = append(args, "::", "reassign", "--to", c.actor)
+	var receipt struct {
+		ID       string  `json:"id"`
+		State    string  `json:"state"`
+		Assignee string  `json:"assignee"`
+		From     *string `json:"from_assignee"`
+		Changed  *bool   `json:"changed"`
+	}
+	err = c.invoke(ctx, args, &receipt)
+	if err != nil {
+		var command *CommandError
+		if errors.As(err, &command) && command.Code == "invalid_argument" && !command.MutationApplied() {
+			var count *int
+			if raw, ok := command.Details["count"]; ok && json.Unmarshal(raw, &count) == nil && count != nil && *count == 0 {
+				return nil, nil
+			}
+		}
+	} else if receipt.ID != id || receipt.State != "hold" || receipt.Assignee != c.actor || receipt.From == nil || *receipt.From != "" || receipt.Changed == nil || !*receipt.Changed {
+		err = fmt.Errorf("%w: invalid hold acquisition receipt: %+v", ErrProtocol, receipt)
+	}
+	observed, readErr := c.Show(ctx, id)
+	if err != nil || readErr != nil {
+		return nil, fmt.Errorf("hold acquisition %s requires operator reconciliation; observed id=%s state=%s owner=%q: %w", id, observed.ID, observed.State, observed.Assignee, errors.Join(err, readErr))
+	}
+	if observed.ID != id || observed.State != "hold" || observed.Assignee != c.actor || !matchesHoldFilters(observed, filters) {
+		return nil, fmt.Errorf("hold acquisition %s changed before dispatch; observed state=%s owner=%q; operator reconciliation required", id, observed.State, observed.Assignee)
+	}
+	return &observed, nil
+}
+
+func matchesHoldFilters(ticket Ticket, filters QueueFilters) bool {
+	tags := make(map[string]bool, len(ticket.Tags))
+	for _, tag := range ticket.Tags {
+		tags[tag] = true
+	}
+	for _, tag := range filters.Tags {
+		if !tags[tag] {
+			return false
+		}
+	}
+	for _, tag := range filters.WithoutTags {
+		if tags[tag] {
+			return false
+		}
+	}
+	return true
+}
+
+// OwnedHold reports an old assessment assignment without authorizing execution.
+// It is intentionally independent of queue filters and role policy.
+func (c *Client) OwnedHold(ctx context.Context) (*Ticket, error) {
+	var response struct {
+		Items []Ticket `json:"items"`
+	}
+	if err := c.invoke(ctx, []string{"list", "--state", "hold", "--assignee", c.actor, "--limit", "1", "--fields", "id,state,assignee"}, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Items) == 0 {
+		return nil, nil
+	}
+	item := response.Items[0]
+	if validateFullID(item.ID) != nil || item.State != "hold" || item.Assignee != c.actor {
+		return nil, fmt.Errorf("%w: invalid owned hold observation", ErrProtocol)
+	}
+	return &item, nil
+}
+
+// EscalateHold performs one guarded human handoff after a clean managed
+// assessment. A stale guard is observation only; ambiguous mutations are never
+// replayed. Existing Handoff must be complete before it can be preserved.
+func (c *Client) EscalateHold(ctx context.Context, id, owner, explanation string) (Ticket, error) {
+	if err := validateFullID(id); err != nil {
+		return Ticket{}, err
+	}
+	if owner != "" && owner != c.actor {
+		return Ticket{}, fmt.Errorf("hold escalation cannot transfer another actor's work")
+	}
+	var detail TicketDetail
+	if err := c.invoke(ctx, []string{"show", id, "--section", "handoff", "--max-bytes", "1048576"}, &detail); err != nil {
+		return Ticket{}, err
+	}
+	if detail.ID != id || detail.Truncated || detail.Sections["handoff"].Truncated {
+		return Ticket{}, fmt.Errorf("%w: incomplete hold Handoff observation", ErrProtocol)
+	}
+	current, err := c.Show(ctx, id)
+	if err != nil {
+		return Ticket{}, err
+	}
+	if current.State != "hold" || current.Assignee != owner {
+		return current, nil
+	}
+	handoff := detail.Sections["handoff"].Text
+	if strings.TrimSpace(handoff) != "" {
+		handoff += "\n\n"
+	}
+	handoff += explanation
+	guard := "unclaimed"
+	if owner != "" {
+		guard = "assignee:" + owner
+	}
+	var receipt struct {
+		ID       string  `json:"id"`
+		State    string  `json:"state"`
+		Assignee string  `json:"assignee"`
+		From     *string `json:"from_assignee"`
+		Changed  *bool   `json:"changed"`
+		Handoff  string  `json:"handoff"`
+	}
+	err = c.invoke(ctx, []string{"query", "id:" + id, "state:hold", guard, "::", "reassign", "--to", "user", "--handoff", handoff, "--message", "Automated hold assessment unresolved; escalated to user."}, &receipt)
+	if err != nil {
+		var command *CommandError
+		if errors.As(err, &command) && command.Code == "invalid_argument" && !command.MutationApplied() {
+			var count *int
+			if raw, ok := command.Details["count"]; ok && json.Unmarshal(raw, &count) == nil && count != nil && *count == 0 {
+				return c.Show(ctx, id)
+			}
+		}
+		return Ticket{}, err
+	}
+	if receipt.ID != id || receipt.State != "hold" || receipt.Assignee != "user" || receipt.From == nil || *receipt.From != owner || receipt.Changed == nil || !*receipt.Changed || receipt.Handoff != handoff {
+		return Ticket{}, fmt.Errorf("%w: invalid hold escalation receipt", ErrProtocol)
+	}
+	return c.Show(ctx, id)
 }

@@ -39,6 +39,21 @@ func validateConfigJSONFields(data []byte) error {
 			if err := validateNestedConfigObject(roles[role], "roles."+role, roleConfigFields); err != nil {
 				return err
 			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(roles[role], &fields); err != nil {
+				return err
+			}
+			if raw, ok := fields["hold_queue"]; ok {
+				var enabled *bool
+				if err := json.Unmarshal(raw, &enabled); err != nil || enabled == nil {
+					return fmt.Errorf("roles.%s.hold_queue must be a boolean", role)
+				}
+				var queue string
+				_ = json.Unmarshal(fields["ticket_queue"], &queue)
+				if queue != "review" && queue != "signoff" {
+					return fmt.Errorf("roles.%s.hold_queue is only valid with ticket_queue review or signoff", role)
+				}
+			}
 		}
 	}
 	if raw := root["workers"]; raw != nil {
@@ -87,7 +102,7 @@ func validateConfigJSONFields(data []byte) error {
 }
 
 var defaultConfigFields = configFieldSet("required_skills", "harness", "model", "reasoning", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "review_completion", "ticket_prompt", "working_dir", "repository", "ticket", "output", "codex", "pi", "claude")
-var roleConfigFields = configFieldSet("ticket_queue", "ticket_tags", "ticket_without_tags", "nudge_prompt", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
+var roleConfigFields = configFieldSet("ticket_queue", "hold_queue", "ticket_tags", "ticket_without_tags", "nudge_prompt", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
 var workerConfigFields = configFieldSet("role", "groups", "required_skills", "harness", "actor", "model", "reasoning", "max_bounces", "session_policy", "session_cleanup", "minimum_reuse_context_percent", "working_dir", "repository", "ticket", "output", "review_completion", "ticket_prompt", "codex", "pi", "claude")
 
 func configFieldSet(fields ...string) map[string]struct{} {

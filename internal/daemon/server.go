@@ -29,6 +29,9 @@ type WorkerStatus struct {
 	Role                       string         `json:"role,omitempty"`
 	EffectiveRoleName          string         `json:"effective_role_name,omitempty"`
 	EffectiveTicketQueue       string         `json:"effective_ticket_queue,omitempty"`
+	EffectiveHoldQueue         bool           `json:"effective_hold_queue"`
+	HoldTicket                 string         `json:"hold_ticket,omitempty"`
+	HoldOutcome                string         `json:"hold_outcome,omitempty"`
 	Harness                    string         `json:"harness,omitempty"`
 	TicketActor                string         `json:"ticket_actor,omitempty"`
 	TicketActivityAt           time.Time      `json:"ticket_activity_at,omitempty"`
@@ -38,6 +41,8 @@ type WorkerStatus struct {
 	State                      string         `json:"state"`
 	Reason                     string         `json:"reason,omitempty"`
 	Failure                    *WorkerFailure `json:"failure,omitempty"`
+	LatestFailure              *LatestFailure `json:"latest_failure,omitempty"`
+	DiagnosticError            string         `json:"diagnostic_error,omitempty"`
 	TicketFrontierState        string         `json:"ticket_frontier_state,omitempty"`
 	EffectiveTicketTags        []string       `json:"effective_ticket_tags,omitempty"`
 	EffectiveTicketWithoutTags []string       `json:"effective_ticket_without_tags,omitempty"`
@@ -66,6 +71,7 @@ type Status struct {
 	URL            string             `json:"url"`
 	StartedAt      time.Time          `json:"started_at"`
 	Mode           string             `json:"mode"`
+	HoldQueueRoles []string           `json:"hold_queue_roles,omitempty"`
 	ConfigRevision string             `json:"config_revision,omitempty"`
 	Workers        []WorkerStatus     `json:"workers"`
 	Repositories   []RepositoryStatus `json:"repositories,omitempty"`
@@ -82,11 +88,15 @@ type SteerStatus struct {
 	Harness                    string   `json:"harness,omitempty"`
 	Session                    string   `json:"session,omitempty"`
 	EffectiveTicketQueue       string   `json:"effective_ticket_queue,omitempty"`
+	EffectiveHoldQueue         bool     `json:"effective_hold_queue"`
+	TargetQueue                string   `json:"target_queue,omitempty"`
+	HoldTicket                 string   `json:"hold_ticket,omitempty"`
+	HoldOutcome                string   `json:"hold_outcome,omitempty"`
 	EffectiveTicketTags        []string `json:"effective_ticket_tags,omitempty"`
 	EffectiveTicketWithoutTags []string `json:"effective_ticket_without_tags,omitempty"`
 	EffectiveReviewSkipTags    []string `json:"effective_review_skip_tags,omitempty"`
 	State                      string   `json:"state"`
-	// Ticket identifies the active claim when one was observed.
+	// Ticket identifies an active claim or an exact unclaimed TargetQueue entry.
 	Ticket          string         `json:"ticket,omitempty"`
 	Code            string         `json:"code,omitempty"`
 	PersistenceCode string         `json:"persistence_code,omitempty"`

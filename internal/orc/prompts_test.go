@@ -195,10 +195,44 @@ func TestReviewerPromptRequiresExactOwnedTicket(t *testing.T) {
 
 func TestManagedPromptsAllowOwnedBlockedOutcome(t *testing.T) {
 	for _, prompt := range []string{CoderPrompt("20261017-01957"), ReviewerPrompt("20261017-01957")} {
-		for _, want := range []string{"Ticket Skill", "concrete blocker", "action needed to resume", "Handoff", "hold this ticket while you still own it", "verify hold", "Do not release it first", "Do not select or work another ticket"} {
+		for _, want := range []string{"Ticket Skill", "concrete blocker", "action needed to resume", "Handoff", "Issue hold while you own the ticket", "Verify it is held and unassigned, then exit", "Do not reassign it to yourself", "Do not select or work another ticket"} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("prompt %q missing %q", prompt, want)
 			}
+		}
+	}
+}
+
+func TestHoldTurnPromptDefinesGuardedOutcomesWithoutPrimaryCompletion(t *testing.T) {
+	const id = "20261025-49336"
+	prompt := HoldTurnPrompt(id)
+	for _, want := range []string{
+		"Assess only held ticket " + id,
+		"Ticket Skill", "full Ticket, Handoff, dependencies", "state and ownership before any mutation",
+		"atomically assigned", "ticket actor -j", "Verify hold and current ownership",
+		"state or ownership changes", "respect current Ticket and stop", "clear another actor's claim",
+		"Do not run next, claim, implement, approve or close the held ticket", "Do not select or process another ticket",
+		"Related unowned planning maintenance", "approved scope and existing authority", "existing role policy and custom role guidance",
+		"reviewer must escalate architectural or scope decisions", "architect may resolve them within approved scope",
+		"Preserve existing Handoff context", "record useful decisions",
+		"ticket open " + id + ` --handoff "CONTEXT AND RESUME ACTION" -j without --claim; verify open and unassigned`,
+		"genuine dependency through Ticket before reopening", "let Ticket readiness block execution",
+		"does not retain a reliable hold-origin lifecycle", "hold->open by default", "do not invent hold->review/signoff",
+		`ticket query -j id:` + id + ` state:hold assignee:ACTOR :: reassign --to user --handoff "BLOCKER, DECISION NEEDED, AND ACTION TO RESUME"`,
+		"same invocation's JSON result ID=" + id + ", state=hold, and assignee=user",
+		"changed=false is acceptable only after this verification", "Zero/multiple-match errors mean reread and stop",
+		"mutation_applied=true means reread without replay", "user-assigned hold stays ineligible until the operator explicitly returns it",
+		"required final action is a verified human handoff with a concrete next action", "do not silently return while it is still owned by you or unassigned",
+		"Unchanged held assessment ownership is not successful task completion", "Do not add completion-only tags, comments or separate Orc ACK records",
+		"boundaries take precedence over conflicting ordinary review/signoff completion instructions",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("hold prompt missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{ArchitectPrompt, "Approve it", "Close it only", "review_completion=", "{{ticket}}", "TICKET_ACTOR", "TICKET_REPOSITORY", "TICKET_SCOPE", "TICKET_CONFIG", "CODEX_HOME", "state:hold unclaimed", "exact unclaimed hold"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("hold prompt inherited ordinary completion, placeholder, or identity guidance %q", unwanted)
 		}
 	}
 }

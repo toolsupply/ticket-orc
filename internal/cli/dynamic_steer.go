@@ -46,6 +46,7 @@ func steerSelectorInstruction(policy steerRolePolicy) string {
 
 type steerRolePolicy struct {
 	TicketQueue       string
+	HoldQueue         bool
 	QueueFilters      ticketclient.QueueFilters
 	TicketWithoutTags []string
 	ReviewSkipTags    []string
@@ -53,6 +54,11 @@ type steerRolePolicy struct {
 	ReviewCompletion  string
 	MaxBounces        int
 	ContainmentActor  string
+}
+
+// Holds use the role's generic selector, without normal review's skip tags.
+func (policy steerRolePolicy) holdQueueFilters() ticketclient.QueueFilters {
+	return ticketclient.QueueFilters{Tags: policy.QueueFilters.Tags, WithoutTags: policy.TicketWithoutTags}
 }
 
 type steerPolicySnapshot struct {
@@ -312,6 +318,7 @@ func applySteerStatusPolicy(status *daemon.SteerStatus, policy steerRolePolicy) 
 		return
 	}
 	status.EffectiveTicketQueue = policy.TicketQueue
+	status.EffectiveHoldQueue = policy.HoldQueue
 	status.EffectiveTicketTags = append([]string(nil), policy.QueueFilters.Tags...)
 	status.EffectiveTicketWithoutTags = append([]string(nil), policy.TicketWithoutTags...)
 	status.EffectiveReviewSkipTags = append([]string(nil), policy.ReviewSkipTags...)
@@ -323,9 +330,13 @@ type steerClient interface {
 	Close() error
 }
 
-type steerSignoffClient interface {
+type steerTargetClient interface {
 	steerClient
 	Show(context.Context, string) (ticketclient.Ticket, error)
+}
+
+type steerSignoffClient interface {
+	steerTargetClient
 	SignoffFrontier(context.Context, ticketclient.QueueFilters, int, int) (ticketclient.ListResult, error)
 }
 
@@ -508,7 +519,7 @@ type steerRuntimePersistence interface {
 	Update(context.Context, state.SteerRegistration, string, string) (bool, error)
 	CompleteDelivery(context.Context, state.SteerRegistration, string, bool, bool) (bool, error)
 	ConfirmNoActiveClaim(context.Context, state.SteerRegistration) (bool, error)
-	ReserveSignoffTarget(context.Context, state.SteerRegistration, string) (bool, error)
+	ReserveSignoffTarget(context.Context, state.SteerRegistration, string, string) (bool, error)
 	CompleteSignoffDelivery(context.Context, state.SteerRegistration, string) (bool, error)
 	CompleteSignoffDeliveryWithIntents(context.Context, state.SteerRegistration, string, bool, bool) (bool, error)
 	ClearSignoffTarget(context.Context, state.SteerRegistration, string) (bool, error)
@@ -599,7 +610,7 @@ func indexSteerDeliveries(snapshot state.SteerRuntimeSnapshot) map[string]state.
 }
 
 func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg state.SteerRegistration, policy steerRolePolicy, client steerClient, status daemon.SteerStatus, delivery state.SteerDelivery, hasDelivery bool, policyGeneration uint64) daemon.SteerStatus {
-	reader, ok := client.(steerSignoffClient)
+	reader, ok := client.(steerTargetClient)
 	if !ok {
 		status.State, status.Code = "degraded", "signoff_observation_unavailable"
 		return status
@@ -612,6 +623,7 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 	plan := orc.PlanSignoffDelivery(hasDelivery && delivery.TargetTicket != "", deliveryState, false, delivery.BootstrapPending, delivery.RecoveryPending)
 	if plan.Step == orc.SignoffObserveTarget {
 		status.Ticket = delivery.TargetTicket
+		status.TargetQueue = delivery.TargetQueue
 		ticket, err := showSignoffTarget(ctx, reader, delivery.TargetTicket)
 		if err != nil {
 			runner.recordSignoffObservationError(reg, err)
@@ -619,12 +631,12 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 			status.Failure = steerObservationFailure(err)
 			return status
 		}
-		switch orc.ClassifySignoffTarget(ticket.State, ticket.Assignee) {
+		switch orc.ClassifyExactSteerTarget(delivery.TargetQueue, ticket.State, ticket.Assignee, reg.Actor) {
 		case orc.SignoffTargetPending:
 			status.State = delivery.State
 			status.Code = delivery.Code
 			if status.Code == "" {
-				status.Code = orc.SignoffAwaitingCode(deliveryState)
+				status.Code = orc.ExactSteerAwaitingCode(deliveryState, delivery.TargetQueue)
 			}
 		case orc.SignoffTargetHumanHandoff, orc.SignoffTargetAssignedElsewhere, orc.SignoffTargetResolved:
 			cleared, err := runner.persistence.ClearSignoffTarget(ctx, reg, delivery.TargetTicket)
@@ -638,18 +650,22 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 				status.State = delivery.State
 				return status
 			}
+			runner.preferPrimary[reg.IncarnationID] = delivery.TargetQueue == "hold"
 			runner.lastPersistedStates[key] = string(orc.SteerIdle)
 			delete(runner.writeFailures, key)
 			// Let a later dirty-triggered pass select the next target.
 			runner.dirty.MarkRepository(reg.RepositoryID)
 			status.State = string(orc.SteerIdle)
-			switch orc.ClassifySignoffTarget(ticket.State, ticket.Assignee) {
+			switch orc.ClassifyExactSteerTarget(delivery.TargetQueue, ticket.State, ticket.Assignee, reg.Actor) {
 			case orc.SignoffTargetHumanHandoff:
 				status.Code = "human_handoff"
 			case orc.SignoffTargetAssignedElsewhere:
 				status.Code = "assigned_elsewhere"
 			default:
 				status.Code = "signoff_resolved"
+				if delivery.TargetQueue == "hold" {
+					status.Code = "hold_resolved"
+				}
 			}
 		}
 		return status
@@ -704,7 +720,30 @@ func (runner *dynamicSteerRunner) reconcileSignoff(ctx context.Context, reg stat
 			status.State, status.Code = string(orc.SteerIdle), "busy"
 			return status
 		}
-		return runner.selectAndSendSignoff(ctx, reg, policy, reader, policyGeneration, status, delivery.BootstrapPending)
+		signoffReader, ok := client.(steerSignoffClient)
+		if !ok {
+			status.State, status.Code = "degraded", "signoff_observation_unavailable"
+			return status
+		}
+		if policy.HoldQueue && runner.preferPrimary[reg.IncarnationID] {
+			primary := runner.selectAndSendSignoff(ctx, reg, policy, signoffReader, policyGeneration, status, false)
+			if primary.Code != "idle" && primary.Code != "target_changed" {
+				return primary
+			}
+		}
+		if policy.HoldQueue {
+			if heldStatus, handled := runner.selectAndSendHold(ctx, reg, policy, client, policyGeneration, status, delivery.BootstrapPending); handled {
+				return heldStatus
+			}
+		}
+		if policy.HoldQueue && runner.preferPrimary[reg.IncarnationID] {
+			if delivery.BootstrapPending {
+				return runner.sendSignoffControl(ctx, reg, policyGeneration, status, signoffBootstrapPlan())
+			}
+			status.State, status.Code = string(orc.SteerIdle), "idle"
+			return status
+		}
+		return runner.selectAndSendSignoff(ctx, reg, policy, signoffReader, policyGeneration, status, delivery.BootstrapPending)
 	case orc.SignoffBootstrapBusySession:
 		return runner.sendSignoffControl(ctx, reg, policyGeneration, status, signoffBootstrapPlan())
 	case orc.SignoffActorBusy:
@@ -748,7 +787,8 @@ func (runner *dynamicSteerRunner) advanceGenericSignoffDelivery(ctx context.Cont
 		runner.lastPersistedStates[steerRegistrationKey(reg)] = string(action.Next)
 		delete(runner.writeFailures, steerRegistrationKey(reg))
 		if action.Retire {
-			// Retire this generic delivery before opening another signoff pass.
+			runner.preferPrimary[reg.IncarnationID] = false
+			// Retire this generic delivery before selecting from either input.
 			runner.dirty.MarkRepository(reg.RepositoryID)
 		}
 	}
@@ -834,10 +874,10 @@ func (runner *dynamicSteerRunner) selectAndSendSignoff(ctx context.Context, reg 
 	if strings.TrimSpace(policy.NudgePrompt) != "" {
 		message += "\n\n" + policy.NudgePrompt
 	}
-	return runner.sendSignoffTarget(ctx, reg, policy, reader, generation, status, target, message, bootstrap)
+	return runner.sendSignoffTarget(ctx, reg, policy, reader, generation, status, target, "signoff", message, bootstrap)
 }
 
-func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg state.SteerRegistration, policy steerRolePolicy, reader steerSignoffClient, generation uint64, status daemon.SteerStatus, target, message string, bootstrap bool) daemon.SteerStatus {
+func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg state.SteerRegistration, policy steerRolePolicy, reader steerTargetClient, generation uint64, status daemon.SteerStatus, target, targetQueue, message string, bootstrap bool) daemon.SteerStatus {
 	key := steerRegistrationKey(reg)
 	stageCode := ""
 	result := steerDeliveryResult{state: string(orc.SteerIdle)}
@@ -851,13 +891,17 @@ func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg sta
 			stageCode = "registration_state_unavailable"
 			return checkErr
 		}
+		if managedOwner(runner.runtime, reg) {
+			result.state, result.code = "conflict", "managed_owner"
+			return nil
+		}
 		currentTicket, showErr := showSignoffTarget(ctx, reader, target)
 		if showErr != nil {
 			stageCode = "ticket_observation_failed"
 			return showErr
 		}
-		if !orc.EligibleSignoffEntry(currentTicket, policy.QueueFilters) {
-			result.state, result.code = string(orc.SteerIdle), "signoff_target_changed"
+		if !orc.EligibleExactSteerEntry(currentTicket, targetQueue, exactSteerFilters(policy, targetQueue)) {
+			result.state, result.code = string(orc.SteerIdle), "target_changed"
 			return nil
 		}
 		active, activeErr := observeSteerActiveTicket(ctx, reader, policy)
@@ -870,7 +914,7 @@ func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg sta
 			result.state, result.code = string(orc.SteerIdle), "busy"
 			return nil
 		}
-		reserved, reserveErr := runner.persistence.ReserveSignoffTarget(ctx, reg, target)
+		reserved, reserveErr := runner.persistence.ReserveSignoffTarget(ctx, reg, target, targetQueue)
 		if reserveErr != nil {
 			stageCode = "runtime_state_write_failed"
 			return reserveErr
@@ -879,6 +923,42 @@ func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg sta
 			runner.signoffResultAfterFalse(ctx, reg, &status, &result)
 			return nil
 		}
+		// Persist intent before mutating Ticket. An uncertain acquisition retains
+		// that intent; neither a reread nor a restart can authorize another send.
+		if targetQueue == "hold" {
+			owner, ok := reader.(steerHoldClient)
+			if !ok {
+				return fmt.Errorf("hold acquisition unavailable")
+			}
+			acquireCtx, cancelAcquire := context.WithTimeout(ctx, steerOperationTimeout)
+			acquired, acquireErr := owner.AcquireHold(acquireCtx, target, exactSteerFilters(policy, targetQueue))
+			cancelAcquire()
+			status.TargetQueue = targetQueue
+			if acquireErr != nil {
+				stageCode = "ticket_observation_failed"
+				return steerHoldReconciliationError("acquire hold", target, reg.Actor, acquireErr)
+			}
+			if acquired == nil {
+				cleared, clearErr := runner.persistence.ClearSignoffTarget(ctx, reg, target)
+				if clearErr != nil {
+					return clearErr
+				}
+				if !cleared {
+					runner.signoffResultAfterFalse(ctx, reg, &status, &result)
+					return nil
+				}
+				result.state, result.code = string(orc.SteerIdle), "target_changed"
+				return nil
+			}
+			current, checkErr = currentSteerRegistration(ctx, runner.observer.store, reg)
+			if checkErr != nil {
+				return fmt.Errorf("owned hold %s requires operator reconciliation after registration check: %w", target, checkErr)
+			}
+			if !current || managedOwner(runner.runtime, reg) {
+				return fmt.Errorf("owned hold %s requires operator reconciliation after worker/registration ownership change", target)
+			}
+		}
+		status.TargetQueue = targetQueue
 		runner.lastPersistedStates[key] = string(orc.SteerSending)
 		delete(runner.writeFailures, key)
 		runner.statuses.publishDelivery(reg, string(orc.SteerSending), target)
@@ -897,7 +977,7 @@ func (runner *dynamicSteerRunner) sendSignoffTarget(ctx context.Context, reg sta
 				return nil
 			}
 			runner.lastPersistedStates[key] = string(orc.SteerQueued)
-			result.state, result.code = string(orc.SteerQueued), "awaiting_signoff_outcome"
+			result.state, result.code = string(orc.SteerQueued), orc.ExactSteerAwaitingCode(orc.SteerQueued, targetQueue)
 			return nil
 		}
 		if steertransport.IsRejected(queueErr) {
@@ -957,10 +1037,11 @@ func (runner *dynamicSteerRunner) signoffResultAfterFalse(ctx context.Context, r
 	}
 	if delivery.TargetTicket != "" {
 		status.Ticket = delivery.TargetTicket
+		status.TargetQueue = delivery.TargetQueue
 		result.state = delivery.State
 		result.code = delivery.Code
 		if result.code == "" {
-			result.code = orc.SignoffAwaitingCode(orc.SteerDeliveryState(delivery.State))
+			result.code = orc.ExactSteerAwaitingCode(orc.SteerDeliveryState(delivery.State), delivery.TargetQueue)
 		}
 		return
 	}
@@ -971,15 +1052,15 @@ func (runner *dynamicSteerRunner) signoffResultAfterFalse(ctx context.Context, r
 	result.state, result.code = delivery.State, "registration_replaced"
 }
 
-func showSignoffTarget(ctx context.Context, client steerSignoffClient, ticketID string) (ticketclient.Ticket, error) {
+func showSignoffTarget(ctx context.Context, client steerTargetClient, ticketID string) (ticketclient.Ticket, error) {
 	readCtx, cancel := context.WithTimeout(ctx, steerOperationTimeout)
 	defer cancel()
 	ticket, err := client.Show(readCtx, ticketID)
 	if err != nil {
-		return ticketclient.Ticket{}, steerObservationError("show signoff target", err)
+		return ticketclient.Ticket{}, steerObservationError("show exact target", err)
 	}
 	if ticket.ID != ticketID || strings.TrimSpace(ticket.State) == "" {
-		return ticketclient.Ticket{}, steerObservationError("show signoff target", ticketclient.ErrProtocol)
+		return ticketclient.Ticket{}, steerObservationError("show exact target", ticketclient.ErrProtocol)
 	}
 	ticket.State = ticketclient.NormalizeLifecycleState(ticket.State)
 	return ticket, nil
@@ -1112,6 +1193,10 @@ type dynamicSteerRunner struct {
 	gate        *dispatchGate
 	dirty       *steerDirtySet
 
+	// Input preference belongs to this registration lifetime and advances only
+	// after authoritative task retirement, never after external enqueue.
+	// Incarnation keys reset the cursor on explicit rejoin/replacement.
+	preferPrimary          map[string]bool
 	connections            map[string]steerClient
 	writeFailures          map[string]string
 	lastPersistedStates    map[string]string
@@ -1154,7 +1239,8 @@ func newDynamicSteerRunner(stateDir string, policies *steerPolicyStore, runtime 
 		stateDir: stateDir, policies: policies, runtime: runtime, clients: clients,
 		router: router, statuses: statuses, persistence: persistence,
 		observer: observer, gate: gate, dirty: dirty,
-		connections: make(map[string]steerClient), writeFailures: make(map[string]string),
+		preferPrimary: make(map[string]bool),
+		connections:   make(map[string]steerClient), writeFailures: make(map[string]string),
 		lastPersistedStates: make(map[string]string), statusCache: make(map[string]daemon.SteerStatus),
 		retries: newSteerRetrySchedule(),
 	}
@@ -1265,8 +1351,15 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 	}
 	activeKeys := make(map[string]bool, len(observation.Registrations))
 	currentRegistrationKeys := make(map[string]bool, len(observation.Registrations))
+	currentIncarnations := make(map[string]bool, len(observation.Registrations))
 	for _, reg := range observation.Registrations {
 		currentRegistrationKeys[steerRegistrationKey(reg)] = true
+		currentIncarnations[reg.IncarnationID] = true
+	}
+	for key := range runner.preferPrimary {
+		if !currentIncarnations[key] {
+			delete(runner.preferPrimary, key)
+		}
 	}
 	for key := range runner.writeFailures {
 		if !currentRegistrationKeys[key] {
@@ -1292,6 +1385,11 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 		}
 		status := daemon.SteerStatus{RepositoryID: reg.RepositoryID, RepositoryName: reg.RepositoryName, Role: reg.Role, Actor: reg.Actor, Harness: reg.Harness, Session: reg.SessionID}
 		applySteerStatusPolicy(&status, policy)
+		// Keep one latest hold assessment in this registration's existing
+		// bounded status cache while ordinary primary work continues.
+		if previous, ok := runner.statusCache[regKey]; ok {
+			status.HoldTicket, status.HoldOutcome = previous.HoldTicket, previous.HoldOutcome
+		}
 		key := regKey
 		activeKeys[key] = true
 		if !work.includes(reg.RepositoryID) {
@@ -1352,7 +1450,10 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 		}
 		if delivery, found := storedDeliveries[key]; (found && delivery.TargetTicket != "") || policy.TicketQueue == "signoff" {
 			status = runner.reconcileSignoff(ctx, reg, policy, client, status, delivery, found, policySnapshot.generation)
-			if status.Code == "ticket_observation_failed" || status.Code == "signoff_observation_unavailable" {
+			if status.TargetQueue == "hold" {
+				status.HoldTicket, status.HoldOutcome = status.Ticket, status.Code
+			}
+			if status.Code == "ticket_observation_failed" || status.Code == "signoff_observation_unavailable" || status.Code == "hold_observation_unavailable" {
 				failedTicketObservations[regKey] = true
 			} else {
 				successfulTicketObservations[regKey] = true
@@ -1459,7 +1560,23 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 				recoveryPending = false
 			}
 		}
-		readyTicket, observeErr := observeSteerReadyTicket(ctx, client, policy, stateName, activeTicket)
+		if policy.HoldQueue && !active && stateName == string(orc.SteerConsumed) {
+			// Retire the positively consumed ordinary wake before selecting from
+			// either input on a later pass. Preserve normal claim/containment
+			// reconciliation above; an exact hold never supplies claim evidence.
+			action := orc.AdvanceSteerDelivery(orc.SteerConsumed, orc.Evidence{})
+			status = runner.advanceGenericSignoffDelivery(ctx, reg, policySnapshot.generation, status, action, orc.SteerConsumed)
+			successfulTicketObservations[regKey] = true
+			applySteerWriteFailure(&status, reg, runner.writeFailures, runner.lastPersistedStates)
+			currentStatus = append(currentStatus, status)
+			continue
+		}
+
+		readyTicket := ""
+		observeReady := !policy.HoldQueue || runner.preferPrimary[reg.IncarnationID] || active || (stateName != "" && stateName != string(orc.SteerIdle))
+		if observeReady {
+			readyTicket, observeErr = observeSteerReadyTicket(ctx, client, policy, stateName, activeTicket)
+		}
 		if observeErr != nil {
 			if steerClientUnusable(observeErr) {
 				discardSteerClient(runner.connections, key)
@@ -1471,6 +1588,29 @@ func (runner *dynamicSteerRunner) reconcile(ctx context.Context, work steerDirty
 			applySteerWriteFailure(&status, reg, runner.writeFailures, runner.lastPersistedStates)
 			currentStatus = append(currentStatus, status)
 			continue
+		}
+		if policy.HoldQueue && !active && (stateName == "" || stateName == string(orc.SteerIdle)) && (!runner.preferPrimary[reg.IncarnationID] || readyTicket == "") {
+			if heldStatus, handled := runner.selectAndSendHold(ctx, reg, policy, client, policySnapshot.generation, status, bootstrapPending); handled {
+				if heldStatus.Code == "ticket_observation_failed" || heldStatus.Code == "hold_observation_unavailable" {
+					failedTicketObservations[regKey] = true
+				} else {
+					successfulTicketObservations[regKey] = true
+				}
+				applySteerWriteFailure(&heldStatus, reg, runner.writeFailures, runner.lastPersistedStates)
+				currentStatus = append(currentStatus, heldStatus)
+				continue
+			}
+		}
+		if !observeReady {
+			readyTicket, observeErr = observeSteerReadyTicket(ctx, client, policy, stateName, activeTicket)
+			if observeErr != nil {
+				runner.recordSignoffObservationError(reg, observeErr)
+				failedTicketObservations[regKey] = true
+				status.State, status.Code = stateName, "ticket_observation_failed"
+				status.Failure = steerObservationFailure(observeErr)
+				currentStatus = append(currentStatus, status)
+				continue
+			}
 		}
 		successfulTicketObservations[regKey] = true
 		plan := planSteerNotification(policy, stateName, activeTicket, readyTicket, recoveryPending, bootstrapPending)

@@ -56,6 +56,9 @@ type currentSessionState struct {
 	SignoffCount     int           `json:"signoff_count,omitempty"`
 	SignoffMore      bool          `json:"signoff_more,omitempty"`
 	ActiveClaims     []localTicket `json:"active_claims"`
+	HoldQueue        bool          `json:"hold_queue"`
+	HoldTarget       string        `json:"hold_target,omitempty"`
+	HoldOutcome      string        `json:"hold_outcome,omitempty"`
 	SignoffTarget    string        `json:"signoff_target,omitempty"`
 	SignoffOutcome   string        `json:"signoff_outcome,omitempty"`
 	Delivery         string        `json:"delivery,omitempty"`
@@ -139,6 +142,7 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 	}
 	result.Queue = role.TicketQueue
 	result.RoleQueue = role.TicketQueue
+	result.HoldQueue = role.HoldQueue
 	client, err := open(identity)
 	if err != nil {
 		return result, fmt.Errorf("open Ticket reader: %w", err)
@@ -175,8 +179,13 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 	if ok {
 		result.Delivery, result.DeliveryCode = delivery.State, delivery.Code
 		if delivery.TargetTicket != "" {
-			result.SignoffTarget = delivery.TargetTicket
-			result.SignoffOutcome = signoffOutcomeCode(delivery)
+			if delivery.TargetQueue == "hold" {
+				result.HoldTarget = delivery.TargetTicket
+				result.HoldOutcome = signoffOutcomeCode(delivery)
+			} else {
+				result.SignoffTarget = delivery.TargetTicket
+				result.SignoffOutcome = signoffOutcomeCode(delivery)
+			}
 		}
 	}
 	if readStatus == nil {
@@ -198,6 +207,7 @@ func currentSessionStateWithEndpointConfig(ctx context.Context, stateDir string,
 	for _, session := range status.Steer {
 		if session.RepositoryID == registration.RepositoryID && session.Actor == registration.Actor && session.Harness == registration.Harness && session.Session == registration.SessionID {
 			matched = true
+			result.HoldQueue = session.EffectiveHoldQueue
 			result.StatusCode = session.Code
 			result.PersistenceCode = session.PersistenceCode
 			if session.State == "conflict" {
@@ -254,7 +264,7 @@ func signoffOutcomeCode(delivery state.SteerDelivery) string {
 	if delivery.Code != "" {
 		return delivery.Code
 	}
-	return orc.SignoffAwaitingCode(orc.SteerDeliveryState(delivery.State))
+	return orc.ExactSteerAwaitingCode(orc.SteerDeliveryState(delivery.State), delivery.TargetQueue)
 }
 
 func localTickets(items []ticketclient.Ticket, queue string) []localTicket {
@@ -294,7 +304,7 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 	} else if result.ReadyCount > 0 {
 		work = readyCountLabel(result.ReadyCount, result.ReadyMore) + " ready"
 	}
-	fmt.Fprintf(out, "Role: %s\nWork: %s\n", result.Role, work)
+	fmt.Fprintf(out, "Role: %s\nWork: %s\nUnassigned holds: %t\n", result.Role, work, result.HoldQueue)
 	if len(result.ActiveClaims) == 0 {
 		fmt.Fprintln(out, "Active: none")
 	} else {
@@ -307,8 +317,11 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 		}
 	}
 	fmt.Fprintf(out, "Delivery: %s\n", humanDelivery(result.Delivery))
+	if result.HoldTarget != "" {
+		fmt.Fprintf(out, "Hold target: %s\nHold outcome: %s\n", result.HoldTarget, humanDeliveryCode(result.HoldOutcome, result.Delivery))
+	}
 	if result.SignoffTarget != "" {
-		fmt.Fprintf(out, "Signoff target: %s\nSignoff outcome: %s\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome))
+		fmt.Fprintf(out, "Signoff target: %s\nSignoff outcome: %s\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome, result.Delivery))
 	}
 	if result.ManagedOwner != "" {
 		fmt.Fprintln(out, "State: conflict")
@@ -319,13 +332,13 @@ func renderCurrentSessionState(out io.Writer, result currentSessionState) error 
 		fmt.Fprintln(out, "Managed ownership: clear")
 	}
 	if result.DeliveryCode != "" {
-		fmt.Fprintf(out, "Delivery detail: %s\n", humanDeliveryCode(result.DeliveryCode))
+		fmt.Fprintf(out, "Delivery detail: %s\n", humanDeliveryCode(result.DeliveryCode, result.Delivery))
 	}
 	if result.StatusCode != "" && result.ManagedOwnership != "unknown" {
-		fmt.Fprintf(out, "Session status: %s\n", humanDeliveryCode(result.StatusCode))
+		fmt.Fprintf(out, "Session status: %s\n", humanDeliveryCode(result.StatusCode, ""))
 	}
 	if result.PersistenceCode != "" {
-		fmt.Fprintf(out, "Persistence: %s\n", humanDeliveryCode(result.PersistenceCode))
+		fmt.Fprintf(out, "Persistence: %s\n", humanDeliveryCode(result.PersistenceCode, ""))
 	}
 	return nil
 }
@@ -343,7 +356,7 @@ func humanStatusCode(code string) string {
 	}
 }
 
-func humanDeliveryCode(code string) string {
+func humanDeliveryCode(code, state string) string {
 	switch code {
 	case "managed_owner":
 		return "actor is already owned by a managed worker"
@@ -373,14 +386,43 @@ func humanDeliveryCode(code string) string {
 		return "waiting for a Ticket claim"
 	case "awaiting_signoff_outcome":
 		return "waiting for a signoff outcome"
+	case "awaiting_hold_resolution":
+		return "waiting for hold resolution"
+	case "signoff_resolved":
+		return "ticket left signoff"
+	case "hold_resolved":
+		return "hold resolved"
+	case "human_handoff":
+		return "assigned to user; human action required"
+	case "assigned_elsewhere":
+		return "ticket assigned to another actor"
+	case "signoff_observation_unavailable":
+		return "signoff observation unavailable"
+	case "hold_observation_unavailable":
+		return "hold observation unavailable"
 	case "consumed":
 		return "Ticket work is active"
 	case "invalid_state":
 		return "delivery status is invalid"
 	case "registration_replaced":
 		return "session registration was replaced"
+	case "registration_removed":
+		return "session left"
+	case "policy_changed":
+		return "session policy changed"
+	case "target_changed":
+		return "target ticket changed before notification"
+	case "daemon_paused":
+		return "Orc is paused"
+	case "daemon_aborted":
+		return "Orc was aborted"
 	default:
-		return "Orc reported a delivery issue"
+		// An unfamiliar code is not evidence of a failed send. Preserve the
+		// reported state and code so operators can inspect the actual outcome.
+		if state != "" {
+			return "Orc status: " + watchLabel(state) + " (code: " + watchLabel(code) + ")"
+		}
+		return "Orc status code: " + watchLabel(code)
 	}
 }
 
@@ -519,17 +561,25 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		Active         bool          `json:"active_claim"`
 		Items          []localTicket `json:"items"`
 		More           bool          `json:"more,omitempty"`
+		HoldQueue      bool          `json:"hold_queue"`
+		HoldTarget     string        `json:"hold_target,omitempty"`
+		HoldOutcome    string        `json:"hold_outcome,omitempty"`
 		SignoffTarget  string        `json:"signoff_target,omitempty"`
 		SignoffOutcome string        `json:"signoff_outcome,omitempty"`
 	}{Role: registration.Role, Harness: registration.Harness, Session: identity.SessionID, Queue: role.TicketQueue, RoleQueue: role.TicketQueue,
-		ActiveQueue: activeQueue, ActiveQueues: activeQueues, Active: len(activeItems) > 0, Items: items, More: ready.More}
+		HoldQueue: role.HoldQueue, ActiveQueue: activeQueue, ActiveQueues: activeQueues, Active: len(activeItems) > 0, Items: items, More: ready.More}
 	if delivery, found, deliveryErr := findCurrentDelivery(ctx, loaded.Instance.LocalDir, registration); deliveryErr != nil {
 		return fmt.Errorf("read delivery status: %w", deliveryErr)
 	} else if found {
 		result.Delivery = humanDelivery(delivery.State)
 		if delivery.TargetTicket != "" {
-			result.SignoffTarget = delivery.TargetTicket
-			result.SignoffOutcome = signoffOutcomeCode(delivery)
+			if delivery.TargetQueue == "hold" {
+				result.HoldTarget = delivery.TargetTicket
+				result.HoldOutcome = signoffOutcomeCode(delivery)
+			} else {
+				result.SignoffTarget = delivery.TargetTicket
+				result.SignoffOutcome = signoffOutcomeCode(delivery)
+			}
 		}
 	} else {
 		result.Delivery = "none"
@@ -540,8 +590,11 @@ func nextWithEndpointConfigRunner(ctx context.Context, jsonOutput bool, configPa
 		return encoder.Encode(result)
 	}
 	fmt.Fprintf(stdout, "Role: %s\nSession: %s\nDelivery: %s\n\n", result.Role, shortIdentity(result.Session), result.Delivery)
+	if result.HoldTarget != "" {
+		fmt.Fprintf(stdout, "Hold target: %s\nHold outcome: %s\n\n", result.HoldTarget, humanDeliveryCode(result.HoldOutcome, ""))
+	}
 	if result.SignoffTarget != "" {
-		fmt.Fprintf(stdout, "Signoff target: %s\nSignoff outcome: %s\n\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome))
+		fmt.Fprintf(stdout, "Signoff target: %s\nSignoff outcome: %s\n\n", result.SignoffTarget, humanDeliveryCode(result.SignoffOutcome, ""))
 	}
 	if len(items) == 0 {
 		if role.TicketQueue == "signoff" {

@@ -2,6 +2,7 @@ package orc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -85,12 +86,12 @@ func runManagedTurn(ctx context.Context, options managedTurnOptions, orchestrati
 		if result.SessionOutcome == harness.SessionInvalidated {
 			retired, changed, err := supersedeManagedSession(ctx, options, managed, agent, current, "harness_invalidated")
 			if err != nil {
-				return result, fmt.Errorf("record invalidated session: %w", err), true
+				return result, errors.Join(runErr, fmt.Errorf("record invalidated session: %w", err)), true
 			}
 			if changed {
 				replacedID = retired.ID
 			} else {
-				return result, fmt.Errorf("invalidated session changed before supersession"), true
+				return result, errors.Join(runErr, fmt.Errorf("invalidated session changed before supersession")), true
 			}
 			found = false
 			result, runErr = agent.Run(ctx, request)
@@ -98,13 +99,23 @@ func runManagedTurn(ctx context.Context, options managedTurnOptions, orchestrati
 	} else {
 		result, runErr = agent.Run(ctx, request)
 	}
+	if runErr != nil && result.Evidence != nil {
+		var executionErr *harness.ExecutionError
+		if !errors.As(runErr, &executionErr) {
+			runErr = &harness.ExecutionError{Harness: options.Harness, Result: result, Cause: runErr}
+		}
+	}
 	if options.Policy == SessionPolicyTicket && result.SessionID != "" && result.SessionOutcome != harness.SessionInvalidated {
 		record := key
 		record.ID = result.SessionID
 		record.ContextTelemetry = normalizedContextTelemetry(result.ContextTelemetry)
 		if err := managed.RegisterSession(ctx, record, replacedID); err != nil {
-			cleanupSupersededSession(ctx, options, agent, record)
-			return result, fmt.Errorf("register managed session: %w", err), true
+			// Failed execution evidence must survive for post-stop inspection.
+			// This worker cannot establish outer cleanup before it exits.
+			if runErr == nil {
+				cleanupSupersededSession(ctx, options, agent, record)
+			}
+			return result, NewFailureContextError(FailureContext{Origin: "orc", Operation: "register managed session", Phase: "post-turn", Ticket: options.Ticket, Execution: result.Evidence}, errors.Join(runErr, fmt.Errorf("register managed session: %w", err))), true
 		}
 		if telemetryState, ok := orchestrationState.(managedContextTelemetryState); ok {
 			if _, err := telemetryState.SetSessionContextTelemetry(ctx, record, record.ContextTelemetry); err != nil {

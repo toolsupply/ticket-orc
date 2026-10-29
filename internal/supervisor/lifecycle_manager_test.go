@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +11,113 @@ import (
 
 	"github.com/toolsupply/ticket-orc/internal/testutil"
 )
+
+func TestUnconfirmedFailedWorkspaceBlocksOverlappingLaunchButNotIndependentWorker(t *testing.T) {
+	root := t.TempDir()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	starts := 0
+	manager := NewLifecycleManager([]lifecycleTestWorker{{"failed"}, {"overlap"}, {"independent"}}, LifecycleHooks[lifecycleTestWorker, *lifecycleTestChild]{
+		Name:        func(w lifecycleTestWorker) string { return w.name },
+		ChildWorker: func(*lifecycleTestChild) lifecycleTestWorker { return lifecycleTestWorker{"failed"} },
+		Workspace: func(w lifecycleTestWorker) string {
+			if w.name == "independent" {
+				return filepath.Join(root, "independent")
+			}
+			if w.name == "overlap" {
+				return filepath.Join(root, "affected", "subdirectory")
+			}
+			return filepath.Join(root, "affected")
+		},
+		StartChild: func(context.Context, lifecycleTestWorker) (*lifecycleTestChild, error) {
+			starts++
+			return &lifecycleTestChild{}, nil
+		},
+		ClassifyExit: func(*lifecycleTestChild, error) ExitOutcome {
+			close(entered)
+			<-release
+			return ExitOutcome{State: WorkerFailed, BlockWorkspace: true}
+		},
+	})
+	if _, err := manager.Start(t.Context(), "failed"); err != nil {
+		t.Fatal(err)
+	}
+	child, _ := manager.Child("failed")
+	exited := make(chan struct{})
+	go func() { defer close(exited); manager.ObserveExit("failed", child, errors.New("failed"), false) }()
+	t.Cleanup(func() { unblock(); awaitFailedWorkspace(t, exited, "exit reconciliation") })
+	awaitFailedWorkspace(t, entered, "classification barrier")
+	started := make(chan error, 1)
+	startDone := make(chan struct{})
+	go func() { defer close(startDone); _, err := manager.Start(t.Context(), "overlap"); started <- err }()
+	t.Cleanup(func() { unblock(); awaitFailedWorkspace(t, startDone, "concurrent start") })
+	unblock()
+	awaitFailedWorkspace(t, exited, "exit reconciliation")
+	awaitFailedWorkspace(t, startDone, "serialized start")
+	var lifecycleErr *LifecycleError
+	if err := <-started; !errors.As(err, &lifecycleErr) || lifecycleErr.Code != "workspace_cleanup_unconfirmed" {
+		t.Fatalf("overlap start: %v", err)
+	}
+	if _, err := manager.Restart(t.Context(), "failed"); err == nil {
+		t.Fatal("manual restart bypassed uncertain cleanup")
+	}
+	if _, err := manager.Start(t.Context(), "independent"); err != nil {
+		t.Fatalf("independent worker blocked: %v", err)
+	}
+	if starts != 2 {
+		t.Fatalf("starts=%d, want original plus independent", starts)
+	}
+}
+
+func TestLifecycleManagerFailedWorkerRequiresManualStart(t *testing.T) {
+	for _, action := range []string{"start", "restart"} {
+		t.Run(action, func(t *testing.T) {
+			starts := 0
+			var lastState WorkerState
+			cause := errors.New("unexpected execution termination")
+			manager := newLifecycleTestManager(LifecycleHooks[lifecycleTestWorker, *lifecycleTestChild]{
+				StartChild: func(context.Context, lifecycleTestWorker) (*lifecycleTestChild, error) {
+					starts++
+					child := &lifecycleTestChild{ready: make(chan struct{}), waited: make(chan struct{})}
+					close(child.ready)
+					close(child.waited)
+					return child, nil
+				},
+				ClassifyExit: func(*lifecycleTestChild, error) ExitOutcome {
+					return ExitOutcome{State: WorkerFailed, Failure: &WorkerFailure{Classification: "harness_process_failed"}, TransitionError: cause}
+				},
+				Transition: func(_ string, state WorkerState, _ error) { lastState = state },
+			})
+			if _, err := manager.Start(t.Context(), "one"); err != nil {
+				t.Fatal(err)
+			}
+			child, _ := manager.Child("one")
+			observed := manager.ObserveExit("one", child, cause, false)
+			if !observed.Current || observed.Outcome.State != WorkerFailed || lastState != WorkerFailed || starts != 1 {
+				t.Fatalf("failure was not retained: %+v state=%s starts=%d", observed, lastState, starts)
+			}
+			if _, running := manager.Child("one"); running {
+				t.Fatal("failed worker was automatically replaced")
+			}
+			if manager.ObserveExit("one", child, cause, false).Current || starts != 1 {
+				t.Fatal("duplicate failure observation started a replacement")
+			}
+			manual := manager.Start
+			if action == "restart" {
+				manual = manager.Restart
+			}
+			if _, err := manual(t.Context(), "one"); err != nil {
+				t.Fatal(err)
+			}
+			current, running := manager.Child("one")
+			if !running || current == child || starts != 2 || lastState != WorkerRunning {
+				t.Fatalf("ordinary manual %s did not start a new worker: starts=%d state=%s", action, starts, lastState)
+			}
+		})
+	}
+}
 
 type lifecycleTestWorker struct{ name string }
 
@@ -220,5 +329,14 @@ func TestLifecycleManagerReloadCommitsWatchersBeforeConcurrentStart(t *testing.T
 	}
 	if _, ok := manager.Worker("two"); !ok || !watchers.Load() || !committed.Load() {
 		t.Fatal("successful reload did not commit workers and watcher state")
+	}
+}
+
+func awaitFailedWorkspace(t *testing.T, done <-chan struct{}, milestone string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", milestone)
 	}
 }

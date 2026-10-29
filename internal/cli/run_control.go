@@ -188,7 +188,14 @@ func (m *workerManager) completeStartupResult(child *runChild, err error, shutti
 	if !shuttingDown && !child.readyObserved() {
 		startupFailure = failure
 		if err == nil && child.failureEnvelope() == nil && startupFailure != nil {
-			startupFailure = &supervisor.WorkerFailure{Classification: "startup_failure", Phase: "worker readiness"}
+			// Keep the observed exit and captured detail without changing the
+			// normal exit outcome shared with the supervisor's result observer.
+			copy := *startupFailure
+			copy.Classification, copy.Phase = "startup_failure", "worker readiness"
+			startupFailure = &copy
+			// A clean exit is retained as a failure only when readiness was
+			// never reached; normal clean exits skip diagnostic replacement.
+			m.retainWorkerFailure(child.worker, startupFailure)
 		}
 	}
 	child.startupAttempt.Complete(startupFailure)
@@ -204,10 +211,12 @@ func (m *workerManager) reconcileStartupExit(name string, child *runChild, exit 
 	// stores the result before closing child.waited, so startup reconciliation
 	// preserves the real child exit even if forwarding consumed the channel.
 	childErr := child.exitResult()
-	failure := classifyWorkerFailureWithEnvelope(childErr, childFailure)
+	failure := classifyManagedChildExit(child, childErr).Failure
 	if childFailure == nil && childErr == nil {
-		failure = &supervisor.WorkerFailure{Classification: "startup_failure", Phase: "worker readiness"}
+		failure.Classification, failure.Phase = "startup_failure", "worker readiness"
 	}
+	failure = m.protectStartupWorkspace(child, exit, failure)
+	m.retainWorkerFailure(child.worker, failure)
 	desired := exit.Desired
 	if m.runtime != nil {
 		m.runtime.SetEffectiveWorker(desired)
@@ -230,6 +239,8 @@ func (m *workerManager) failStartupReadiness(name string, child *runChild, exit 
 		_ = child.forceStop()
 	}
 	failure := &supervisor.WorkerFailure{Classification: "startup_timeout", Phase: "worker readiness", Remediation: "inspect Ticket observations and external harness responsiveness before retrying"}
+	failure = m.protectStartupWorkspace(child, exit, failure)
+	m.retainWorkerFailure(child.worker, failure)
 	child.startupAttempt.Complete(failure)
 	desired := exit.Desired
 	if m.runtime != nil {
@@ -244,6 +255,25 @@ func (m *workerManager) failStartupReadiness(name string, child *runChild, exit 
 		m.runtime.SetFailure(name, failure)
 	}
 	return &supervisor.LifecycleError{Code: "worker_startup_timeout", Message: "worker did not become ready before startup timeout", Failure: failure}
+}
+
+func (m *workerManager) protectStartupWorkspace(child *runChild, exit supervisor.ExitReconciliation[supervisor.RunWorker], failure *supervisor.WorkerFailure) *supervisor.WorkerFailure {
+	if !exit.Current {
+		return failure
+	}
+	// Startup failure cannot establish claim-release eligibility. Retain its
+	// workspace protection even when no final envelope or completed wait exists.
+	boundary := child.boundaryResult()
+	confirmed := false
+	select {
+	case <-child.waited:
+		confirmed = boundary.Confirmed && boundary.Err == nil
+	default:
+	}
+	outcome := supervisor.ExitOutcome{State: WorkerFailed, Failure: failure}
+	supervisor.PrepareFailedCoderClaim(child.worker, exit.Desired, exit.Configured, nil, confirmed, &outcome)
+	m.lifecycle.ProtectWorkspaceLocked(child.worker, outcome)
+	return outcome.Failure
 }
 
 func doctorFailureReason(err error) string {

@@ -1,5 +1,7 @@
 package orc
 
+import "github.com/toolsupply/ticket-orc/internal/harness"
+
 // Event is the process-local, privacy-safe event record emitted by worker
 // loops. The supervisor translates it to the daemon event envelope.
 type Event struct {
@@ -14,23 +16,30 @@ type Event struct {
 	Failure *Failure `json:"failure,omitempty"`
 }
 
-// Failure is a bounded child-to-supervisor diagnostic. It carries only safe
-// local classification metadata; raw errors, argv, prompts, credentials,
-// environment values, and session contents never cross the child boundary.
+// Failure is a bounded child-to-supervisor diagnostic. It carries classification
+// metadata and explanatory error text subject to the diagnostic redaction and
+// size policy. It must never serialize error objects, execution requests,
+// prompts, credentials, environment dumps or private session contents.
 type Failure struct {
-	Classification    string `json:"classification"`
-	Phase             string `json:"phase"`
-	ExitCode          int    `json:"exit_code,omitempty"`
-	NestedExitCode    int    `json:"nested_exit_code,omitempty"`
-	Signal            string `json:"signal,omitempty"`
-	Contained         bool   `json:"contained,omitempty"`
-	Origin            string `json:"origin,omitempty"`
-	Operation         string `json:"operation,omitempty"`
-	TicketCode        string `json:"ticket_code,omitempty"`
-	TransportCategory string `json:"transport_category,omitempty"`
-	// Ticket is emitted only after full-ID validation at the supervisor
-	// boundary; worker and repository identity remain in their enclosing
-	// runtime records.
+	Detail            string                     `json:"detail,omitempty"`
+	RepositoryID      string                     `json:"repository_id,omitempty"`
+	Worker            string                     `json:"worker,omitempty"`
+	Role              string                     `json:"role,omitempty"`
+	Actor             string                     `json:"actor,omitempty"`
+	AttemptID         uint64                     `json:"attempt_id,omitempty"`
+	Execution         *harness.ExecutionEvidence `json:"execution,omitempty"`
+	Classification    string                     `json:"classification"`
+	Phase             string                     `json:"phase"`
+	ExitCode          int                        `json:"exit_code,omitempty"`
+	NestedExitCode    int                        `json:"nested_exit_code,omitempty"`
+	Signal            string                     `json:"signal,omitempty"`
+	Contained         bool                       `json:"contained,omitempty"`
+	Origin            string                     `json:"origin,omitempty"`
+	Operation         string                     `json:"operation,omitempty"`
+	TicketCode        string                     `json:"ticket_code,omitempty"`
+	TransportCategory string                     `json:"transport_category,omitempty"`
+	// Ticket and execution identity are validated at the supervisor boundary.
+	// The enclosing runtime record also identifies the reporting worker.
 	Ticket      string `json:"ticket,omitempty"`
 	Remediation string `json:"remediation,omitempty"`
 }

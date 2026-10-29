@@ -19,6 +19,14 @@ func steerObservationError(operation string, err error) error {
 	}, err)
 }
 
+// This uses the existing typed failure context. The cause stays local; only
+// validated identity fields and fixed reconciliation advice reach status.
+func steerHoldReconciliationError(operation, ticket, actor string, cause error) error {
+	return orc.NewFailureContextError(orc.FailureContext{
+		Origin: "ticket", Phase: "hold assessment", Operation: operation, Ticket: ticket, Actor: actor,
+	}, cause)
+}
+
 func steerObservationFailure(err error) *daemon.WorkerFailure {
 	failure := classifyWorkerFailure(err)
 	switch {
@@ -32,6 +40,15 @@ func steerObservationFailure(err error) *daemon.WorkerFailure {
 		failure.Classification = "ticket_transport_failed"
 	case failure.Classification == "worker_error":
 		failure.Classification = "ticket_observation_failed"
+	}
+	switch failure.Operation {
+	case "owned hold reconciliation":
+		failure.Detail = "Held ticket remains assigned without current execution authority."
+	case "acquire hold":
+		failure.Detail = "Hold acquisition outcome requires reconciliation; no assessment was dispatched."
+	}
+	if failure.Detail != "" && (failure.Operation == "owned hold reconciliation" || failure.Operation == "acquire hold") {
+		failure.Remediation = "Operator must inspect Ticket ownership and delivery evidence, then explicitly reconcile the held assignment before another assessment."
 	}
 	return daemon.WorkerFailureDTO(failure)
 }
@@ -77,6 +94,19 @@ func consoleSteerFailureDetail(failure *daemon.WorkerFailure) string {
 	}
 	if failure.Signal != "" {
 		parts = append(parts, "signal="+consoleField(failure.Signal))
+	}
+	// These operations are projected above with fixed advice, never raw cause
+	// text. Keep that advice visible alongside structured timeout/transport data.
+	if failure.Operation == "owned hold reconciliation" || failure.Operation == "acquire hold" {
+		if failure.Detail != "" {
+			parts = append(parts, consoleField(failure.Detail))
+		}
+		if failure.Actor != "" {
+			parts = append(parts, "actor="+consoleField(failure.Actor))
+		}
+		if failure.Remediation != "" {
+			parts = append(parts, consoleField(failure.Remediation))
+		}
 	}
 	return strings.Join(parts, "; ")
 }

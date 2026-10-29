@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/toolsupply/ticket-orc/internal/harness"
 	"github.com/toolsupply/ticket-orc/internal/supervisor"
 )
 
@@ -98,16 +100,24 @@ type DoctorWorkerResult struct {
 // raw stderr, argv, prompts, credentials, environment values, and session
 // contents.
 type WorkerFailure struct {
-	Classification    string `json:"classification"`
-	Phase             string `json:"phase"`
-	ExitCode          int    `json:"exit_code,omitempty"`
-	NestedExitCode    int    `json:"nested_exit_code,omitempty"`
-	Signal            string `json:"signal,omitempty"`
-	Contained         bool   `json:"contained,omitempty"`
-	Origin            string `json:"origin,omitempty"`
-	Operation         string `json:"operation,omitempty"`
-	TicketCode        string `json:"ticket_code,omitempty"`
-	TransportCategory string `json:"transport_category,omitempty"`
+	Detail            string                     `json:"detail,omitempty"`
+	OuterProcess      *harness.ProcessOutcome    `json:"outer_process,omitempty"`
+	RepositoryID      string                     `json:"repository_id,omitempty"`
+	Worker            string                     `json:"worker,omitempty"`
+	Role              string                     `json:"role,omitempty"`
+	Actor             string                     `json:"actor,omitempty"`
+	AttemptID         uint64                     `json:"attempt_id,omitempty"`
+	Execution         *harness.ExecutionEvidence `json:"execution,omitempty"`
+	Classification    string                     `json:"classification"`
+	Phase             string                     `json:"phase"`
+	ExitCode          int                        `json:"exit_code,omitempty"`
+	NestedExitCode    int                        `json:"nested_exit_code,omitempty"`
+	Signal            string                     `json:"signal,omitempty"`
+	Contained         bool                       `json:"contained,omitempty"`
+	Origin            string                     `json:"origin,omitempty"`
+	Operation         string                     `json:"operation,omitempty"`
+	TicketCode        string                     `json:"ticket_code,omitempty"`
+	TransportCategory string                     `json:"transport_category,omitempty"`
 	// Ticket is present only when the worker supplied a validated full ID.
 	Ticket      string `json:"ticket,omitempty"`
 	Remediation string `json:"remediation,omitempty"`
@@ -150,4 +160,11 @@ type Control struct {
 	Reload        func(context.Context) (supervisor.ReloadResult, error)
 	Doctor        func(context.Context) (supervisor.DoctorResult, error)
 	Shutdown      func(context.Context) error
+}
+
+// LatestFailure is historical evidence and never a worker lifecycle state.
+type LatestFailure struct {
+	ObservedAt time.Time      `json:"observed_at"`
+	Reference  string         `json:"reference"`
+	Failure    *WorkerFailure `json:"failure"`
 }

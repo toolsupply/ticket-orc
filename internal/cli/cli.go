@@ -337,8 +337,12 @@ func renderRoleFailure(out io.Writer, err error) {
 		fmt.Fprintln(out, "error: worker role failed")
 		return
 	}
-	if failure.Classification == "worker_error" {
-		fmt.Fprintf(out, "error: worker failure classification=%s phase=%s", safeFailureToken(failure.Classification), safeFailurePhase(failure.Phase))
+	if failure.Classification == "worker_error" || failure.Execution != nil {
+		if failure.Execution != nil && failure.Execution.Process.ExitObserved && failure.Execution.Process.ExitCode > 0 {
+			fmt.Fprintf(out, "error: Codex process exited with status %d classification=%s phase=%s", failure.Execution.Process.ExitCode, safeFailureToken(failure.Classification), safeFailurePhase(failure.Phase))
+		} else {
+			fmt.Fprintf(out, "error: worker failure classification=%s phase=%s", safeFailureToken(failure.Classification), safeFailurePhase(failure.Phase))
+		}
 		renderRoleFailureMetadataAfterPrefix(out, failure)
 		if detail := safeRoleFailureDetail(err); detail != "" {
 			fmt.Fprintf(out, " detail=%s", detail)
@@ -422,6 +426,9 @@ func renderRoleFailureMetadataAfterPrefix(out io.Writer, failure *orc.Failure) {
 	}
 	if failure.NestedExitCode != 0 {
 		fmt.Fprintf(out, " nested_exit_code=%d", failure.NestedExitCode)
+	}
+	if detail := executionFailureDetail(failure.Execution); detail != "" {
+		fmt.Fprintf(out, " %s", detail)
 	}
 	if failure.Ticket != "" {
 		fmt.Fprintf(out, " ticket=%s", optionalFailureTicket(failure.Ticket))

@@ -31,6 +31,7 @@ type ExecutionOutput struct {
 	framer   harness.LineFramer
 	err      error
 	closed   bool
+	failed   bool
 }
 
 // OpenExecutionOutput creates the required raw log before an agent starts.
@@ -65,16 +66,19 @@ func (o *ExecutionOutput) Write(data []byte) (int, error) {
 	}
 	written, err := o.log.Write(data)
 	if err != nil {
+		o.failed = true
 		o.err = err
 		return written, o.err
 	}
 	if o.mode == OutputJSON {
 		operatorWritten, err := o.operator.Write(data)
 		if err != nil {
+			o.failed = true
 			o.err = fmt.Errorf("write Codex operator output: %w", err)
 			return len(data), o.err
 		}
 		if operatorWritten != len(data) {
+			o.failed = true
 			o.err = fmt.Errorf("write Codex operator output: %w", io.ErrShortWrite)
 			return len(data), o.err
 		}
@@ -84,6 +88,9 @@ func (o *ExecutionOutput) Write(data []byte) (int, error) {
 	if err := o.framer.Write(data, o.renderLine); err != nil {
 		if errors.Is(err, harness.ErrEventTooLarge) {
 			err = fmt.Errorf("%w: event exceeds %d bytes", ErrProtocol, harness.MaxEventBytes)
+		}
+		if !errors.Is(err, ErrProtocol) {
+			o.failed = true
 		}
 		o.err = err
 		return len(data), err
@@ -102,10 +109,15 @@ func (o *ExecutionOutput) Close() error {
 			if errors.Is(err, harness.ErrEventTooLarge) {
 				err = fmt.Errorf("%w: event exceeds %d bytes", ErrProtocol, harness.MaxEventBytes)
 			}
+			if !errors.Is(err, ErrProtocol) {
+				o.failed = true
+			}
 			o.err = err
 		}
 	}
-	o.err = errors.Join(o.err, o.log.Close())
+	closeErr := o.log.Close()
+	o.failed = o.failed || closeErr != nil
+	o.err = errors.Join(o.err, closeErr)
 	return o.err
 }
 

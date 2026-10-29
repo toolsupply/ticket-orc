@@ -70,6 +70,53 @@ func (c *Client) WaitAndClaimReview(ctx context.Context, filters QueueFilters) (
 	return c.waitAndClaimQueue(ctx, "review", filters)
 }
 
+// NextAndClaimReview performs Ticket's nonblocking atomic review selection.
+// A nil item means the queue is empty; callers may then wait on a change watch.
+func (c *Client) NextAndClaimReview(ctx context.Context, filters QueueFilters) (*Ticket, error) {
+	return c.nextAndClaimQueue(ctx, "review", filters)
+}
+
+func (c *Client) nextAndClaimQueue(ctx context.Context, queue string, filters QueueFilters) (*Ticket, error) {
+	if queue != "open" && queue != "review" {
+		return nil, fmt.Errorf("ticket queue must be open or review")
+	}
+	filters, err := CanonicalQueueFilters(filters)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"next"}
+	if queue == "review" {
+		args = append(args, "review")
+	}
+	args = appendTagArgs(args, filters.Tags)
+	args = appendWithoutTagArgs(args, filters.WithoutTags)
+	args = append(args, "--claim")
+	var response struct {
+		Item *Ticket `json:"item"`
+	}
+	if err := c.invoke(ctx, args, &response); err != nil {
+		conflict, verificationErr := c.verifyActorQueueConflict(ctx, err, queue)
+		if verificationErr != nil {
+			return nil, verificationErr
+		}
+		if conflict != nil {
+			return nil, conflict
+		}
+		return nil, err
+	}
+	if response.Item == nil {
+		return nil, nil
+	}
+	item := response.Item.NormalizeState()
+	if err := validateFullID(item.ID); err != nil {
+		return nil, fmt.Errorf("%w: claimed %s ticket: %v", ErrProtocol, queue, err)
+	}
+	if item.State != queue || item.Assignee != c.actor {
+		return nil, fmt.Errorf("%w: claimed %s item has state %q and actor %q, expected %s and %q", ErrProtocol, queue, item.State, item.Assignee, queue, c.actor)
+	}
+	return &item, nil
+}
+
 func (c *Client) waitAndClaimQueue(ctx context.Context, queue string, filters QueueFilters) (Ticket, error) {
 	if queue != "open" && queue != "review" {
 		return Ticket{}, fmt.Errorf("ticket queue must be open or review")
@@ -89,39 +136,13 @@ func (c *Client) waitAndClaimQueue(ctx context.Context, queue string, filters Qu
 	}
 	// wait supports positive tags but not exclusions. Use Ticket's atomic
 	// next-and-claim operation and poll when an exclusion is required.
-	args := []string{"next"}
-	if queue == "review" {
-		args = append(args, "review")
-	}
-	args = appendTagArgs(args, filters.Tags)
-	args = appendWithoutTagArgs(args, filters.WithoutTags)
-	args = append(args, "--claim")
 	for {
-		var response struct {
-			Item *Ticket `json:"item"`
-		}
-		if err := c.invoke(ctx, args, &response); err != nil {
-			conflict, verificationErr := c.verifyActorQueueConflict(ctx, err, queue)
-			if verificationErr != nil {
-				return Ticket{}, verificationErr
-			}
-			if conflict != nil {
-				return Ticket{}, conflict
-			}
+		item, err := c.nextAndClaimQueue(ctx, queue, filters)
+		if err != nil {
 			return Ticket{}, err
 		}
-		if response.Item != nil {
-			item := response.Item.NormalizeState()
-			if err := validateFullID(item.ID); err != nil {
-				return Ticket{}, fmt.Errorf("%w: claimed %s ticket: %v", ErrProtocol, queue, err)
-			}
-			if item.State != queue {
-				return Ticket{}, fmt.Errorf("%w: claimed %s ticket has state %q", ErrProtocol, queue, item.State)
-			}
-			if item.Assignee != c.actor {
-				return Ticket{}, fmt.Errorf("%w: claimed item belongs to actor %q, expected %q", ErrProtocol, item.Assignee, c.actor)
-			}
-			return item, nil
+		if item != nil {
+			return *item, nil
 		}
 		timer := time.NewTimer(filteredQueuePoll)
 		select {
@@ -311,17 +332,47 @@ const (
 // projection; --unassigned owns that predicate and any returned assignee must
 // be empty.
 func (c *Client) SignoffFrontier(ctx context.Context, filters QueueFilters, limit, offset int) (ListResult, error) {
+	return c.unassignedFrontier(ctx, "signoff", filters, limit, offset)
+}
+
+// HoldFrontier observes a bounded page of unassigned holds. Ticket applies state,
+// ownership, and tag predicates before pagination. Recheck each exact ID through
+// Show; entries that have left hold or acquired an owner are omitted. More still
+// describes the original list page. This observation never claims work; callers
+// must reread state and ownership immediately before dispatch or mutation.
+func (c *Client) HoldFrontier(ctx context.Context, filters QueueFilters, limit, offset int) (ListResult, error) {
+	frontier, err := c.unassignedFrontier(ctx, "hold", filters, limit, offset)
+	if err != nil {
+		return ListResult{}, err
+	}
+	items := make([]Ticket, 0, len(frontier.Items))
+	for _, candidate := range frontier.Items {
+		current, err := c.Show(ctx, candidate.ID)
+		if err != nil {
+			return ListResult{}, fmt.Errorf("recheck hold ticket %s: %w", candidate.ID, err)
+		}
+		if current.State == "hold" && current.Assignee == "" {
+			items = append(items, current)
+		}
+	}
+	frontier.Items = items
+	return frontier, nil
+}
+
+// unassignedFrontier shares the finite hold/signoff observation protocol, not
+// Ticket's ready selection or claiming policy.
+func (c *Client) unassignedFrontier(ctx context.Context, queue string, filters QueueFilters, limit, offset int) (ListResult, error) {
 	if limit < 1 || limit > maxSignoffFrontierLimit {
-		return ListResult{}, fmt.Errorf("ticket signoff frontier limit must be between 1 and %d", maxSignoffFrontierLimit)
+		return ListResult{}, fmt.Errorf("ticket %s frontier limit must be between 1 and %d", queue, maxSignoffFrontierLimit)
 	}
 	if offset < 0 {
-		return ListResult{}, fmt.Errorf("ticket signoff frontier offset must not be negative")
+		return ListResult{}, fmt.Errorf("ticket %s frontier offset must not be negative", queue)
 	}
 	filters, err := CanonicalQueueFilters(filters)
 	if err != nil {
 		return ListResult{}, err
 	}
-	args := appendTagArgs([]string{"list", "--state", "signoff", "--unassigned"}, filters.Tags)
+	args := appendTagArgs([]string{"list", "--state", queue, "--unassigned"}, filters.Tags)
 	args = appendWithoutTagArgs(args, filters.WithoutTags)
 	args = append(args, "--limit", fmt.Sprint(limit), "--offset", fmt.Sprint(offset), "--fields", "id,state,assignee")
 	var response struct {
@@ -332,55 +383,55 @@ func (c *Client) SignoffFrontier(ctx context.Context, filters QueueFilters, limi
 		return ListResult{}, err
 	}
 	if len(response.Items) == 0 || response.More == nil {
-		return ListResult{}, fmt.Errorf("%w: signoff frontier response is missing items or more", ErrProtocol)
+		return ListResult{}, fmt.Errorf("%w: %s frontier response is missing items or more", ErrProtocol, queue)
 	}
 	var rawItems []json.RawMessage
 	if err := json.Unmarshal(response.Items, &rawItems); err != nil || rawItems == nil {
-		return ListResult{}, fmt.Errorf("%w: signoff frontier items must be an array", ErrProtocol)
+		return ListResult{}, fmt.Errorf("%w: %s frontier items must be an array", ErrProtocol, queue)
 	}
 	if len(rawItems) > limit {
-		return ListResult{}, fmt.Errorf("%w: signoff frontier exceeds requested limit", ErrProtocol)
+		return ListResult{}, fmt.Errorf("%w: %s frontier exceeds requested limit", ErrProtocol, queue)
 	}
 	result := ListResult{Items: make([]Ticket, 0, len(rawItems)), More: *response.More}
 	seen := make(map[string]struct{}, len(rawItems))
 	for _, raw := range rawItems {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-			return ListResult{}, fmt.Errorf("%w: signoff frontier item must be an object", ErrProtocol)
+			return ListResult{}, fmt.Errorf("%w: %s frontier item must be an object", ErrProtocol, queue)
 		}
 		for _, name := range []string{"id", "state"} {
 			value, ok := fields[name]
 			if !ok || len(value) == 0 {
-				return ListResult{}, fmt.Errorf("%w: signoff frontier item is missing %q", ErrProtocol, name)
+				return ListResult{}, fmt.Errorf("%w: %s frontier item is missing %q", ErrProtocol, queue, name)
 			}
 			var text *string
 			if err := json.Unmarshal(value, &text); err != nil || text == nil {
-				return ListResult{}, fmt.Errorf("%w: signoff frontier item field %q must be a string", ErrProtocol, name)
+				return ListResult{}, fmt.Errorf("%w: %s frontier item field %q must be a string", ErrProtocol, queue, name)
 			}
 		}
 		if value, ok := fields["assignee"]; ok {
 			var assignee *string
 			if err := json.Unmarshal(value, &assignee); err != nil || assignee == nil {
-				return ListResult{}, fmt.Errorf("%w: signoff frontier item field %q must be a string", ErrProtocol, "assignee")
+				return ListResult{}, fmt.Errorf("%w: %s frontier item field %q must be a string", ErrProtocol, queue, "assignee")
 			}
 			if *assignee != "" {
-				return ListResult{}, fmt.Errorf("%w: signoff frontier item is assigned to %q", ErrProtocol, *assignee)
+				return ListResult{}, fmt.Errorf("%w: %s frontier item is assigned to %q", ErrProtocol, queue, *assignee)
 			}
 		}
 		var item Ticket
 		if err := json.Unmarshal(raw, &item); err != nil {
-			return ListResult{}, fmt.Errorf("%w: decode signoff frontier item: %v", ErrProtocol, err)
+			return ListResult{}, fmt.Errorf("%w: decode %s frontier item: %v", ErrProtocol, queue, err)
 		}
 		item = item.NormalizeState()
 		if err := validateFullID(item.ID); err != nil {
-			return ListResult{}, fmt.Errorf("%w: signoff frontier item: %v", ErrProtocol, err)
+			return ListResult{}, fmt.Errorf("%w: %s frontier item: %v", ErrProtocol, queue, err)
 		}
 		if _, ok := seen[item.ID]; ok {
-			return ListResult{}, fmt.Errorf("%w: duplicate signoff frontier item %q", ErrProtocol, item.ID)
+			return ListResult{}, fmt.Errorf("%w: duplicate %s frontier item %q", ErrProtocol, queue, item.ID)
 		}
 		seen[item.ID] = struct{}{}
-		if item.State != "signoff" || item.Assignee != "" {
-			return ListResult{}, fmt.Errorf("%w: signoff frontier item %q is not unassigned signoff work", ErrProtocol, item.ID)
+		if item.State != queue || item.Assignee != "" {
+			return ListResult{}, fmt.Errorf("%w: %s frontier item %q is not unassigned %s work", ErrProtocol, queue, item.ID, queue)
 		}
 		result.Items = append(result.Items, item)
 	}

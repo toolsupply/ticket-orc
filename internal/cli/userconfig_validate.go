@@ -204,6 +204,9 @@ func validateRolePolicies(config *FileConfig) error {
 		if role.TicketQueue != "open" && role.TicketQueue != "review" && role.TicketQueue != "signoff" {
 			return fmt.Errorf("roles.%s.ticket_queue must be open, review, or signoff", name)
 		}
+		if role.HoldQueue && role.TicketQueue != "review" && role.TicketQueue != "signoff" {
+			return fmt.Errorf("roles.%s.hold_queue is only valid with ticket_queue review or signoff", name)
+		}
 		if err := validateTicketTagList("roles."+name+".ticket_tags", role.TicketTags); err != nil {
 			return err
 		}

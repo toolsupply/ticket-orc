@@ -2,6 +2,13 @@
 
 All notable user-facing changes to `ticket-orc` are documented here.
 
+## [0.1.6] - 2026-10-24
+
+### Fixed
+
+- Improved crash recovery of managed harnesses
+- Reduced CPU usage in managed worker mode
+
 ## [0.1.5] - 2026-10-24
 
 ### Added
@@ -65,6 +72,7 @@ All notable user-facing changes to `ticket-orc` are documented here.
 
 - Initial release
 
+[0.1.6]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.6
 [0.1.5]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.5
 [0.1.4]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.4
 [0.1.3]: https://github.com/toolsupply/ticket-orc/releases/tag/v0.1.3
